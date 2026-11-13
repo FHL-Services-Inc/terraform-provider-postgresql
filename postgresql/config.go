@@ -5,7 +5,9 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"log"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -51,6 +53,10 @@ const (
 	featureSecurityLabel
 	featureMaintainPrivilege
 )
+
+// defaultConnMaxIdleTime closes connections that stayed idle in the pool for
+// that long. Only used when max_idle_connections > 0.
+const defaultConnMaxIdleTime = 5 * time.Minute
 
 var (
 	dbRegistryLock sync.Mutex
@@ -189,6 +195,7 @@ type Config struct {
 	ConnectionRetryTimeoutSeconds   int
 	ConnMaxLifetimeSeconds          int
 	MaxConns                        int
+	MaxIdleConns                    int
 	ExpectedVersion                 semver.Version
 	SSLClientCert                   *ClientCertificateConfig
 	SSLRootCertPath                 string
@@ -253,6 +260,9 @@ func (c *Config) connParams() []string {
 	for key, value := range params {
 		paramsArray = append(paramsArray, fmt.Sprintf("%s=%s", key, url.QueryEscape(value)))
 	}
+	// Map iteration order is random; sort so the DSN (the dbRegistry key) is
+	// stable and a database always maps to a single registry entry.
+	sort.Strings(paramsArray)
 
 	return paramsArray
 }
@@ -307,12 +317,7 @@ func (c *Client) Connect() (*DBConnection, error) {
 		return nil, err
 	}
 
-	// We don't want to retain connection
-	// So when we connect on a specific database which might be managed by terraform,
-	// we don't keep opened connection in case of the db has to be dropped in the plan.
-	db.SetMaxIdleConns(0)
-	db.SetMaxOpenConns(c.config.MaxConns)
-	db.SetConnMaxLifetime(time.Duration(c.config.ConnMaxLifetimeSeconds) * time.Second)
+	c.config.configurePool(db)
 
 	defaultVersion, _ := semver.Parse(defaultExpectedPostgreSQLVersion)
 	version := &c.config.ExpectedVersion
@@ -341,6 +346,51 @@ func (c *Client) Connect() (*DBConnection, error) {
 	}
 	dbRegistry[dsn] = conn
 	return conn, nil
+}
+
+// configurePool applies the provider's pool settings to a freshly opened
+// database handle.
+func (c *Config) configurePool(db *sql.DB) {
+	// By default (max_idle_connections = 0) no connection is retained: when we
+	// connect to a specific database which might be managed by terraform, we
+	// don't keep connections open in case the database has to be dropped in
+	// the plan. With max_idle_connections > 0 connections are reused, and
+	// postgresql_database evicts the pool of a database before dropping it
+	// (see evictDBConnection).
+	db.SetMaxIdleConns(c.MaxIdleConns)
+	if c.MaxIdleConns > 0 {
+		db.SetConnMaxIdleTime(defaultConnMaxIdleTime)
+	}
+	db.SetMaxOpenConns(c.MaxConns)
+	db.SetConnMaxLifetime(time.Duration(c.ConnMaxLifetimeSeconds) * time.Second)
+}
+
+// evictDBConnection removes the pooled connection to database from dbRegistry
+// and closes it, so no idle connection to a database that is about to be
+// dropped stays around, and a database later recreated under the same name
+// gets a fresh pool. Pools created with max_idle_connections = 0 retain no
+// idle connections and are left untouched.
+//
+// The entry is looked up by DSN, which only matches because every Client is
+// created from the same provider Config (see NewClient) and connStr is
+// deterministic. It returns true if a pool was found and evicted.
+// It must not be called while holding dbRegistryLock.
+func (c *Config) evictDBConnection(database string) bool {
+	dsn := c.connStr(database)
+
+	dbRegistryLock.Lock()
+	conn, found := dbRegistry[dsn]
+	if !found || conn.client.config.MaxIdleConns == 0 {
+		dbRegistryLock.Unlock()
+		return false
+	}
+	delete(dbRegistry, dsn)
+	dbRegistryLock.Unlock()
+
+	if err := conn.Close(); err != nil {
+		log.Printf("[WARN] error closing connection pool to database %q: %v", database, err)
+	}
+	return true
 }
 
 // connectWithRetry opens a connection to dsn, retrying transient failures up

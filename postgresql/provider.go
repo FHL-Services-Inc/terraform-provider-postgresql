@@ -23,6 +23,7 @@ import (
 
 const (
 	defaultProviderMaxOpenConnections            = 20
+	defaultProviderMaxIdleConnections            = 0
 	defaultProviderConnMaxLifetimeSeconds        = 0 // unlimited
 	defaultProviderMaxConnRetries                = 0
 	defaultProviderConnectionRetryTimeoutSeconds = 5
@@ -209,6 +210,13 @@ func Provider() *schema.Provider {
 				Default:      defaultProviderMaxOpenConnections,
 				Description:  "Maximum number of connections to establish to the database. Zero means unlimited.",
 				ValidateFunc: validation.IntAtLeast(-1),
+			},
+			"max_idle_connections": {
+				Type:         schema.TypeInt,
+				Optional:     true,
+				Default:      defaultProviderMaxIdleConnections,
+				Description:  "Maximum number of idle connections kept open per database for reuse. Zero (the default) means connections are closed after each use. Capped to max_connections when the latter is non-zero.",
+				ValidateFunc: validation.IntAtLeast(0),
 			},
 			"conn_max_lifetime_seconds": {
 				Type:         schema.TypeInt,
@@ -410,6 +418,7 @@ func providerConfigure(d *schema.ResourceData) (any, error) {
 		MaxConnRetries:                  d.Get("max_conn_retries").(int),
 		ConnectionRetryTimeoutSeconds:   d.Get("connection_retry_timeout_seconds").(int),
 		MaxConns:                        d.Get("max_connections").(int),
+		MaxIdleConns:                    d.Get("max_idle_connections").(int),
 		ConnMaxLifetimeSeconds:          d.Get("conn_max_lifetime_seconds").(int),
 		ExpectedVersion:                 version,
 		SSLRootCertPath:                 d.Get("sslrootcert").(string),
