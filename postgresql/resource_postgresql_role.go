@@ -387,7 +387,7 @@ func resourcePostgreSQLRoleDelete(db *DBConnection, d *schema.ResourceData) erro
 	}
 	defer deferredRollback(txn)
 
-	if err := pgLockRole(txn, roleName); err != nil {
+	if err := pgLockRole(db, txn, roleName); err != nil {
 		return err
 	}
 
@@ -662,7 +662,7 @@ func resourcePostgreSQLRoleUpdate(db *DBConnection, d *schema.ResourceData) erro
 	defer deferredRollback(txn)
 
 	oldName, _ := d.GetChange(roleNameAttr)
-	if err := pgLockRole(txn, oldName.(string)); err != nil {
+	if err := pgLockRole(db, txn, oldName.(string)); err != nil {
 		return err
 	}
 

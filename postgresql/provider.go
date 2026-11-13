@@ -224,6 +224,13 @@ func Provider() *schema.Provider {
 				Description:  "Specify the expected version of PostgreSQL.",
 				ValidateFunc: validateExpectedVersion,
 			},
+			"advisory_lock_timeout": {
+				Type:         schema.TypeInt,
+				Optional:     true,
+				Default:      0,
+				Description:  "Maximum wait, in milliseconds, for the advisory locks the provider takes on roles and databases before failing. Zero means wait indefinitely.",
+				ValidateFunc: validation.IntAtLeast(0),
+			},
 		},
 
 		ResourcesMap: map[string]*schema.Resource{
@@ -414,6 +421,7 @@ func providerConfigure(d *schema.ResourceData) (any, error) {
 		ExpectedVersion:                 version,
 		SSLRootCertPath:                 d.Get("sslrootcert").(string),
 		GCPIAMImpersonateServiceAccount: d.Get("gcp_iam_impersonate_service_account").(string),
+		AdvisoryLockTimeout:             d.Get("advisory_lock_timeout").(int),
 	}
 
 	if value, ok := d.GetOk("clientcert"); ok {

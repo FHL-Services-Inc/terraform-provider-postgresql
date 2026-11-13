@@ -134,7 +134,7 @@ func createDatabase(db *DBConnection, d *schema.ResourceData) error {
 		if err != nil {
 			return err
 		}
-		if err := pgLockRole(lockTxn, currentUser); err != nil {
+		if err := pgLockRole(db, lockTxn, currentUser); err != nil {
 			return err
 		}
 		defer deferredRollback(lockTxn)
@@ -243,7 +243,7 @@ func resourcePostgreSQLDatabaseDelete(db *DBConnection, d *schema.ResourceData) 
 	var err error
 	if owner != "" {
 		lockTxn, err := startTransaction(db.client, "")
-		if err := pgLockRole(lockTxn, currentUser); err != nil {
+		if err := pgLockRole(db, lockTxn, currentUser); err != nil {
 			return err
 		}
 		defer deferredRollback(lockTxn)
@@ -438,7 +438,7 @@ func setDBOwner(db *DBConnection, d *schema.ResourceData) error {
 	currentUser := db.client.config.getDatabaseUsername()
 
 	lockTxn, err := startTransaction(db.client, "")
-	if err := pgLockRole(lockTxn, currentUser); err != nil {
+	if err := pgLockRole(db, lockTxn, currentUser); err != nil {
 		return err
 	}
 	defer deferredRollback(lockTxn)
@@ -482,7 +482,7 @@ func setAlterOwnership(db *DBConnection, d *schema.ResourceData) error {
 	dbName := d.Get(dbNameAttr).(string)
 
 	lockTxn, err := startTransaction(db.client, dbName)
-	if err := pgLockRole(lockTxn, currentUser); err != nil {
+	if err := pgLockRole(db, lockTxn, currentUser); err != nil {
 		return err
 	}
 	defer deferredRollback(lockTxn)
