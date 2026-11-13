@@ -56,6 +56,13 @@ In order to test the provider, you can simply run `make test`.
 $ make test
 ```
 
+Before opening a pull request, also run `make vet` and `make lint`. `make lint` runs the same pinned golangci-lint version as CI, so lint failures show up locally instead of only on the PR.
+
+```sh
+$ make vet
+$ make lint
+```
+
 In order to run the full suite of Acceptance tests, run `make testacc`.
 
 *Note:* 
