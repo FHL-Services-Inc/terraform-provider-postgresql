@@ -178,6 +178,14 @@ The following arguments are supported:
   the database. The default is `20`.  Zero means unlimited open connections.
 * `conn_max_lifetime_seconds` - (Optional) Maximum lifetime of a connection,
   in seconds. The default is `0`.  Zero means unlimited.
+* `binary_parameters` - (Optional) If set to `true`, adds `binary_parameters=yes`
+  to the connection string. The driver then sends each statement that has bind
+  parameters (almost every query the provider runs) in a single round-trip
+  instead of two (a separate prepare step followed by the execution). This
+  mostly helps when the database is far from where Terraform runs. Only
+  `[]byte` parameters are sent in binary format, which the provider does not
+  use, and results are still read as text. Can also be set with the
+  `PGBINARYPARAMETERS` environment variable. The default is `false`.
 * `expected_version` - (Optional) Specify a hint to Terraform regarding the
   expected version that the provider will be talking with.  This is a required
   hint in order for Terraform to talk with an ancient version of PostgreSQL.

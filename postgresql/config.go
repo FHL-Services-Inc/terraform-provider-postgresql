@@ -193,6 +193,7 @@ type Config struct {
 	SSLClientCert                   *ClientCertificateConfig
 	SSLRootCertPath                 string
 	GCPIAMImpersonateServiceAccount string
+	BinaryParameters                bool
 }
 
 // Client struct holding connection string
@@ -247,6 +248,12 @@ func (c *Config) connParams() []string {
 
 	if c.SSLRootCertPath != "" {
 		params["sslrootcert"] = c.SSLRootCertPath
+	}
+
+	// Send Parse/Bind/Describe/Execute/Sync in a single flush for statements
+	// with bind parameters instead of a separate prepare round-trip.
+	if c.BinaryParameters {
+		params["binary_parameters"] = "yes"
 	}
 
 	paramsArray := []string{}

@@ -43,3 +43,32 @@ func testAccPreCheck(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestProviderConfigureBinaryParameters(t *testing.T) {
+	tests := []struct {
+		name string
+		env  string
+		raw  map[string]any
+		want bool
+	}{
+		{name: "default", want: false},
+		{name: "enabled", raw: map[string]any{"binary_parameters": true}, want: true},
+		{name: "env", env: "true", want: true},
+		{name: "explicit false overrides env", env: "true", raw: map[string]any{"binary_parameters": false}, want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("PGBINARYPARAMETERS", tt.env)
+			d := schema.TestResourceDataRaw(t, Provider().Schema, tt.raw)
+
+			client, err := providerConfigure(d)
+			if err != nil {
+				t.Fatalf("providerConfigure: %v", err)
+			}
+			if got := client.(*Client).config.BinaryParameters; got != tt.want {
+				t.Errorf("BinaryParameters = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
