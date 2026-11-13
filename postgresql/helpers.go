@@ -587,7 +587,11 @@ func getRolesSuperuser(db QueryAble, roles []string) (map[string]bool, error) {
 	if err != nil {
 		return nil, fmt.Errorf("could not check if roles %v are superuser: %w", roles, err)
 	}
-	defer rows.Close()
+	defer func() {
+		if err := rows.Close(); err != nil {
+			log.Printf("error closing rows: %v", err)
+		}
+	}()
 
 	superusers := make(map[string]bool, len(roles))
 	for rows.Next() {
