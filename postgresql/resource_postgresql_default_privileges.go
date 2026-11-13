@@ -155,18 +155,20 @@ func resourcePostgreSQLDefaultPrivilegesCreate(db *DBConnection, d *schema.Resou
 		return err
 	}
 
+	// On update, when only the privileges changed, apply just the difference
+	// with the previous set (see defaultPrivilegesStatements).
+	var oldPrivileges *schema.Set
+	if d.Id() != "" && !d.HasChangeExcept("privileges") {
+		old, _ := d.GetChange("privileges")
+		oldPrivileges = old.(*schema.Set)
+	}
+
 	// Needed in order to set the owner of the db if the connection user is not a superuser
 	if err := withRolesGranted(txn, []string{owner}, func() error {
-
-		// Revoke all privileges before granting otherwise reducing privileges will not work.
-		// We just have to revoke them in the same transaction so role will not lose its privileges
-		// between revoke and grant.
-		if err = revokeRoleDefaultPrivileges(txn, d); err != nil {
-			return err
-		}
-
-		if err = grantRoleDefaultPrivileges(txn, d); err != nil {
-			return err
+		for _, query := range defaultPrivilegesStatements(d.Get, oldPrivileges) {
+			if _, err := txn.Exec(query); err != nil {
+				return fmt.Errorf("could not alter default privileges: %w", err)
+			}
 		}
 		return nil
 	}); err != nil {
@@ -212,7 +214,10 @@ func resourcePostgreSQLDefaultPrivilegesDelete(db *DBConnection, d *schema.Resou
 
 	// Needed in order to set the owner of the db if the connection user is not a superuser
 	if err := withRolesGranted(txn, []string{owner}, func() error {
-		return revokeRoleDefaultPrivileges(txn, d)
+		if _, err := txn.Exec(createDefaultPrivilegesRevokeQuery(d.Get, nil)); err != nil {
+			return fmt.Errorf("could not revoke default privileges: %w", err)
+		}
+		return nil
 	}); err != nil {
 		return err
 	}
@@ -293,70 +298,101 @@ func readRoleDefaultPrivileges(txn *sql.Tx, db *DBConnection, d *schema.Resource
 	return nil
 }
 
-func grantRoleDefaultPrivileges(txn *sql.Tx, d *schema.ResourceData) error {
-	role := d.Get("role").(string)
-	pgSchema := d.Get("schema").(string)
+// defaultPrivilegesStatements returns the ALTER DEFAULT PRIVILEGES statements
+// needed to reach the wanted privileges (getter("privileges")).
+//
+// oldPrivileges is the previously applied set on update, or nil on create.
+// When it is known and neither side uses ALL, only the difference is applied:
+// REVOKE of the removed privileges, then GRANT of the added ones.
+// Otherwise everything is revoked and the full set is granted again. Both
+// variants run in the same transaction, so the role never temporarily loses
+// the privileges it keeps.
+func defaultPrivilegesStatements(getter ResourceSchemeGetter, oldPrivileges *schema.Set) []string {
+	wanted := getter("privileges").(*schema.Set)
 
-	privileges := []string{}
-	for _, priv := range d.Get("privileges").(*schema.Set).List() {
-		privileges = append(privileges, priv.(string))
+	if oldPrivileges != nil {
+		if added, removed, ok := defaultPrivilegesDelta(oldPrivileges, wanted); ok {
+			var queries []string
+			if removed.Len() > 0 {
+				queries = append(queries, createDefaultPrivilegesRevokeQuery(getter, removed))
+			}
+			if added.Len() > 0 {
+				queries = append(queries, createDefaultPrivilegesGrantQuery(getter, added))
+			}
+			return queries
+		}
 	}
 
-	if len(privileges) == 0 {
-		log.Printf("[DEBUG] no default privileges to grant for role %s, owner %s in database: %s,", d.Get("role").(string), d.Get("owner").(string), d.Get("database").(string))
-		return nil
+	// Revoke all privileges before granting otherwise reducing privileges will not work.
+	queries := []string{createDefaultPrivilegesRevokeQuery(getter, nil)}
+	if wanted.Len() > 0 {
+		queries = append(queries, createDefaultPrivilegesGrantQuery(getter, wanted))
+	} else {
+		log.Printf("[DEBUG] no default privileges to grant for role %s, owner %s", getter("role").(string), getter("owner").(string))
 	}
-
-	var inSchema string
-
-	// If a schema is specified we need to build the part of the query string to action this
-	if pgSchema != "" {
-		inSchema = fmt.Sprintf("IN SCHEMA %s", pq.QuoteIdentifier(pgSchema))
-	}
-
-	query := fmt.Sprintf("ALTER DEFAULT PRIVILEGES FOR ROLE %s %s GRANT %s ON %sS TO %s",
-		pq.QuoteIdentifier(d.Get("owner").(string)),
-		inSchema,
-		strings.Join(privileges, ","),
-		strings.ToUpper(d.Get("object_type").(string)),
-		pq.QuoteIdentifier(role),
-	)
-
-	if d.Get("with_grant_option").(bool) {
-		query = query + " WITH GRANT OPTION"
-	}
-
-	_, err := txn.Exec(
-		query,
-	)
-	if err != nil {
-		return fmt.Errorf("could not alter default privileges: %w", err)
-	}
-
-	return nil
+	return queries
 }
 
-func revokeRoleDefaultPrivileges(txn *sql.Tx, d *schema.ResourceData) error {
-	pgSchema := d.Get("schema").(string)
+// defaultPrivilegesDelta computes the privileges to add and to remove to go
+// from oldPrivileges to newPrivileges. ok is false when ALL (or ALL PRIVILEGES)
+// is present on either side: ALL is an alias for a version dependent list of
+// privileges, so a plain set difference would be wrong and the caller has to
+// fall back to a full revoke and regrant.
+func defaultPrivilegesDelta(oldPrivileges, newPrivileges *schema.Set) (added, removed *schema.Set, ok bool) {
+	for _, set := range []*schema.Set{oldPrivileges, newPrivileges} {
+		for _, p := range set.List() {
+			switch strings.ToUpper(p.(string)) {
+			case "ALL", "ALL PRIVILEGES":
+				return nil, nil, false
+			}
+		}
+	}
+	return newPrivileges.Difference(oldPrivileges), oldPrivileges.Difference(newPrivileges), true
+}
 
+func defaultPrivilegesQueryPrefix(getter ResourceSchemeGetter) string {
 	var inSchema string
 
 	// If a schema is specified we need to build the part of the query string to action this
-	if pgSchema != "" {
+	if pgSchema := getter("schema").(string); pgSchema != "" {
 		inSchema = fmt.Sprintf("IN SCHEMA %s", pq.QuoteIdentifier(pgSchema))
 	}
-	query := fmt.Sprintf(
-		"ALTER DEFAULT PRIVILEGES FOR ROLE %s %s REVOKE ALL ON %sS FROM %s",
-		pq.QuoteIdentifier(d.Get("owner").(string)),
+
+	return fmt.Sprintf("ALTER DEFAULT PRIVILEGES FOR ROLE %s %s",
+		pq.QuoteIdentifier(getter("owner").(string)),
 		inSchema,
-		strings.ToUpper(d.Get("object_type").(string)),
-		pq.QuoteIdentifier(d.Get("role").(string)),
+	)
+}
+
+// createDefaultPrivilegesGrantQuery grants the given privileges.
+func createDefaultPrivilegesGrantQuery(getter ResourceSchemeGetter, privileges *schema.Set) string {
+	query := fmt.Sprintf("%s GRANT %s ON %sS TO %s",
+		defaultPrivilegesQueryPrefix(getter),
+		setToPgIdentSimpleList(privileges),
+		strings.ToUpper(getter("object_type").(string)),
+		pq.QuoteIdentifier(getter("role").(string)),
 	)
 
-	if _, err := txn.Exec(query); err != nil {
-		return fmt.Errorf("could not revoke default privileges: %w", err)
+	if getter("with_grant_option").(bool) {
+		query = query + " WITH GRANT OPTION"
 	}
-	return nil
+	return query
+}
+
+// createDefaultPrivilegesRevokeQuery revokes the given privileges, or all of
+// them when privileges is nil.
+func createDefaultPrivilegesRevokeQuery(getter ResourceSchemeGetter, privileges *schema.Set) string {
+	revoked := "ALL"
+	if privileges != nil {
+		revoked = setToPgIdentSimpleList(privileges)
+	}
+
+	return fmt.Sprintf("%s REVOKE %s ON %sS FROM %s",
+		defaultPrivilegesQueryPrefix(getter),
+		revoked,
+		strings.ToUpper(getter("object_type").(string)),
+		pq.QuoteIdentifier(getter("role").(string)),
+	)
 }
 
 func generateDefaultPrivilegesID(d *schema.ResourceData) string {
