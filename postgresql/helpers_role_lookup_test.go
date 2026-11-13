@@ -4,7 +4,9 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"os"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 )
@@ -84,5 +86,56 @@ func TestRoleOIDWrappersKeepBehavior(t *testing.T) {
 		if err != nil || got != want {
 			t.Fatalf("roleExists(%s) = (%v, %v), want (%v, nil)", role, got, err, want)
 		}
+	}
+}
+
+func TestGetRolesSuperuser(t *testing.T) {
+	skipIfNotAcc(t)
+	existing, missing := testRoleLookupName(t)
+	defer createTestRole(t, existing)()
+
+	db, txn := openTestRoleLookupDB(t)
+	defer closeDB(t, db)
+	defer deferredRollback(txn)
+
+	currentUser, err := getCurrentUser(txn)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := getRolesSuperuser(txn, []string{currentUser, existing, missing, existing})
+	if err != nil {
+		t.Fatalf("getRolesSuperuser: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("getRolesSuperuser returned %v, want exactly %s and %s", got, currentUser, existing)
+	}
+	wantSuper := os.Getenv("PGSUPERUSER") != "false"
+	if super, ok := got[currentUser]; !ok || super != wantSuper {
+		t.Fatalf("current user %s: got (%v, %v), want (%v, true)", currentUser, super, ok, wantSuper)
+	}
+	if super, ok := got[existing]; !ok || super {
+		t.Fatalf("role %s: got (%v, %v), want (false, true)", existing, super, ok)
+	}
+	if _, ok := got[missing]; ok {
+		t.Fatalf("missing role %s must not be in the result", missing)
+	}
+}
+
+func TestLookupSuperuser(t *testing.T) {
+	superusers := map[string]bool{"admin": true, "app": false}
+
+	if super, err := lookupSuperuser(superusers, "admin"); err != nil || !super {
+		t.Fatalf("lookupSuperuser(admin) = (%v, %v), want (true, nil)", super, err)
+	}
+	if super, err := lookupSuperuser(superusers, "app"); err != nil || super {
+		t.Fatalf("lookupSuperuser(app) = (%v, %v), want (false, nil)", super, err)
+	}
+
+	// A role missing from pg_roles keeps the error isSuperuser used to return.
+	_, err := lookupSuperuser(superusers, "ghost")
+	if err == nil || !errors.Is(err, sql.ErrNoRows) ||
+		!strings.HasPrefix(err.Error(), "could not check if role ghost is superuser: ") {
+		t.Fatalf("lookupSuperuser(ghost) error = %v, want 'could not check if role ghost is superuser: sql: no rows in result set'", err)
 	}
 }

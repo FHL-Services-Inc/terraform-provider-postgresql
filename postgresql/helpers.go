@@ -154,7 +154,14 @@ func withRolesGranted(txn *sql.Tx, roles []string, fn func() error) error {
 		return err
 	}
 
-	superuser, err := isSuperuser(txn, currentUser)
+	// Fetch rolsuper for the current user and all the requested roles in a
+	// single round-trip instead of one query per role.
+	superusers, err := getRolesSuperuser(txn, append([]string{currentUser}, roles...))
+	if err != nil {
+		return err
+	}
+
+	superuser, err := lookupSuperuser(superusers, currentUser)
 	if err != nil {
 		return err
 	}
@@ -169,7 +176,7 @@ func withRolesGranted(txn *sql.Tx, roles []string, fn func() error) error {
 	for _, role := range roles {
 		// We need to check if the role we want to grant is a superuser
 		// in this case Postgres disallows to grant it to a current user which is not superuser.
-		superuser, err := isSuperuser(txn, role)
+		superuser, err := lookupSuperuser(superusers, role)
 		if err != nil {
 			return err
 		}
@@ -573,13 +580,38 @@ func resolveOwners(db QueryAble, owners []string) ([]string, error) {
 	return resolvedOwners, nil
 }
 
-func isSuperuser(db QueryAble, role string) (bool, error) {
-	var superuser bool
+// getRolesSuperuser returns the rolsuper attribute of the given roles, fetched
+// with a single query. Roles that do not exist are absent from the result.
+func getRolesSuperuser(db QueryAble, roles []string) (map[string]bool, error) {
+	rows, err := db.Query("SELECT rolname, rolsuper FROM pg_roles WHERE rolname = ANY($1)", pq.Array(roles))
+	if err != nil {
+		return nil, fmt.Errorf("could not check if roles %v are superuser: %w", roles, err)
+	}
+	defer rows.Close()
 
-	if err := db.QueryRow("SELECT rolsuper FROM pg_roles WHERE rolname = $1", role).Scan(&superuser); err != nil {
-		return false, fmt.Errorf("could not check if role %s is superuser: %w", role, err)
+	superusers := make(map[string]bool, len(roles))
+	for rows.Next() {
+		var rolname string
+		var superuser bool
+		if err := rows.Scan(&rolname, &superuser); err != nil {
+			return nil, fmt.Errorf("could not scan superuser attribute: %w", err)
+		}
+		superusers[rolname] = superuser
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("could not check if roles %v are superuser: %w", roles, err)
 	}
 
+	return superusers, nil
+}
+
+// lookupSuperuser reads a role from the result of getRolesSuperuser.
+// A missing role yields the same error a per-role rolsuper lookup returned.
+func lookupSuperuser(superusers map[string]bool, role string) (bool, error) {
+	superuser, ok := superusers[role]
+	if !ok {
+		return false, fmt.Errorf("could not check if role %s is superuser: %w", role, sql.ErrNoRows)
+	}
 	return superuser, nil
 }
 
