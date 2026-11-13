@@ -435,15 +435,12 @@ func dbExists(db QueryAble, dbname string) (bool, error) {
 }
 
 func roleExists(txn *sql.Tx, rolname string) (bool, error) {
-	err := txn.QueryRow("SELECT 1 FROM pg_roles WHERE rolname=$1", rolname).Scan(&rolname)
-	switch {
-	case err == sql.ErrNoRows:
-		return false, nil
-	case err != nil:
+	_, exists, err := roleOIDAndExists(txn, rolname)
+	if err != nil {
 		return false, fmt.Errorf("could not check if role exists: %w", err)
 	}
 
-	return true, nil
+	return exists, nil
 }
 
 func schemaExists(txn *sql.Tx, schemaname string) (bool, error) {
@@ -593,11 +590,30 @@ func getRoleOID(db QueryAble, role string) (uint32, error) {
 		return 0, nil
 	}
 
-	var oid uint32
-	if err := db.QueryRow("SELECT oid FROM pg_roles WHERE rolname = $1", role).Scan(&oid); err != nil {
+	oid, exists, err := roleOIDAndExists(db, role)
+	if err == nil && !exists {
+		err = sql.ErrNoRows
+	}
+	if err != nil {
 		return 0, fmt.Errorf("could not find oid for role %s: %w", role, err)
 	}
 	return oid, nil
+}
+
+// roleOIDAndExists looks up a role in pg_roles with a single query and returns
+// its OID and whether it exists. A missing role is not an error (0, false, nil).
+// Unlike getRoleOID, the pseudo-role "public" is not special-cased: it has no
+// pg_roles row, so it is reported as not existing.
+func roleOIDAndExists(db QueryAble, role string) (uint32, bool, error) {
+	var oid uint32
+	err := db.QueryRow("SELECT oid FROM pg_roles WHERE rolname = $1", role).Scan(&oid)
+	switch {
+	case err == sql.ErrNoRows:
+		return 0, false, nil
+	case err != nil:
+		return 0, false, err
+	}
+	return oid, true, nil
 }
 
 // Lock a role and all his members to avoid concurrent updates on some resources
