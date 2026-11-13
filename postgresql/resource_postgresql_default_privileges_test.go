@@ -577,7 +577,11 @@ WHERE d.defaclrole = (SELECT oid FROM pg_roles WHERE rolname = $1)
 		if err != nil {
 			return fmt.Errorf("could not read pg_default_acl: %w", err)
 		}
-		defer rows.Close()
+		defer func() {
+			if err := rows.Close(); err != nil {
+				t.Errorf("could not close rows: %v", err)
+			}
+		}()
 
 		got := map[string]bool{}
 		for rows.Next() {
