@@ -135,7 +135,7 @@ func resourcePostgreSQLExtensionReadImpl(db *DBConnection, d *schema.ResourceDat
 		return err
 	}
 
-	txn, err := startTransaction(db.client, database)
+	dbc, err := initConnection(db.client, database)
 	if err != nil {
 		if isDatabaseDoesNotExistError(err) {
 			log.Printf("[WARN] PostgreSQL database (%s) not found, removing extension (%s) from state", database, extName)
@@ -144,16 +144,19 @@ func resourcePostgreSQLExtensionReadImpl(db *DBConnection, d *schema.ResourceDat
 		}
 		return err
 	}
-	defer deferredRollback(txn)
 
 	var extSchema, extVersion string
 	query := `SELECT n.nspname, e.extversion ` +
 		`FROM pg_catalog.pg_extension e, pg_catalog.pg_namespace n ` +
 		`WHERE n.oid = e.extnamespace AND e.extname = $1`
-	err = txn.QueryRow(query, extName).Scan(&extSchema, &extVersion)
+	err = dbc.QueryRow(query, extName).Scan(&extSchema, &extVersion)
 	switch {
 	case err == sql.ErrNoRows:
 		log.Printf("[WARN] PostgreSQL extension (%s) not found for database %s", extName, database)
+		d.SetId("")
+		return nil
+	case isDatabaseDoesNotExistError(err):
+		log.Printf("[WARN] PostgreSQL database (%s) not found, removing extension (%s) from state", database, extName)
 		d.SetId("")
 		return nil
 	case err != nil:
