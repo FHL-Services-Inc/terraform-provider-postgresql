@@ -160,18 +160,13 @@ func resourcePostgreSQLServerRead(db *DBConnection, d *schema.ResourceData) erro
 
 func resourcePostgreSQLServerReadImpl(db *DBConnection, d *schema.ResourceData) error {
 	serverName := d.Get(serverNameAttr).(string)
-	txn, err := startTransaction(db.client, "")
-	if err != nil {
-		return err
-	}
-	defer deferredRollback(txn)
 
 	var serverType, serverVersion, serverOwner, serverFDW string
 	var serverOptions []string
 	query := `SELECT COALESCE(fs.srvtype, ''), COALESCE(fs.srvversion, ''), fs.srvowner::regrole, fs.srvoptions, w.fdwname ` +
 		`FROM pg_foreign_server fs JOIN pg_foreign_data_wrapper w on w.oid = fs.srvfdw ` +
 		`WHERE fs.srvname = $1`
-	err = txn.QueryRow(query, serverName).Scan(&serverType, &serverVersion, &serverOwner, pq.Array(&serverOptions), &serverFDW)
+	err := db.QueryRow(query, serverName).Scan(&serverType, &serverVersion, &serverOwner, pq.Array(&serverOptions), &serverFDW)
 	switch {
 	case err == sql.ErrNoRows:
 		log.Printf("[WARN] PostgreSQL foreign server (%s) not found", serverName)
