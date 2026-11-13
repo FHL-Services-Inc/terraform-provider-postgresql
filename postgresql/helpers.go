@@ -154,7 +154,14 @@ func withRolesGranted(txn *sql.Tx, roles []string, fn func() error) error {
 		return err
 	}
 
-	superuser, err := isSuperuser(txn, currentUser)
+	// Fetch rolsuper for the current user and all the requested roles in a
+	// single round-trip instead of one query per role.
+	superusers, err := getRolesSuperuser(txn, append([]string{currentUser}, roles...))
+	if err != nil {
+		return err
+	}
+
+	superuser, err := lookupSuperuser(superusers, currentUser)
 	if err != nil {
 		return err
 	}
@@ -169,7 +176,7 @@ func withRolesGranted(txn *sql.Tx, roles []string, fn func() error) error {
 	for _, role := range roles {
 		// We need to check if the role we want to grant is a superuser
 		// in this case Postgres disallows to grant it to a current user which is not superuser.
-		superuser, err := isSuperuser(txn, role)
+		superuser, err := lookupSuperuser(superusers, role)
 		if err != nil {
 			return err
 		}
@@ -435,15 +442,12 @@ func dbExists(db QueryAble, dbname string) (bool, error) {
 }
 
 func roleExists(txn *sql.Tx, rolname string) (bool, error) {
-	err := txn.QueryRow("SELECT 1 FROM pg_roles WHERE rolname=$1", rolname).Scan(&rolname)
-	switch {
-	case err == sql.ErrNoRows:
-		return false, nil
-	case err != nil:
+	_, exists, err := roleOIDAndExists(txn, rolname)
+	if err != nil {
 		return false, fmt.Errorf("could not check if role exists: %w", err)
 	}
 
-	return true, nil
+	return exists, nil
 }
 
 func schemaExists(txn *sql.Tx, schemaname string) (bool, error) {
@@ -576,13 +580,42 @@ func resolveOwners(db QueryAble, owners []string) ([]string, error) {
 	return resolvedOwners, nil
 }
 
-func isSuperuser(db QueryAble, role string) (bool, error) {
-	var superuser bool
+// getRolesSuperuser returns the rolsuper attribute of the given roles, fetched
+// with a single query. Roles that do not exist are absent from the result.
+func getRolesSuperuser(db QueryAble, roles []string) (map[string]bool, error) {
+	rows, err := db.Query("SELECT rolname, rolsuper FROM pg_roles WHERE rolname = ANY($1)", pq.Array(roles))
+	if err != nil {
+		return nil, fmt.Errorf("could not check if roles %v are superuser: %w", roles, err)
+	}
+	defer func() {
+		if err := rows.Close(); err != nil {
+			log.Printf("error closing rows: %v", err)
+		}
+	}()
 
-	if err := db.QueryRow("SELECT rolsuper FROM pg_roles WHERE rolname = $1", role).Scan(&superuser); err != nil {
-		return false, fmt.Errorf("could not check if role %s is superuser: %w", role, err)
+	superusers := make(map[string]bool, len(roles))
+	for rows.Next() {
+		var rolname string
+		var superuser bool
+		if err := rows.Scan(&rolname, &superuser); err != nil {
+			return nil, fmt.Errorf("could not scan superuser attribute: %w", err)
+		}
+		superusers[rolname] = superuser
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("could not check if roles %v are superuser: %w", roles, err)
 	}
 
+	return superusers, nil
+}
+
+// lookupSuperuser reads a role from the result of getRolesSuperuser.
+// A missing role yields the same error a per-role rolsuper lookup returned.
+func lookupSuperuser(superusers map[string]bool, role string) (bool, error) {
+	superuser, ok := superusers[role]
+	if !ok {
+		return false, fmt.Errorf("could not check if role %s is superuser: %w", role, sql.ErrNoRows)
+	}
 	return superuser, nil
 }
 
@@ -593,11 +626,30 @@ func getRoleOID(db QueryAble, role string) (uint32, error) {
 		return 0, nil
 	}
 
-	var oid uint32
-	if err := db.QueryRow("SELECT oid FROM pg_roles WHERE rolname = $1", role).Scan(&oid); err != nil {
+	oid, exists, err := roleOIDAndExists(db, role)
+	if err == nil && !exists {
+		err = sql.ErrNoRows
+	}
+	if err != nil {
 		return 0, fmt.Errorf("could not find oid for role %s: %w", role, err)
 	}
 	return oid, nil
+}
+
+// roleOIDAndExists looks up a role in pg_roles with a single query and returns
+// its OID and whether it exists. A missing role is not an error (0, false, nil).
+// Unlike getRoleOID, the pseudo-role "public" is not special-cased: it has no
+// pg_roles row, so it is reported as not existing.
+func roleOIDAndExists(db QueryAble, role string) (uint32, bool, error) {
+	var oid uint32
+	err := db.QueryRow("SELECT oid FROM pg_roles WHERE rolname = $1", role).Scan(&oid)
+	switch {
+	case err == sql.ErrNoRows:
+		return 0, false, nil
+	case err != nil:
+		return 0, false, err
+	}
+	return oid, true, nil
 }
 
 // Lock a role and all his members to avoid concurrent updates on some resources
