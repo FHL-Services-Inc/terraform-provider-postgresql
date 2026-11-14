@@ -61,23 +61,36 @@ func main() {
 	write(filepath.Join(*out, "fixture.sql"), p.fixtureSQL)
 	write(filepath.Join(*out, "cleanup.sql"), p.cleanupSQL)
 	n := 0
-	write(filepath.Join(*out, "main.tf"), func(w *bufio.Writer) { n = p.terraform(w) })
+	write(filepath.Join(*out, "main.tf"), func(w writer) { n = p.terraform(w) })
 	fmt.Printf("wrote %s: %d tables in %d schemas, %d terraform resources\n", *out, p.tables, p.schemas, n)
 }
 
-func write(path string, fn func(*bufio.Writer)) {
+func write(path string, fn func(writer)) {
 	f, err := os.Create(path)
 	if err != nil {
 		log.Fatal(err)
 	}
 	w := bufio.NewWriter(f)
-	fn(w)
+	fn(writer{w})
 	if err := w.Flush(); err != nil {
 		log.Fatal(err)
 	}
 	if err := f.Close(); err != nil {
 		log.Fatal(err)
 	}
+}
+
+// writer wraps a bufio.Writer. A bufio.Writer keeps the first write error and
+// returns it from every later call, including Flush, so write checks the error
+// once there instead of after each print.
+type writer struct{ *bufio.Writer }
+
+func (w writer) printf(format string, args ...any) {
+	_, _ = fmt.Fprintf(w.Writer, format, args...)
+}
+
+func (w writer) print(args ...any) {
+	_, _ = fmt.Fprint(w.Writer, args...)
 }
 
 func (p params) tablesIn(schema int) int {
@@ -88,28 +101,28 @@ func (p params) tablesIn(schema int) int {
 	return n
 }
 
-func (p params) fixtureSQL(w *bufio.Writer) {
-	fmt.Fprintf(w, "CREATE DATABASE %s;\n\\connect %s\n", p.db, p.db)
+func (p params) fixtureSQL(w writer) {
+	w.printf("CREATE DATABASE %s;\n\\connect %s\n", p.db, p.db)
 	for s := 0; s < p.schemas; s++ {
-		fmt.Fprintf(w, "CREATE SCHEMA app_%d;\n", s)
+		w.printf("CREATE SCHEMA app_%d;\n", s)
 		for t := 0; t < p.tablesIn(s); t++ {
-			fmt.Fprintf(w, "CREATE TABLE app_%d.t_%d (id bigint PRIMARY KEY, payload text);\n", s, t)
+			w.printf("CREATE TABLE app_%d.t_%d (id bigint PRIMARY KEY, payload text);\n", s, t)
 		}
 	}
 }
 
-func (p params) cleanupSQL(w *bufio.Writer) {
+func (p params) cleanupSQL(w writer) {
 	// Dropping the databases first removes every privilege and default ACL that
 	// references the roles, so the roles can be dropped afterwards.
-	fmt.Fprintf(w, "DROP DATABASE IF EXISTS %s WITH (FORCE);\n", p.db)
+	w.printf("DROP DATABASE IF EXISTS %s WITH (FORCE);\n", p.db)
 	for d := 0; d < p.databases; d++ {
-		fmt.Fprintf(w, "DROP DATABASE IF EXISTS %s_db_%d WITH (FORCE);\n", p.prefix, d)
+		w.printf("DROP DATABASE IF EXISTS %s_db_%d WITH (FORCE);\n", p.prefix, d)
 	}
 	for i := 0; i < p.roles; i++ {
-		fmt.Fprintf(w, "DROP ROLE IF EXISTS %s_user_%d;\n", p.prefix, i)
+		w.printf("DROP ROLE IF EXISTS %s_user_%d;\n", p.prefix, i)
 	}
 	for g := 0; g < p.groups; g++ {
-		fmt.Fprintf(w, "DROP ROLE IF EXISTS %s_group_%d;\n", p.prefix, g)
+		w.printf("DROP ROLE IF EXISTS %s_group_%d;\n", p.prefix, g)
 	}
 }
 
@@ -119,9 +132,9 @@ func (p params) cleanupSQL(w *bufio.Writer) {
 // USAGE on schema app_(i%schemas), schema-wide SELECT on its tables (no objects),
 // SELECT/INSERT on objectsPerGrnt tables of the next schema (with objects), and for
 // every other role a default-privileges entry.
-func (p params) terraform(w *bufio.Writer) int {
+func (p params) terraform(w writer) int {
 	n := 0
-	fmt.Fprint(w, `terraform {
+	w.print(`terraform {
   required_providers {
     postgresql = {
       source = "cyrilgdn/postgresql"
@@ -157,15 +170,15 @@ provider "postgresql" {
 `)
 
 	for d := 0; d < p.databases; d++ {
-		fmt.Fprintf(w, "\nresource \"postgresql_database\" \"db_%d\" {\n  name = \"%s_db_%d\"\n}\n", d, p.prefix, d)
+		w.printf("\nresource \"postgresql_database\" \"db_%d\" {\n  name = \"%s_db_%d\"\n}\n", d, p.prefix, d)
 		n++
 	}
 	for g := 0; g < p.groups; g++ {
-		fmt.Fprintf(w, "\nresource \"postgresql_role\" \"group_%d\" {\n  name = \"%s_group_%d\"\n}\n", g, p.prefix, g)
+		w.printf("\nresource \"postgresql_role\" \"group_%d\" {\n  name = \"%s_group_%d\"\n}\n", g, p.prefix, g)
 		n++
 	}
 	for s := 0; s < p.tfSchemas; s++ {
-		fmt.Fprintf(w, `
+		w.printf(`
 resource "postgresql_schema" "tf_%d" {
   name     = "tf_%d"
   database = %q
@@ -178,7 +191,7 @@ resource "postgresql_schema" "tf_%d" {
 	for i := 0; i < p.roles; i++ {
 		own := i % p.schemas
 		next := (i + 1) % p.schemas
-		fmt.Fprintf(w, `
+		w.printf(`
 resource "postgresql_role" "user_%[1]d" {
   name  = "%[2]s_user_%[1]d"
   login = true
@@ -222,7 +235,7 @@ resource "postgresql_grant" "user_%[1]d_some_tables" {
 		n += 5
 
 		if i%2 == 0 {
-			fmt.Fprintf(w, `
+			w.printf(`
 resource "postgresql_default_privileges" "user_%[1]d" {
   database    = %[2]q
   role        = postgresql_role.user_%[1]d.name
