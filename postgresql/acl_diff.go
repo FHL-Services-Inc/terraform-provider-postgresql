@@ -428,6 +428,13 @@ func (g *statementGroup) render(phase int, role string, actual aclState) []strin
 
 	var stmts []string
 	for _, m := range list {
+		if strings.HasPrefix(g.kind, "default:") {
+			// Default privileges are altered per owner: one statement each.
+			for _, owner := range m.objects {
+				stmts = append(stmts, g.statement(phase, role, m.privileges, []string{owner}, actual))
+			}
+			continue
+		}
 		stmts = append(stmts, g.statement(phase, role, m.privileges, m.objects, actual))
 	}
 	return stmts

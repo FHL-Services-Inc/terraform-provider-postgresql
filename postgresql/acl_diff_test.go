@@ -253,3 +253,18 @@ func TestDriftEntries_CapAndProblems(t *testing.T) {
 		t.Fatalf("last entry = %q", got[len(got)-1])
 	}
 }
+
+func TestRenderACLStatements_DefaultPrivilegesPerOwner(t *testing.T) {
+	a := aclObject{kind: "default:table", schema: "s", name: "owner_a"}
+	b := aclObject{kind: "default:table", schema: "s", name: "owner_b"}
+	desired := aclState{a: privs("SELECT"), b: privs("SELECT")}
+	actual := aclState{}
+	got := renderACLStatements("r", diffACL(desired, actual, scopeOf(desired)), actual)
+	want := []string{
+		`ALTER DEFAULT PRIVILEGES FOR ROLE "owner_a" IN SCHEMA "s" GRANT SELECT ON TABLES TO "r"`,
+		`ALTER DEFAULT PRIVILEGES FOR ROLE "owner_b" IN SCHEMA "s" GRANT SELECT ON TABLES TO "r"`,
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+}
