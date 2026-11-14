@@ -181,12 +181,18 @@ The following arguments are supported:
   every connection is closed once it is returned, so each query opens a new
   connection. Setting it above zero avoids a new connection (TCP, TLS and
   authentication handshake) for most queries, which noticeably speeds up plans
-  and applies with many resources. Idle connections are closed after 5 minutes,
-  and the provider closes its own connections to a database before dropping it
-  with `postgresql_database`. While Terraform runs, a plain `DROP DATABASE`
+  and applies with many resources. Idle connections are closed after 30
+  seconds. Each database the provider connects to gets its own pool, so the
+  limit applies per database, not in total. `postgresql_database` closes the provider's own connections to a
+  database before dropping or renaming it, or before using it as the
+  `template` of another database. While Terraform runs, a plain
+  `DROP DATABASE`, `ALTER DATABASE ... RENAME` or `CREATE DATABASE ... TEMPLATE`
   issued outside of the provider can fail with "database is being accessed by
-  other users" because of these idle connections. The value is capped to
-  `max_connections` when the latter is non-zero.
+  other users" because of these idle connections; terminate them first
+  (`pg_terminate_backend`) or use `DROP DATABASE ... WITH (FORCE)` on
+  PostgreSQL 13+. The value is capped to `max_connections` when the latter is
+  non-zero. It can also be set with the `PGMAXIDLECONNECTIONS` environment
+  variable.
 * `conn_max_lifetime_seconds` - (Optional) Maximum lifetime of a connection,
   in seconds. The default is `0`.  Zero means unlimited.
 * `expected_version` - (Optional) Specify a hint to Terraform regarding the
