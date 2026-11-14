@@ -61,3 +61,8 @@ Changing this value
   user mapping, even to the owner of the server. In that case the provider
   keeps the options from the Terraform state, so changes made to them outside
   of Terraform are not detected.
+
+~> **Known issue:** a user mapping for `PUBLIC` (`user_name = "public"`) is
+created but not read back, so the apply reports an inconsistent result and the
+next apply tries to create it again
+([#121](https://github.com/FHL-Services-Inc/terraform-provider-postgresql/issues/121)).

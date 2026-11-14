@@ -51,6 +51,28 @@ resource "postgresql_grant" "read_insert_column" {
 * `columns` - (Optional) The columns upon which to grant the privileges. Required when `object_type` is `column`. You cannot specify this option if the `object_type` is not `column`.
 * `with_grant_option` - (Optional) Whether the recipient of these privileges can grant the same privileges to others. Defaults to false.
 
+### Notes
+
+* **`object_type = "table"` covers every kind of relation `GRANT ... ON TABLE`
+  accepts:** ordinary and partitioned tables, views, materialized views and
+  foreign tables, and so does `object_type = "column"`. This applies to
+  reading the privileges back too: with `objects` empty, every such relation in
+  the schema must have the configured privileges, and a missing privilege on
+  any of them (for example on a view created after the grant, or revoked
+  outside of Terraform) shows up as a change that the next apply grants
+  again. Earlier versions only read back ordinary tables, so the first plan
+  after upgrading can show such changes; a column grant on a view is no longer
+  replaced on every plan.
+* **`object_type = "database"` with a non-superuser provider:** PostgreSQL
+  ignores (with only a warning) a `GRANT ... ON DATABASE` from a role that
+  neither owns the database nor has grant option on it. As for schemas and
+  tables, the provider therefore temporarily grants itself membership in the
+  database owner while it runs the statement, and revokes it afterwards. The
+  provider's role needs the right to grant the owner role to itself (`ADMIN
+  OPTION` on it, or `CREATEROLE` before PostgreSQL 16).
+* Privileges are read with a single statement per resource, outside of a
+  transaction.
+
 
 ## Examples
 

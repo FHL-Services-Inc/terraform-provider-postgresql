@@ -30,7 +30,10 @@ resource "postgresql_database" "my_db" {
 ## Argument Reference
 
 * `name` - (Required) The name of the database. Must be unique on the PostgreSQL
-  server instance where it is configured.
+  server instance where it is configured. Changing it renames the database,
+  which PostgreSQL refuses while other sessions are connected to it. With
+  `max_idle_connections` enabled in the provider, the provider closes its own
+  pooled connections to the database before renaming or dropping it.
 
 * `owner` - (Optional) The role name of the user who will own the database, or
   `DEFAULT` to use the default (namely, the user executing the command). To
@@ -59,6 +62,34 @@ resource "postgresql_database" "my_db" {
   the default in Terraform is `template0`, not `template1`.  Changing this value
   will force the creation of a new resource as this value can only be changed
   when a database is created.
+
+  PostgreSQL refuses to copy a database while any other session is connected
+  to it. When the template is a database managed in the same configuration,
+  make this resource depend on the resources inside the template database
+  (schemas, extensions, grants, ...), for example with `depends_on`, so they
+  are done before the copy starts. With `max_idle_connections` enabled in the
+  provider, the provider closes its pooled connections to the template
+  database just before the copy; a resource inside the template database that
+  is still running at that moment fails with `sql: database is closed`.
+
+  ```hcl
+  resource "postgresql_database" "template" {
+    name        = "app_template"
+    is_template = true
+  }
+
+  resource "postgresql_extension" "pgcrypto" {
+    name     = "pgcrypto"
+    database = postgresql_database.template.name
+  }
+
+  resource "postgresql_database" "app" {
+    name     = "app"
+    template = postgresql_database.template.name
+
+    depends_on = [postgresql_extension.pgcrypto]
+  }
+  ```
 
 * `encoding` - (Optional) Character set encoding to use in the database.
   Specify a string constant (e.g. `UTF8` or `SQL_ASCII`), or an integer encoding
@@ -90,6 +121,15 @@ resource "postgresql_database" "my_db" {
   hold the ownership of the objects in that database. To alter existing objects in
   the database, you must be a direct or indirect member of the specified role, or
   the username in the provider must be superuser.
+
+  The reassignment runs `REASSIGN OWNED BY <previous owner> TO <new owner>` in
+  the database. Note that `REASSIGN OWNED` also transfers the previous owner's
+  shared objects, such as other databases it owns, to the new owner.
+
+  A provider connected as a non-superuser (for example with `CREATEROLE`, as on
+  AWS RDS or Cloud SQL) temporarily grants itself membership in the previous
+  and the new owner for the reassignment, and revokes the memberships it added
+  afterwards. Owner changes of several databases in one apply are serialized.
 
 ## Import Example
 
