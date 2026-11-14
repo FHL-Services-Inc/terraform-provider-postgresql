@@ -49,6 +49,65 @@ func TestQuoteIdentifyIdentKeepsWholeSignature(t *testing.T) {
 	}
 }
 
+// TestFunctionLookupSignature checks how an objects entry is reduced to the
+// argument types to_regprocedure accepts: GRANT also takes argument modes and
+// names and ignores OUT arguments, so those are dropped; the types are kept as
+// written.
+func TestFunctionLookupSignature(t *testing.T) {
+	cases := map[string]string{
+		"f(integer)":                             "f(integer)",
+		"f()":                                    "f()",
+		"f( )":                                   "f()",
+		"f(  integer ,  text )":                  "f(integer, text)",
+		"f(x integer)":                           "f(integer)",
+		"f(IN a text, OUT b int)":                "f(text)",
+		"f(in a text, inout b int)":              "f(text, int)",
+		"f(OUT b int)":                           "f()",
+		"f(out integer)":                         "f()",
+		"f(INOUT integer)":                       "f(integer)",
+		"f(VARIADIC v integer[])":                "f(integer[])",
+		"f(variadic integer[])":                  "f(integer[])",
+		"f(x integer[])":                         "f(integer[])",
+		"f(integer [])":                          "f(integer [])",
+		"f(a integer DEFAULT 1, b text = 'x,y')": "f(integer, text)",
+		"f(a integer default (1 + 2))":           "f(integer)",
+		`f("my arg" "MyType")`:                   `f("MyType")`,
+		`f(x "My Type")`:                         `f("My Type")`,
+		`f("My Type")`:                           `f("My Type")`,
+		`f("a""b" text)`:                         `f(text)`,
+		"f(numeric(10,2))":                       "f(numeric(10,2))",
+		"f(x numeric(10, 2))":                    "f(numeric(10, 2))",
+		"f(numeric (10,2))":                      "f(numeric (10,2))",
+		"f(double precision)":                    "f(double precision)",
+		"f(d double precision)":                  "f(double precision)",
+		"f(d DOUBLE PRECISION[])":                "f(DOUBLE PRECISION[])",
+		"f(character varying(10))":               "f(character varying(10))",
+		"f(c character varying)":                 "f(character varying)",
+		"f(char varying)":                        "f(char varying)",
+		"f(national character varying(5))":       "f(national character varying(5))",
+		"f(n national char)":                     "f(national char)",
+		"f(bit varying(5))":                      "f(bit varying(5))",
+		"f(b bit varying)":                       "f(bit varying)",
+		"f(timestamp with time zone)":            "f(timestamp with time zone)",
+		"f(ts timestamp(3) without time zone)":   "f(timestamp(3) without time zone)",
+		"f(time)":                                "f(time)",
+		"f(time integer)":                        "f(integer)",
+		"f(interval day to second)":              "f(interval day to second)",
+		"f(interval(3))":                         "f(interval(3))",
+		"f(interval integer)":                    "f(integer)",
+		"f(x pg_catalog.int4)":                   "f(pg_catalog.int4)",
+		"f(int4, x int4)":                        "f(int4, int4)",
+		// Not a signature to reduce: left as is.
+		"f":         "f",
+		"f(integer": "f(integer",
+	}
+	for in, want := range cases {
+		if got := functionLookupSignature(in); got != want {
+			t.Errorf("functionLookupSignature(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
 // TestBuildReadFunctionRolePrivilegesQuery locks in the function/procedure/
 // routine Read query shape: one row per routine (overload), bare entries
 // matched by name through the pg_proc name index, entries carrying an argument
@@ -102,7 +161,7 @@ func TestBuildReadFunctionRolePrivilegesQuery(t *testing.T) {
 		}
 	})
 
-	entries := []any{"f", "f(integer)", "g(text, char)", "h(numeric(10,2))", "k"}
+	entries := []any{"f", "f(integer)", "g(text, char)", "h(numeric(10,2))", "k", "m(IN x integer, OUT y text)"}
 	objects := schema.NewSet(schema.HashString, entries)
 
 	t.Run("listed objects", func(t *testing.T) {
@@ -138,16 +197,19 @@ func TestBuildReadFunctionRolePrivilegesQuery(t *testing.T) {
 			got[sigEntries[i]] = signatures[i]
 		}
 		want := map[string]string{
-			"f(integer)":       `"test schema"."f"(integer)`,
-			"g(text, char)":    `"test schema"."g"(text, char)`,
-			"h(numeric(10,2))": `"test schema"."h"(numeric(10,2))`,
+			"f(integer)":                  `"test schema"."f"(integer)`,
+			"g(text, char)":               `"test schema"."g"(text, char)`,
+			"h(numeric(10,2))":            `"test schema"."h"(numeric(10,2))`,
+			"m(IN x integer, OUT y text)": `"test schema"."m"(integer)`,
 		}
 		if !reflect.DeepEqual(got, want) {
 			t.Fatalf("signatures: got %v, want %v", got, want)
 		}
-		// The signature is rendered exactly like the GRANT renders it.
+		// The signature is rendered like the GRANT renders it, once reduced
+		// to its argument types.
 		for entry, sig := range got {
-			if wantSig := setToPgIdentList("test schema", schema.NewSet(schema.HashString, []any{entry})); sig != wantSig {
+			lookup := functionLookupSignature(entry)
+			if wantSig := setToPgIdentList("test schema", schema.NewSet(schema.HashString, []any{lookup})); sig != wantSig {
 				t.Fatalf("signature of %q = %q, the GRANT uses %q", entry, sig, wantSig)
 			}
 		}
@@ -269,6 +331,8 @@ func TestAccPostgresqlGrantReadFunctionPrivilegesQuery(t *testing.T) {
 		"CREATE FUNCTION test_schema.g() RETURNS int LANGUAGE sql AS 'SELECT 1'",
 		"CREATE FUNCTION test_schema.h() RETURNS int LANGUAGE sql AS 'SELECT 1'",
 		"CREATE FUNCTION test_schema.v(character varying, numeric) RETURNS int LANGUAGE sql AS 'SELECT 1'",
+		"CREATE FUNCTION test_schema.mo(IN a text, OUT b integer) LANGUAGE sql AS 'SELECT 1'",
+		"CREATE FUNCTION test_schema.vf(VARIADIC xs integer[]) RETURNS int LANGUAGE sql AS 'SELECT 1'",
 		`CREATE FUNCTION test_schema."q(int)"() RETURNS int LANGUAGE sql AS 'SELECT 1'`,
 		"CREATE PROCEDURE test_schema.p() LANGUAGE sql AS 'SELECT 1'",
 		"CREATE AGGREGATE test_schema.agg(integer) (SFUNC = int4pl, STYPE = integer)",
@@ -277,6 +341,7 @@ func TestAccPostgresqlGrantReadFunctionPrivilegesQuery(t *testing.T) {
 		fmt.Sprintf("GRANT EXECUTE ON PROCEDURE test_schema.f(boolean) TO %s", roleName),
 		fmt.Sprintf("GRANT EXECUTE ON FUNCTION test_schema.f2(integer), test_schema.f2(text) TO %s", roleName),
 		fmt.Sprintf("GRANT EXECUTE ON FUNCTION test_schema.v(varchar, numeric) TO %s", roleName),
+		fmt.Sprintf("GRANT EXECUTE ON FUNCTION test_schema.mo(text), test_schema.vf(integer[]) TO %s", roleName),
 		fmt.Sprintf(`GRANT EXECUTE ON FUNCTION test_schema."q(int)"() TO %s`, roleName),
 		fmt.Sprintf("GRANT EXECUTE ON PROCEDURE test_schema.p() TO %s", roleName),
 		fmt.Sprintf("GRANT EXECUTE ON FUNCTION test_schema.agg(integer) TO %s", roleName),
@@ -304,7 +369,7 @@ func TestAccPostgresqlGrantReadFunctionPrivilegesQuery(t *testing.T) {
 			role: roleName, schema: "test_schema", roleExists: true, schemaExists: true,
 			expected: map[string][]string{
 				"f": {"", e}, "f2": {e, e}, "g": {""}, "h": {""}, "v": {e},
-				"q(int)": {e}, "agg": {e},
+				"mo": {e}, "vf": {e}, "q(int)": {e}, "agg": {e},
 			},
 		},
 		{
@@ -317,7 +382,7 @@ func TestAccPostgresqlGrantReadFunctionPrivilegesQuery(t *testing.T) {
 			role: roleName, schema: "test_schema", roleExists: true, schemaExists: true,
 			expected: map[string][]string{
 				"f": {"", e, e}, "f2": {e, e}, "g": {""}, "h": {""}, "v": {e},
-				"q(int)": {e}, "agg": {e}, "p": {e},
+				"mo": {e}, "vf": {e}, "q(int)": {e}, "agg": {e}, "p": {e},
 			},
 		},
 		{
@@ -342,6 +407,24 @@ func TestAccPostgresqlGrantReadFunctionPrivilegesQuery(t *testing.T) {
 			expected: map[string][]string{
 				"f(int4)": {e}, "f(  integer )": {e}, "f(pg_catalog.int4)": {e}, "f2(TEXT)": {e},
 				"v(varchar,numeric)": {e}, "v(character varying(10), numeric(10,2))": {e},
+			},
+		},
+		{
+			// GRANT accepts argument names and modes and ignores OUT
+			// arguments; the Read resolves the same overload.
+			name: "argument names and modes", objectType: "function",
+			role: roleName, schema: "test_schema", roleExists: true, schemaExists: true,
+			objects: []any{
+				"f(x integer)", "f(IN x integer)", "f(x text)", "mo(IN a text, OUT b integer)",
+				"mo(a text)", "vf(VARIADIC xs integer[])", "vf(variadic integer[])",
+				"f(x integer DEFAULT 1)", "v(c character varying, n numeric(10,2))",
+				"v(time varchar, interval numeric)", `v("my arg" varchar, numeric)`,
+			},
+			expected: map[string][]string{
+				"f(x integer)": {e}, "f(IN x integer)": {e}, "f(x text)": {""}, "mo(IN a text, OUT b integer)": {e},
+				"mo(a text)": {e}, "vf(VARIADIC xs integer[])": {e}, "vf(variadic integer[])": {e},
+				"f(x integer DEFAULT 1)": {e}, "v(c character varying, n numeric(10,2))": {e},
+				"v(time varchar, interval numeric)": {e}, `v("my arg" varchar, numeric)`: {e},
 			},
 		},
 		{
@@ -443,6 +526,7 @@ func TestAccPostgresqlGrantFunctionOverloads(t *testing.T) {
 		"CREATE FUNCTION test_schema.k() RETURNS int LANGUAGE sql AS 'SELECT 1'",
 		"CREATE FUNCTION test_schema.sp(integer, text) RETURNS int LANGUAGE sql AS 'SELECT 1'",
 		"CREATE FUNCTION test_schema.m(integer) RETURNS int LANGUAGE sql AS 'SELECT 1'",
+		"CREATE FUNCTION test_schema.mo(IN a text, OUT b integer) LANGUAGE sql AS 'SELECT 1'",
 		"CREATE AGGREGATE test_schema.agg(integer) (SFUNC = int4pl, STYPE = integer)",
 		"CREATE PROCEDURE test_schema.p() LANGUAGE sql AS 'SELECT 1'",
 		"CREATE PROCEDURE test_schema.p2() LANGUAGE sql AS 'SELECT 1'",
@@ -484,13 +568,13 @@ resource "postgresql_grant" "spelling" {
 	privileges  = ["EXECUTE"]
 }
 
-# The read cannot resolve an entry with argument names; it must not fail.
+# Argument names and modes, as GRANT accepts them.
 resource "postgresql_grant" "named_args" {
 	database    = "%[1]s"
 	role        = "%[2]s"
 	schema      = "test_schema"
 	object_type = "function"
-	objects     = ["m(x integer)"]
+	objects     = ["m(x integer)", "mo(IN a text, OUT b integer)"]
 	privileges  = ["EXECUTE"]
 }
 
@@ -542,7 +626,7 @@ resource "postgresql_grant" "all_functions" {
 			{
 				// The framework also checks that a plan right after apply is
 				// empty: no drift from the signature entries (whatever their
-				// spelling), from the entry it cannot resolve, nor from the
+				// spelling or argument names), nor from the
 				// procedure next to the whole schema function grant.
 				Config: tfConfig,
 				Check: resource.ComposeTestCheckFunc(
@@ -573,9 +657,29 @@ resource "postgresql_grant" "all_functions" {
 				ExpectNonEmptyPlan: true,
 			},
 			{
-				// Aggregates are granted and read as functions.
+				// ... including entries with argument names ...
 				PreConfig: exec(
 					fmt.Sprintf("GRANT EXECUTE ON FUNCTION test_schema.sp(integer, text) TO %s", role),
+					fmt.Sprintf("REVOKE EXECUTE ON FUNCTION test_schema.m(integer) FROM %s", role),
+				),
+				Config:             tfConfig,
+				PlanOnly:           true,
+				ExpectNonEmptyPlan: true,
+			},
+			{
+				// ... and modes (OUT arguments are not part of it).
+				PreConfig: exec(
+					fmt.Sprintf("GRANT EXECUTE ON FUNCTION test_schema.m(integer) TO %s", role),
+					fmt.Sprintf("REVOKE EXECUTE ON FUNCTION test_schema.mo(text) FROM %s", role),
+				),
+				Config:             tfConfig,
+				PlanOnly:           true,
+				ExpectNonEmptyPlan: true,
+			},
+			{
+				// Aggregates are granted and read as functions.
+				PreConfig: exec(
+					fmt.Sprintf("GRANT EXECUTE ON FUNCTION test_schema.mo(text) TO %s", role),
 					fmt.Sprintf("REVOKE EXECUTE ON FUNCTION test_schema.agg(integer) FROM %s", role),
 				),
 				Config:             tfConfig,
