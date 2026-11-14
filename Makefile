@@ -1,6 +1,8 @@
 TEST?=$$(go list ./...)
 GOFMT_FILES?=$$(find . -name '*.go')
 PKG_NAME=postgresql
+# Keep in sync with the golangci-lint version in .github/workflows/golangci.yml
+GOLANGCI_LINT_VERSION?=v2.12.2
 
 default: build
 
@@ -30,11 +32,14 @@ vet:
 		exit 1; \
 	fi
 
+lint:
+	go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_LINT_VERSION) run ./...
+
 fmt:
 	gofmt -w $(GOFMT_FILES)
 
 fmtcheck:
 	@sh -c "'$(CURDIR)/scripts/gofmtcheck.sh'"
 
-.PHONY: build test testacc vet fmt fmtcheck
+.PHONY: build test testacc vet lint fmt fmtcheck
 
