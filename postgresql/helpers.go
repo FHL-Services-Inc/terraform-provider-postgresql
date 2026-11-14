@@ -58,27 +58,15 @@ func pqQuoteLiteral(in string) string {
 	return in
 }
 
-func isMemberOfRole(db QueryAble, role, member string) (bool, error) {
+func isMemberOfRole(db QueryAble, setOption bool, role, member string) (bool, error) {
 	var _rez int
-	setOption := true
-
-	err := db.QueryRow(
-		"SELECT 1 FROM information_schema.columns WHERE table_name='pg_auth_members' AND column_name = 'set_option'",
-	).Scan(&_rez)
-
-	switch {
-	case err == sql.ErrNoRows:
-		setOption = false
-	case err != nil:
-		return false, fmt.Errorf("could not read setOption column: %w", err)
-	}
 
 	query := "SELECT 1 FROM pg_auth_members WHERE pg_get_userbyid(roleid) = $1 AND pg_get_userbyid(member) = $2"
 	if setOption {
 		query += " AND set_option"
 	}
 
-	err = db.QueryRow(query, role, member).Scan(&_rez)
+	err := db.QueryRow(query, role, member).Scan(&_rez)
 	switch {
 	case err == sql.ErrNoRows:
 		return false, nil
@@ -92,12 +80,12 @@ func isMemberOfRole(db QueryAble, role, member string) (bool, error) {
 // grantRoleMembership grants the role *role* to the user *member*.
 // It returns false if the grant is not needed because the user is already
 // a member of this role.
-func grantRoleMembership(db QueryAble, role, member string) (bool, error) {
+func grantRoleMembership(db QueryAble, setOption bool, role, member string) (bool, error) {
 	if member == role {
 		return false, nil
 	}
 
-	isMember, err := isMemberOfRole(db, role, member)
+	isMember, err := isMemberOfRole(db, setOption, role, member)
 	if err != nil {
 		return false, err
 	}
@@ -118,12 +106,12 @@ func grantRoleMembership(db QueryAble, role, member string) (bool, error) {
 
 // revokeRoleMembership revokes the role *role* from the user *member*.
 // It returns false if the revoke is not needed because the user is not a member of this role.
-func revokeRoleMembership(db QueryAble, role, member string) (bool, error) {
+func revokeRoleMembership(db QueryAble, setOption bool, role, member string) (bool, error) {
 	if member == role {
 		return false, nil
 	}
 
-	isMember, err := isMemberOfRole(db, role, member)
+	isMember, err := isMemberOfRole(db, setOption, role, member)
 	if err != nil {
 		return false, err
 	}
@@ -143,27 +131,44 @@ func revokeRoleMembership(db QueryAble, role, member string) (bool, error) {
 // withRolesGranted temporarily grants, if needed, the roles specified to connected user
 // (i.e.: the admin configure in the provider) and revoke them as soon as the
 // callback func has finished.
-func withRolesGranted(txn *sql.Tx, roles []string, fn func() error) error {
+func withRolesGranted(db *DBConnection, txn *sql.Tx, roles []string, fn func() error) error {
 	// No roles asked, execute the function directly
 	if len(roles) == 0 {
 		return fn()
 	}
 
-	currentUser, err := getCurrentUser(txn)
+	setOption := db.featureSupported(featureAuthMembersSetOption)
+
+	currentUser, err := db.currentUser(txn)
 	if err != nil {
 		return err
 	}
 
-	// Fetch rolsuper for the current user and all the requested roles in a
-	// single round-trip instead of one query per role.
-	superusers, err := getRolesSuperuser(txn, append([]string{currentUser}, roles...))
+	// The rolsuper of the login role is memoized per pool; when it is not
+	// known yet, fetch it together with the requested roles.
+	superuser, known := db.cachedSuperuser()
+	if known && superuser {
+		log.Printf("withRolesGranted: current user %s is superuser, no need to grant roles", currentUser)
+		return fn()
+	}
+
+	// Fetch rolsuper for the requested roles (and the current user if needed)
+	// in a single round-trip instead of one query per role.
+	lookup := roles
+	if !known {
+		lookup = append([]string{currentUser}, roles...)
+	}
+	superusers, err := getRolesSuperuser(txn, lookup)
 	if err != nil {
 		return err
 	}
 
-	superuser, err := lookupSuperuser(superusers, currentUser)
-	if err != nil {
-		return err
+	if !known {
+		superuser, err = lookupSuperuser(superusers, currentUser)
+		if err != nil {
+			return err
+		}
+		db.storeSuperuser(superuser)
 	}
 	if superuser {
 		log.Printf("withRolesGranted: current user %s is superuser, no need to grant roles", currentUser)
@@ -201,7 +206,7 @@ func withRolesGranted(txn *sql.Tx, roles []string, fn func() error) error {
 		//  - GRANT postgres TO foo
 
 		// Check the opposite relation and revoke currentUser from role if needed
-		revoked, err := revokeRoleMembership(txn, currentUser, role)
+		revoked, err := revokeRoleMembership(txn, setOption, currentUser, role)
 		if err != nil {
 			return err
 		}
@@ -210,7 +215,7 @@ func withRolesGranted(txn *sql.Tx, roles []string, fn func() error) error {
 		}
 
 		// Grant the role to currentUser if needed
-		roleGranted, err := grantRoleMembership(txn, role, currentUser)
+		roleGranted, err := grantRoleMembership(txn, setOption, role, currentUser)
 		if err != nil {
 			return err
 		}
@@ -226,7 +231,7 @@ func withRolesGranted(txn *sql.Tx, roles []string, fn func() error) error {
 
 	// Revoke the temporary granted roles.
 	for _, role := range grantedRoles {
-		if _, err := revokeRoleMembership(txn, role, currentUser); err != nil {
+		if _, err := revokeRoleMembership(txn, setOption, role, currentUser); err != nil {
 			return err
 		}
 	}
@@ -241,7 +246,7 @@ func withRolesGranted(txn *sql.Tx, roles []string, fn func() error) error {
 		if !exists {
 			continue
 		}
-		if _, err := grantRoleMembership(txn, currentUser, role); err != nil {
+		if _, err := grantRoleMembership(txn, setOption, currentUser, role); err != nil {
 			return err
 		}
 	}
