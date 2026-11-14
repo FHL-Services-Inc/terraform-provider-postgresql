@@ -283,3 +283,76 @@ resource "postgresql_grant" "public_revoked" {
 		},
 	})
 }
+
+// TestAccPostgresqlGrantPublicWholeSchemaDefaultACL is the reproduction from
+// #77: whole-schema PUBLIC function grants, then a new function (NULL ACL) in
+// each schema. PUBLIC may execute it by default, so the EXECUTE grant must not
+// drift and the "revoke from PUBLIC" grant must.
+func TestAccPostgresqlGrantPublicWholeSchemaDefaultACL(t *testing.T) {
+	skipIfNotAcc(t)
+
+	dbSuffix, teardown := setupTestDatabase(t, true, true)
+	defer teardown()
+
+	config := getTestConfig(t)
+	dbName, _ := getTestDBNames(dbSuffix)
+	dsn := config.connStr(dbName)
+
+	for _, stmt := range []string{
+		"CREATE FUNCTION test_schema.f1() RETURNS int LANGUAGE sql AS 'SELECT 1'",
+		"CREATE FUNCTION dev_schema.g1() RETURNS int LANGUAGE sql AS 'SELECT 1'",
+	} {
+		dbExecute(t, dsn, stmt)
+	}
+
+	tfConfig := fmt.Sprintf(`
+resource "postgresql_grant" "public_exec" {
+	database    = "%[1]s"
+	role        = "public"
+	schema      = "test_schema"
+	object_type = "function"
+	privileges  = ["EXECUTE"]
+}
+
+resource "postgresql_grant" "public_none" {
+	database    = "%[1]s"
+	role        = "public"
+	schema      = "dev_schema"
+	object_type = "function"
+	privileges  = []
+}
+`, dbName)
+
+	resource.Test(t, resource.TestCase{
+		PreCheck: func() {
+			testAccPreCheck(t)
+			testCheckCompatibleVersion(t, featurePrivileges)
+		},
+		Providers: testAccProviders,
+		Steps: []resource.TestStep{
+			{Config: tfConfig},
+			{
+				// No false drift: PUBLIC already has EXECUTE on the new
+				// function through its default ACL.
+				PreConfig: func() {
+					dbExecute(t, dsn, "CREATE FUNCTION test_schema.f2() RETURNS int LANGUAGE sql AS 'SELECT 1'")
+				},
+				Config:   tfConfig,
+				PlanOnly: true,
+			},
+			{
+				// PUBLIC can execute the new function: the revoke drifts.
+				PreConfig: func() {
+					dbExecute(t, dsn, "CREATE FUNCTION dev_schema.g2() RETURNS int LANGUAGE sql AS 'SELECT 1'")
+				},
+				Config:             tfConfig,
+				PlanOnly:           true,
+				ExpectNonEmptyPlan: true,
+			},
+			{
+				// Apply revokes it again.
+				Config: tfConfig,
+			},
+		},
+	})
+}
