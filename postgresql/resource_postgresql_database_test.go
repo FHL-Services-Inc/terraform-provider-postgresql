@@ -573,7 +573,7 @@ func TestAccPostgresqlDatabase_DropWithIdleConnections(t *testing.T) {
 	providerOnly := `
 provider "postgresql" {
   max_idle_connections = 2
-  connect_timeout      = 179
+  connect_timeout      = 175
 }
 `
 
