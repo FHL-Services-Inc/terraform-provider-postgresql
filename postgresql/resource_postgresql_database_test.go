@@ -4,7 +4,6 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"os"
 	"strconv"
 	"testing"
 
@@ -615,11 +614,7 @@ resource "postgresql_database" "db" {
 				),
 			},
 			{
-				// ALTER DATABASE OWNER also needs membership in the current
-				// owner, which setDBOwner does not grant, so a non-superuser
-				// cannot change the owner here (same without max_connections).
-				SkipFunc: func() (bool, error) { return os.Getenv("PGSUPERUSER") == "false", nil },
-				Config:   dbConfig("owner2"),
+				Config: dbConfig("owner2"),
 				Check: resource.ComposeTestCheckFunc(
 					testAccCheckPostgresqlDatabaseExists("postgresql_database.db"),
 					resource.TestCheckResourceAttr("postgresql_database.db", "owner", "tf_tests_single_conn_owner2"),
@@ -761,4 +756,66 @@ func testAccCheckDatabaseGone(dbName string) resource.TestCheckFunc {
 		}
 		return nil
 	}
+}
+
+// TestAccPostgresqlDatabase_OwnerChange changes the owner of an existing
+// database. ALTER DATABASE ... OWNER TO needs the provider role to be a member
+// of both the current and the new owner, so a non-superuser provider role has
+// to be granted both temporarily, and neither membership may be left behind.
+func TestAccPostgresqlDatabase_OwnerChange(t *testing.T) {
+	skipIfNotAcc(t)
+
+	config := getTestConfig(t)
+
+	const rolesConfig = `
+resource "postgresql_role" "owner1" {
+  name = "tf_tests_owner_change_owner1"
+}
+
+resource "postgresql_role" "owner2" {
+  name = "tf_tests_owner_change_owner2"
+}
+`
+	dbConfig := func(owner string) string {
+		return rolesConfig + fmt.Sprintf(`
+resource "postgresql_database" "db" {
+  name  = "tf_tests_owner_change_db"
+  owner = postgresql_role.%s.name
+}
+`, owner)
+	}
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:     func() { testAccPreCheck(t) },
+		Providers:    testAccProviders,
+		CheckDestroy: testAccCheckPostgresqlDatabaseDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config: dbConfig("owner1"),
+				Check: resource.ComposeTestCheckFunc(
+					testAccCheckPostgresqlDatabaseExists("postgresql_database.db"),
+					resource.TestCheckResourceAttr("postgresql_database.db", "owner", "tf_tests_owner_change_owner1"),
+				),
+			},
+			{
+				Config: dbConfig("owner2"),
+				Check: resource.ComposeTestCheckFunc(
+					testAccCheckPostgresqlDatabaseExists("postgresql_database.db"),
+					resource.TestCheckResourceAttr("postgresql_database.db", "owner", "tf_tests_owner_change_owner2"),
+					checkUserMembership(t, config.Username, "tf_tests_owner_change_owner1", false),
+					checkUserMembership(t, config.Username, "tf_tests_owner_change_owner2", false),
+				),
+			},
+			{
+				// And back, so the previous owner is again a role the
+				// provider is not a member of.
+				Config: dbConfig("owner1"),
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr("postgresql_database.db", "owner", "tf_tests_owner_change_owner1"),
+					checkUserMembership(t, config.Username, "tf_tests_owner_change_owner1", false),
+					checkUserMembership(t, config.Username, "tf_tests_owner_change_owner2", false),
+				),
+			},
+		},
+	})
 }
