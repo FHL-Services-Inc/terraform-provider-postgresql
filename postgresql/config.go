@@ -3,6 +3,7 @@ package postgresql
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"errors"
 	"fmt"
 	"log"
@@ -274,6 +275,12 @@ type Config struct {
 	SSLRootCertPath                 string
 	GCPIAMImpersonateServiceAccount string
 	AdvisoryLockTimeout             int
+
+	// AuthTokens, when set, supplies the password of every new connection
+	// for the "postgres" scheme (AWS RDS IAM and Azure AD tokens), and
+	// Password is left empty, so the DSN and the dbRegistry key carry no
+	// token. It is a pointer: all Clients of a provider share the cache.
+	AuthTokens *authTokenSource
 }
 
 // Client struct holding connection string
@@ -475,17 +482,30 @@ func (c *Config) configurePool(db *sql.DB) {
 }
 
 // openPostgres opens a pool for the "postgres" scheme. Connections are dialed
-// through proxyDriver (honoring ALL_PROXY / HTTPS_PROXY), and count against
-// the endpoint's connection budget when max_total_connections is set.
+// through proxyDriver (honoring ALL_PROXY / HTTPS_PROXY), authenticate with a
+// fresh token when an auth token source is configured, and count against the
+// endpoint's connection budget when max_total_connections is set. The chain is
+// budgetConnector -> tokenAuthConnector -> pq, so a budget slot is taken before
+// the token fetch and the dial.
 //
 // The gocloud schemes (awspostgres, gcppostgres) open their pools themselves
 // and don't expose their connector, so the budget does not apply to them.
 func (c *Config) openPostgres(dsn string) (*sql.DB, error) {
-	connector, err := pq.NewConnector(dsn)
-	if err != nil {
-		return nil, err
+	var connector driver.Connector
+	if c.AuthTokens != nil {
+		tc, err := c.newPostgresConnector(dsn)
+		if err != nil {
+			return nil, err
+		}
+		connector = tc
+	} else {
+		pc, err := pq.NewConnector(dsn)
+		if err != nil {
+			return nil, err
+		}
+		pc.Dialer(proxyDriver{})
+		connector = pc
 	}
-	connector.Dialer(proxyDriver{})
 	if c.MaxTotalConns <= 0 {
 		return sql.OpenDB(connector), nil
 	}
@@ -574,7 +594,12 @@ func (c *Client) connectWithRetry(ctx context.Context, openPostgres func(dsn str
 		if _, ok := errors.AsType[*pq.Error](retryError); ok {
 			return nil, fmt.Errorf("error connecting to PostgreSQL server %s (scheme: %s): %w", c.config.Host, c.config.Scheme, retryError)
 		}
-		errString := strings.Replace(retryError.Error(), c.config.Password, "XXXX", 2)
+		// On the auth token path Password is empty and the connector has
+		// already redacted the token.
+		errString := retryError.Error()
+		if c.config.Password != "" {
+			errString = strings.Replace(errString, c.config.Password, "XXXX", 2)
+		}
 		return nil, fmt.Errorf("error connecting to PostgreSQL server %s (scheme: %s): %s", c.config.Host, c.config.Scheme, errString)
 	}
 

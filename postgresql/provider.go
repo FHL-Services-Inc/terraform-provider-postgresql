@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/sts"
@@ -286,13 +287,17 @@ func validateExpectedVersion(v any, key string) (warnings []string, errors []err
 	return
 }
 
-func getRDSAuthToken(region string, profile string, role string, username string, host string, port int) (string, error) {
+// getRDSAuthToken builds an RDS IAM auth token and returns it with its expiry:
+// the presigned URL's own expiry, or earlier if the signing credentials expire
+// first (the token stops working with them).
+func getRDSAuthToken(ctx context.Context, region string, profile string, role string, username string, host string, port int) (string, time.Time, error) {
 	endpoint := fmt.Sprintf("%s:%d", host, port)
-
-	ctx := context.Background()
 
 	var awscfg aws.Config
 	var err error
+	// sessionExpiry is when the assumed role session ends: the static
+	// credentials provider built from it doesn't know.
+	var sessionExpiry *time.Time
 
 	if profile != "" {
 		awscfg, err = awsConfig.LoadDefaultConfig(ctx, awsConfig.WithSharedConfigProfile(profile))
@@ -302,7 +307,7 @@ func getRDSAuthToken(region string, profile string, role string, username string
 		awscfg, err = awsConfig.LoadDefaultConfig(ctx)
 	}
 	if err != nil {
-		return "", err
+		return "", time.Time{}, err
 	}
 
 	if role != "" {
@@ -314,7 +319,7 @@ func getRDSAuthToken(region string, profile string, role string, username string
 
 		roleOutput, err := stsClient.AssumeRole(ctx, roleInput)
 		if err != nil {
-			return "", fmt.Errorf("could not assume AWS role: %w", err)
+			return "", time.Time{}, fmt.Errorf("could not assume AWS role: %w", err)
 		}
 
 		awscfg, err = awsConfig.LoadDefaultConfig(ctx,
@@ -327,13 +332,26 @@ func getRDSAuthToken(region string, profile string, role string, username string
 			),
 		)
 		if err != nil {
-			return "", fmt.Errorf("could not load AWS default config: %w", err)
+			return "", time.Time{}, fmt.Errorf("could not load AWS default config: %w", err)
 		}
+		sessionExpiry = roleOutput.Credentials.Expiration
 	}
 
+	issuedAt := time.Now()
 	token, err := auth.BuildAuthToken(ctx, endpoint, awscfg.Region, username, awscfg.Credentials)
-
-	return token, err
+	if err != nil {
+		return "", time.Time{}, err
+	}
+	expiresAt := rdsAuthTokenExpiry(token, issuedAt)
+	if sessionExpiry != nil && sessionExpiry.Before(expiresAt) {
+		expiresAt = *sessionExpiry
+	}
+	// BuildAuthToken retrieved the credentials through the cache, so this
+	// doesn't call out again.
+	if creds, err := awscfg.Credentials.Retrieve(ctx); err == nil && creds.CanExpire && creds.Expires.Before(expiresAt) {
+		expiresAt = creds.Expires
+	}
+	return token, expiresAt, nil
 }
 
 func createGoogleCredsFileIfNeeded() error {
@@ -364,20 +382,22 @@ func createGoogleCredsFileIfNeeded() error {
 	return os.Setenv("GOOGLE_APPLICATION_CREDENTIALS", tmpFile.Name())
 }
 
-func acquireAzureOauthToken(tenantId string) (string, error) {
+// acquireAzureOauthToken gets an Azure AD access token for Azure Database for
+// PostgreSQL and returns it with its expiry.
+func acquireAzureOauthToken(ctx context.Context, tenantId string) (string, time.Time, error) {
 	credential, err := azidentity.NewDefaultAzureCredential(
 		&azidentity.DefaultAzureCredentialOptions{TenantID: tenantId})
 	if err != nil {
-		return "", err
+		return "", time.Time{}, err
 	}
-	token, err := credential.GetToken(context.Background(), policy.TokenRequestOptions{
+	token, err := credential.GetToken(ctx, policy.TokenRequestOptions{
 		Scopes:   []string{"https://ossrdbms-aad.database.windows.net/.default"},
 		TenantID: tenantId,
 	})
 	if err != nil {
-		return "", err
+		return "", time.Time{}, err
 	}
-	return token.Token, nil
+	return token.Token, token.ExpiresOn, nil
 }
 
 func providerConfigure(d *schema.ResourceData) (any, error) {
@@ -397,32 +417,47 @@ func providerConfigure(d *schema.ResourceData) (any, error) {
 	port := d.Get("port").(int)
 	username := d.Get("username").(string)
 
+	scheme := d.Get("scheme").(string)
+
 	var password string
+	var authTokens *authTokenSource
 	if d.Get("aws_rds_iam_auth").(bool) {
 		profile := d.Get("aws_rds_iam_profile").(string)
 		region := d.Get("aws_rds_iam_region").(string)
 		role := d.Get("aws_rds_iam_provider_role_arn").(string)
-		var err error
-		password, err = getRDSAuthToken(region, profile, role, username, host, port)
-		if err != nil {
-			return nil, err
-		}
+		authTokens = newAuthTokenSource("AWS RDS IAM", func(ctx context.Context) (string, time.Time, error) {
+			return getRDSAuthToken(ctx, region, profile, role, username, host, port)
+		})
 	} else if d.Get("azure_identity_auth").(bool) {
 		tenantId := d.Get("azure_tenant_id").(string)
 		if tenantId == "" {
 			return nil, fmt.Errorf("postgresql: azure_identity_auth is enabled, azure_tenant_id must be provided also")
 		}
-		var err error
-		password, err = acquireAzureOauthToken(tenantId)
-		if err != nil {
-			return nil, err
-		}
+		authTokens = newAuthTokenSource("Azure AD", func(ctx context.Context) (string, time.Time, error) {
+			return acquireAzureOauthToken(ctx, tenantId)
+		})
 	} else {
 		password = d.Get("password").(string)
 	}
 
+	if authTokens != nil {
+		// Fetch the first token now: bad credentials still fail here, as
+		// before, and the first connection doesn't have to wait for it.
+		token, err := authTokens.Token(context.Background())
+		if err != nil {
+			return nil, err
+		}
+		if scheme != "postgres" {
+			// The gocloud schemes open their connections themselves from the
+			// DSN, so the token can't be refreshed per connection there; keep
+			// passing the first one as the password.
+			password = token
+			authTokens = nil
+		}
+	}
+
 	config := Config{
-		Scheme:                          d.Get("scheme").(string),
+		Scheme:                          scheme,
 		Host:                            host,
 		Port:                            port,
 		Username:                        username,
@@ -442,6 +477,7 @@ func providerConfigure(d *schema.ResourceData) (any, error) {
 		SSLRootCertPath:                 d.Get("sslrootcert").(string),
 		GCPIAMImpersonateServiceAccount: d.Get("gcp_iam_impersonate_service_account").(string),
 		AdvisoryLockTimeout:             d.Get("advisory_lock_timeout").(int),
+		AuthTokens:                      authTokens,
 	}
 
 	if value, ok := d.GetOk("clientcert"); ok {

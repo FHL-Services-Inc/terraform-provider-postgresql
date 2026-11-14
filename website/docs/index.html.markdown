@@ -237,11 +237,15 @@ The following arguments are supported:
   connection has been established, Terraform will fingerprint the actual
   version.  Default: `9.0.0`.
 * `aws_rds_iam_auth` - (Optional) If set to `true`, call the AWS RDS API to grab a temporary password, using AWS Credentials
-  from the environment (or the given profile, see `aws_rds_iam_profile`)
+  from the environment (or the given profile, see `aws_rds_iam_profile`). With `scheme = "postgres"` (the default) the
+  token is cached and renewed before it expires (RDS tokens are valid for 15 minutes), and every new connection uses
+  a current one, so long-running applies keep working. With the GoCloud schemes the token obtained at provider
+  configuration is used for the whole run.
 * `aws_rds_iam_profile` - (Optional) The AWS IAM Profile to use while using AWS RDS IAM Auth.
 * `aws_rds_iam_region` - (Optional) The AWS region to use while using AWS RDS IAM Auth.
 * `aws_rds_iam_provider_role_arn` - (Optional) AWS IAM role to assume while using AWS RDS IAM Auth.
-* `azure_identity_auth` - (Optional) If set to `true`, call the Azure OAuth token endpoint for temporary token
+* `azure_identity_auth` - (Optional) If set to `true`, call the Azure OAuth token endpoint for temporary token. As with
+  `aws_rds_iam_auth`, the token is renewed before it expires and every new connection uses a current one.
 * `azure_tenant_id` - (Optional) (Required if `azure_identity_auth` is `true`) Azure tenant ID [read more](https://registry.terraform.io/providers/hashicorp/azurerm/latest/docs/data-sources/client_config.html)
 
 ## GoCloud
