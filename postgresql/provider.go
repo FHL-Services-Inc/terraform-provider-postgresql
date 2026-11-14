@@ -214,7 +214,7 @@ func Provider() *schema.Provider {
 			"max_idle_connections": {
 				Type:         schema.TypeInt,
 				Optional:     true,
-				Default:      defaultProviderMaxIdleConnections,
+				DefaultFunc:  schema.EnvDefaultFunc("PGMAXIDLECONNECTIONS", defaultProviderMaxIdleConnections),
 				Description:  "Maximum number of idle connections kept open per database for reuse. Zero (the default) means connections are closed after each use. Capped to max_connections when the latter is non-zero.",
 				ValidateFunc: validation.IntAtLeast(0),
 			},
