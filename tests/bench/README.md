@@ -15,7 +15,7 @@ has close to zero latency and hides that cost.
 | file | purpose |
 |---|---|
 | `run.sh` | Runs everything: builds the providers, loads the fixture, applies once, runs the timed plans, writes the summary |
-| `genfixture/` | Generates `fixture.sql` (database, schemas, tables), `main.tf` (Terraform resources) and `cleanup.sql` |
+| `genfixture/` | Generates `fixture.sql` (database, schemas, tables), `main.tf` (Terraform resources) and `cleanup.sql`; with `-core-only`, a `main.tf` of `terraform_data` resources in the same shape |
 | `latencyproxy/` | TCP proxy that delays each direction by a fixed amount (RTT = 2 x delay) |
 | `connsampler/` | Polls `pg_stat_activity` during each plan for the concurrent-connections columns |
 | `smallpool.sh` | Small-pool matrix: databases with an owner under `max_connections` 1/2/4/8 x `-parallelism` 1/2/10, with a timeout per phase so a deadlock shows up as a hang |
@@ -45,6 +45,24 @@ You can change the sizes through `GEN_ARGS`. For example, use
 privileges and Terraform-managed schemas on them. The resource count stays the same.
 The provider keeps one connection pool per database, so this is the setup where idle
 connections of several pools add up.
+
+`GEN_ARGS="-preset large"` sets 2,000 roles, 50 schemas and 10,000 tables, about 11,000
+resources. Flags given next to it override the preset, for example
+`GEN_ARGS="-preset large -roles 1000"`. The default preset is the table above.
+
+### Config shape
+
+`-shape` decides how the same resources are written:
+
+- `blocks` (default): one resource block per object, `postgresql_role.user_3`.
+- `count`: one block with `count` per kind of resource, `postgresql_role.user[3]`,
+  9 blocks in all. Names and attribute values are the same as with `blocks`; only the
+  resource addresses differ, so switching shape needs a fresh setup (the default).
+
+Terraform core time grows with the square of the instances in one block, so `count`
+shows what a config built around a few big `count`/`for_each` blocks costs, before
+the provider does any work. See the core reference below and
+`website/docs/guides/large-configurations.html.markdown`.
 
 ## Running it
 
@@ -89,7 +107,8 @@ You need Go, Terraform 1.x, `psql` and `perl`. `perl` is used for sub-second tim
    machine affect all of them. Run `run.sh -h` for the other options: `-P` sets the
    parallelism, `-w` sets the work dir, and `-S` reuses an existing fixture and state.
 
-3. `run.sh` prints a markdown table and writes it to `<workdir>/summary.md`.
+3. `run.sh` prints a markdown table and writes it to `<workdir>/summary.md`. The
+   table ends with a `core (terraform_data)` row, see "Core reference" below.
    `<workdir>/results.csv` holds the per-run numbers, and `<workdir>/logs/` holds the
    apply and plan output.
 
@@ -125,6 +144,32 @@ numbers within one matrix, not across matrices that ran in parallel.
 
 To clean up, run `psql -f <workdir>/tf/cleanup.sql` and `container stop pg-tf-bench`
 (the container was started with `--rm`, so stopping it also removes it).
+
+## Core reference
+
+Before the provider plans, `run.sh` generates the same config with
+`genfixture -core-only`: every provider resource becomes a `terraform_data` resource
+with the same name, instance count and references, in the same `-shape`. It plans that
+`-n` times with the same `-parallelism` and adds the median as the
+`core (terraform_data)` row: what Terraform core alone costs for this config shape,
+before any provider call. `-R` skips it.
+
+`run.sh -r` runs only the core reference. It needs no provider and no PostgreSQL:
+
+```sh
+tests/bench/run.sh -r -n 3                                  # 1143 instances, blocks
+GEN_ARGS="-shape count" tests/bench/run.sh -r -n 3          # same instances, 9 count blocks
+GEN_ARGS="-roles 545 -shape count" tests/bench/run.sh -r    # about 3,000 instances
+```
+
+By default the core reference plans against an empty state, so the plan creates
+everything and no apply is needed. `CORE_STATE=1` applies the config once and then
+plans against that state with `-refresh=true`, like the provider runs. That apply
+writes the state after every resource and gets slow quickly: about 25 s at 1,100
+instances and 2-3 minutes at 3,000 on an M-series Mac. The two are not the same work: with
+`-shape count` the empty-state plan was the slower one (7.5 s against 4.1 s at 3,000
+instances), so compare against the provider rows with `CORE_STATE=1` when the exact
+split matters.
 
 ## Small-pool matrix
 
