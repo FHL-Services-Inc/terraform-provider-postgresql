@@ -204,6 +204,7 @@ type Config struct {
 	ConnMaxLifetimeSeconds          int
 	MaxConns                        int
 	MaxIdleConns                    int
+	MaxTotalConns                   int
 	ExpectedVersion                 semver.Version
 	SSLClientCert                   *ClientCertificateConfig
 	SSLRootCertPath                 string
@@ -320,7 +321,7 @@ func (c *Client) Connect() (*DBConnection, error) {
 
 	// Dialing and retrying happen outside the lock so a slow/flaky connection
 	// to one DSN doesn't stall Connect() calls for other DSNs.
-	db, err := c.connectWithRetry(ctx, proxyDriverName, dsn)
+	db, err := c.connectWithRetry(ctx, c.config.openPostgres, dsn)
 	if err != nil {
 		return nil, err
 	}
@@ -369,8 +370,36 @@ func (c *Config) configurePool(db *sql.DB) {
 	if c.MaxIdleConns > 0 {
 		db.SetConnMaxIdleTime(defaultConnMaxIdleTime)
 	}
-	db.SetMaxOpenConns(c.MaxConns)
+	db.SetMaxOpenConns(c.effectiveMaxConns())
 	db.SetConnMaxLifetime(time.Duration(c.ConnMaxLifetimeSeconds) * time.Second)
+}
+
+// openPostgres opens a pool for the "postgres" scheme. Connections are dialed
+// through proxyDriver (honoring ALL_PROXY / HTTPS_PROXY), and count against
+// the endpoint's connection budget when max_total_connections is set.
+//
+// The gocloud schemes (awspostgres, gcppostgres) open their pools themselves
+// and don't expose their connector, so the budget does not apply to them.
+func (c *Config) openPostgres(dsn string) (*sql.DB, error) {
+	connector, err := pq.NewConnector(dsn)
+	if err != nil {
+		return nil, err
+	}
+	connector.Dialer(proxyDriver{})
+	if c.MaxTotalConns <= 0 {
+		return sql.OpenDB(connector), nil
+	}
+	budget := getEndpointBudget(c.endpointKey(), c.MaxTotalConns)
+	return openBudgetedDB(connector, budget, c.MaxIdleConns, c.budgetWait()), nil
+}
+
+// budgetWait is how long a dial waits for a free slot of the endpoint budget:
+// connect_timeout, or 3 minutes (its default) when connect_timeout is 0.
+func (c *Config) budgetWait() time.Duration {
+	if c.ConnectTimeoutSec > 0 {
+		return time.Duration(c.ConnectTimeoutSec) * time.Second
+	}
+	return defaultProviderConnectTimeoutSeconds * time.Second
 }
 
 // evictDBConnection removes the pooled connection to database from dbRegistry
@@ -403,9 +432,9 @@ func (c *Config) evictDBConnection(database string) bool {
 
 // connectWithRetry opens a connection to dsn, retrying transient failures up
 // to c.config.MaxConnRetries times or until c.config.ConnectionRetryTimeoutSeconds
-// elapses, whichever comes first. postgresDriverName is the database/sql
-// driver used for the "postgres" scheme (overridable by tests).
-func (c *Client) connectWithRetry(ctx context.Context, postgresDriverName, dsn string) (*sql.DB, error) {
+// elapses, whichever comes first. openPostgres opens the pool for the
+// "postgres" scheme (overridable by tests).
+func (c *Client) connectWithRetry(ctx context.Context, openPostgres func(dsn string) (*sql.DB, error), dsn string) (*sql.DB, error) {
 	var db *sql.DB
 	var err error
 	retryCount := 0
@@ -413,7 +442,7 @@ func (c *Client) connectWithRetry(ctx context.Context, postgresDriverName, dsn s
 	connectRetryTimeout := time.Duration(c.config.ConnectionRetryTimeoutSeconds) * time.Second
 	retryError := retry.RetryContext(ctx, connectRetryTimeout, func() *retry.RetryError {
 		if c.config.Scheme == "postgres" {
-			db, err = sql.Open(postgresDriverName, dsn)
+			db, err = openPostgres(dsn)
 		} else if c.config.Scheme == "gcppostgres" && c.config.GCPIAMImpersonateServiceAccount != "" {
 			db, err = openImpersonatedGCPDBConnection(ctx, dsn, c.config.GCPIAMImpersonateServiceAccount)
 		} else {

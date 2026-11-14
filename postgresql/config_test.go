@@ -118,7 +118,7 @@ func TestConnectWithRetrySucceedsAfterTransientFailures(t *testing.T) {
 	drv := &flakyPingDriver{failuresBeforeSuccess: 2}
 	c := newFlakyClient("flaky-retry-success", drv, 5, 5)
 
-	db, err := c.connectWithRetry(context.Background(), "flaky-retry-success", "dsn")
+	db, err := c.connectWithRetry(context.Background(), openDriver("flaky-retry-success"), "dsn")
 	if err != nil {
 		t.Fatalf("connectWithRetry() returned unexpected error: %v", err)
 	}
@@ -133,7 +133,7 @@ func TestConnectWithRetryGivesUpAfterMaxConnRetries(t *testing.T) {
 	drv := &flakyPingDriver{failuresBeforeSuccess: 100}
 	c := newFlakyClient("flaky-retry-exhausted", drv, 3, 30)
 
-	_, err := c.connectWithRetry(context.Background(), "flaky-retry-exhausted", "dsn")
+	_, err := c.connectWithRetry(context.Background(), openDriver("flaky-retry-exhausted"), "dsn")
 	if err == nil {
 		t.Fatal("connectWithRetry() expected an error, got nil")
 	}
@@ -253,4 +253,9 @@ func TestConfigEvictDBConnection(t *testing.T) {
 	if !inRegistry(dsn) {
 		t.Error("evictDBConnection() removed a pool without idle connections")
 	}
+}
+
+// openDriver opens pools with the registered database/sql driver name.
+func openDriver(name string) func(string) (*sql.DB, error) {
+	return func(dsn string) (*sql.DB, error) { return sql.Open(name, dsn) }
 }
