@@ -132,6 +132,7 @@ func createDatabase(db *DBConnection, d *schema.ResourceData) error {
 	if owner != "" {
 		// Take a lock on db currentUser to avoid multiple database creation at the same time
 		// It can fail if they grant the same owner to current at the same time as it's not done in transaction.
+		setOption := db.featureSupported(featureAuthMembersSetOption)
 		lockConn, release, err := lockRoleConn(db, currentUser)
 		if err != nil {
 			return err
@@ -141,12 +142,12 @@ func createDatabase(db *DBConnection, d *schema.ResourceData) error {
 
 		// Needed in order to set the owner of the db if the connection user is not a
 		// superuser
-		ownerGranted, err := grantRoleMembership(conn, owner, currentUser)
+		ownerGranted, err := grantRoleMembership(conn, setOption, owner, currentUser)
 		if err != nil {
 			return err
 		}
 		if ownerGranted {
-			defer revokeRoleMembershipDeferred(conn, owner, currentUser)
+			defer revokeRoleMembershipDeferred(conn, setOption, owner, currentUser)
 		}
 	}
 
@@ -245,6 +246,7 @@ func resourcePostgreSQLDatabaseDelete(db *DBConnection, d *schema.ResourceData) 
 	// lock when an owner is set.
 	var conn QueryAble = db
 	if owner != "" {
+		setOption := db.featureSupported(featureAuthMembersSetOption)
 		lockConn, release, err := lockRoleConn(db, currentUser)
 		if err != nil {
 			return err
@@ -254,12 +256,12 @@ func resourcePostgreSQLDatabaseDelete(db *DBConnection, d *schema.ResourceData) 
 
 		// Needed in order to set the owner of the db if the connection user is not a
 		// superuser
-		ownerGranted, err := grantRoleMembership(conn, owner, currentUser)
+		ownerGranted, err := grantRoleMembership(conn, setOption, owner, currentUser)
 		if err != nil {
 			return err
 		}
 		if ownerGranted {
-			defer revokeRoleMembershipDeferred(conn, owner, currentUser)
+			defer revokeRoleMembershipDeferred(conn, setOption, owner, currentUser)
 		}
 	}
 
@@ -464,6 +466,7 @@ func setDBOwner(db *DBConnection, d *schema.ResourceData) error {
 	}
 	currentUser := db.client.config.getDatabaseUsername()
 
+	setOption := db.featureSupported(featureAuthMembersSetOption)
 	conn, release, err := lockRoleConn(db, currentUser)
 	if err != nil {
 		return err
@@ -471,12 +474,12 @@ func setDBOwner(db *DBConnection, d *schema.ResourceData) error {
 	defer release()
 
 	//needed in order to set the owner of the db if the connection user is not a superuser
-	ownerGranted, err := grantRoleMembership(conn, owner, currentUser)
+	ownerGranted, err := grantRoleMembership(conn, setOption, owner, currentUser)
 	if err != nil {
 		return err
 	}
 	if ownerGranted {
-		defer revokeRoleMembershipDeferred(conn, owner, currentUser)
+		defer revokeRoleMembershipDeferred(conn, setOption, owner, currentUser)
 	}
 
 	dbName := d.Get(dbNameAttr).(string)
@@ -488,12 +491,12 @@ func setDBOwner(db *DBConnection, d *schema.ResourceData) error {
 	if err != nil {
 		return fmt.Errorf("error getting current database OWNER: %w", err)
 	}
-	currentOwnerGranted, err := grantRoleMembership(conn, currentOwner, currentUser)
+	currentOwnerGranted, err := grantRoleMembership(conn, setOption, currentOwner, currentUser)
 	if err != nil {
 		return err
 	}
 	if currentOwnerGranted {
-		defer revokeRoleMembershipDeferred(conn, currentOwner, currentUser)
+		defer revokeRoleMembershipDeferred(conn, setOption, currentOwner, currentUser)
 	}
 
 	sql := fmt.Sprintf("ALTER DATABASE %s OWNER TO %s", pq.QuoteIdentifier(dbName), pq.QuoteIdentifier(owner))
@@ -527,6 +530,7 @@ func setAlterOwnership(db *DBConnection, d *schema.ResourceData) error {
 	// locks taken in the same database, and taking it in dbName let owner
 	// changes of several databases grant and revoke the same membership at
 	// the same time (#25).
+	setOption := db.featureSupported(featureAuthMembersSetOption)
 	conn, release, err := lockRoleConn(db, currentUser)
 	if err != nil {
 		return err
@@ -557,12 +561,12 @@ func setAlterOwnership(db *DBConnection, d *schema.ResourceData) error {
 		return nil
 	}
 
-	currentOwnerGranted, err := grantRoleMembership(conn, currentOwner, currentUser)
+	currentOwnerGranted, err := grantRoleMembership(conn, setOption, currentOwner, currentUser)
 	if err != nil {
 		return err
 	}
 	if currentOwnerGranted {
-		defer revokeRoleMembershipDeferred(conn, currentOwner, currentUser)
+		defer revokeRoleMembershipDeferred(conn, setOption, currentOwner, currentUser)
 	}
 
 	// REASSIGN OWNED also needs the privileges of the new owner, and since
@@ -570,12 +574,12 @@ func setAlterOwnership(db *DBConnection, d *schema.ResourceData) error {
 	// role gets in the roles it creates has neither by default
 	// (createrole_self_grant), isMemberOfRole does not count it, and the
 	// explicit GRANT gets SET (and INHERIT) by default.
-	newOwnerGranted, err := grantRoleMembership(conn, newOwner, currentUser)
+	newOwnerGranted, err := grantRoleMembership(conn, setOption, newOwner, currentUser)
 	if err != nil {
 		return err
 	}
 	if newOwnerGranted {
-		defer revokeRoleMembershipDeferred(conn, newOwner, currentUser)
+		defer revokeRoleMembershipDeferred(conn, setOption, newOwner, currentUser)
 	}
 
 	// REASSIGN OWNED only affects the database it runs in, so it runs on a
