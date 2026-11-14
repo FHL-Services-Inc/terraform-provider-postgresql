@@ -179,6 +179,66 @@ resource "postgresql_role" "member" {
 	})
 }
 
+// TestAccPostgresqlRole_PasswordUpdateKeepsRoles is the repro from #93: an
+// update that only changes the password must not touch the memberships, so
+// an ADMIN OPTION given outside of postgresql_role survives it.
+func TestAccPostgresqlRole_PasswordUpdateKeepsRoles(t *testing.T) {
+	skipIfNotAcc(t)
+
+	dbSuffix, teardown := setupTestDatabase(t, false, false)
+	defer teardown()
+	_, prefix := getTestDBNames(dbSuffix)
+
+	config := getTestConfig(t)
+	dsn := config.connStr("postgres")
+	member := prefix + "_member"
+
+	tfConfig := func(password string) string {
+		return fmt.Sprintf(`
+resource "postgresql_role" "g1" {
+  name = "%[1]s_g1"
+}
+resource "postgresql_role" "g2" {
+  name = "%[1]s_g2"
+}
+resource "postgresql_role" "member" {
+  name     = "%[1]s_member"
+  login    = true
+  password = "%[2]s"
+  roles    = [postgresql_role.g1.name, postgresql_role.g2.name]
+}
+`, prefix, password)
+	}
+
+	resource.Test(t, resource.TestCase{
+		PreCheck: func() {
+			testAccPreCheck(t)
+			testCheckCompatibleVersion(t, featurePrivileges)
+		},
+		Providers: testAccProviders,
+		Steps: []resource.TestStep{
+			{
+				Config: tfConfig("pw1"),
+				Check: resource.ComposeTestCheckFunc(
+					checkMembership(t, dsn, member, prefix+"_g1", true, false),
+					checkMembership(t, dsn, member, prefix+"_g2", true, false),
+				),
+			},
+			{
+				PreConfig: func() {
+					dbExecute(t, dsn, fmt.Sprintf("GRANT %s_g1 TO %s WITH ADMIN OPTION", prefix, member))
+				},
+				Config: tfConfig("pw2"),
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr("postgresql_role.member", "password", "pw2"),
+					checkMembership(t, dsn, member, prefix+"_g1", true, true),
+					checkMembership(t, dsn, member, prefix+"_g2", true, false),
+				),
+			},
+		},
+	})
+}
+
 // TestAccPostgresqlRole_RolesChangeKeepsGrantRole changes postgresql_role.roles
 // in the same apply that a postgresql_grant_role (WITH ADMIN OPTION) adds
 // another membership to the same member. The grant_role membership must

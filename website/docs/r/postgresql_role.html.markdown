@@ -138,6 +138,9 @@ resource "postgresql_role" "app_user" {
   Conflicts with `password`.
 
 * `roles` - (Optional) Defines list of roles which will be granted to this new role.
+  On update, only the roles added to or removed from the list are granted or
+  revoked; memberships that stay in the list (and their `ADMIN OPTION`) are not
+  touched, and an update that does not change `roles` does not touch memberships.
 
 * `search_path` - (Optional) Alters the search path of this new role. Note that
   due to limitations in the implementation, values cannot contain the substring
