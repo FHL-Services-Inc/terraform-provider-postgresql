@@ -209,7 +209,7 @@ func resourcePostgreSQLGrantCreateOrUpdate(db *DBConnection, d *schema.ResourceD
 		return err
 	}
 
-	if err = txn.Commit(); err != nil {
+	if err = commitTxn(txn); err != nil {
 		return fmt.Errorf("could not commit transaction: %w", err)
 	}
 
@@ -259,7 +259,7 @@ func resourcePostgreSQLGrantDelete(db *DBConnection, d *schema.ResourceData) err
 		return err
 	}
 
-	if err = txn.Commit(); err != nil {
+	if err = commitTxn(txn); err != nil {
 		return fmt.Errorf("could not commit transaction: %w", err)
 	}
 

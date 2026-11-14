@@ -147,7 +147,7 @@ func resourcePostgreSQLSchemaCreate(db *DBConnection, d *schema.ResourceData) er
 		return err
 	}
 
-	if err := txn.Commit(); err != nil {
+	if err := commitTxn(txn); err != nil {
 		return fmt.Errorf("error committing schema: %w", err)
 	}
 
@@ -265,7 +265,7 @@ func resourcePostgreSQLSchemaDelete(db *DBConnection, d *schema.ResourceData) er
 		return err
 	}
 
-	if err := txn.Commit(); err != nil {
+	if err := commitTxn(txn); err != nil {
 		return fmt.Errorf("error committing schema: %w", err)
 	}
 
@@ -359,7 +359,7 @@ func resourcePostgreSQLSchemaUpdate(db *DBConnection, d *schema.ResourceData) er
 		return err
 	}
 
-	if err := txn.Commit(); err != nil {
+	if err := commitTxn(txn); err != nil {
 		return fmt.Errorf("error committing schema: %w", err)
 	}
 
