@@ -918,7 +918,8 @@ func TestAccPostgresqlGrantSnapshot_Lifecycle(t *testing.T) {
 	// The Check of a step runs right after its apply, when the write has
 	// just dropped the snapshot, so the Reads of the plans before it are
 	// visible only as builds: more than at the previous Check with the flag
-	// on, none at all without it.
+	// on, none since the start of this test without it (other tests of the
+	// package, such as the equivalence test, build snapshots directly).
 	snapshotOn := os.Getenv("PGCATALOGSNAPSHOT") == "true"
 	clearCatalogSnapshots()
 	builds := catalogSnapshotBuilds()
@@ -928,8 +929,8 @@ func TestAccPostgresqlGrantSnapshot_Lifecycle(t *testing.T) {
 		if snapshotOn && now == builds {
 			return fmt.Errorf("no catalog snapshot built since the previous step, the Reads did not use it")
 		}
-		if !snapshotOn && now != 0 {
-			return fmt.Errorf("%d catalog snapshots built with catalog_snapshot off", now)
+		if !snapshotOn && now != builds {
+			return fmt.Errorf("%d catalog snapshot(s) built with catalog_snapshot off", now-builds)
 		}
 		return nil
 	}
