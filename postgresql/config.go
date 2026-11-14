@@ -3,12 +3,16 @@ package postgresql
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"errors"
 	"fmt"
+	"log"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode"
 
@@ -20,6 +24,7 @@ import (
 	"gocloud.dev/postgres"
 	_ "gocloud.dev/postgres/awspostgres"
 	"gocloud.dev/postgres/gcppostgres"
+	"golang.org/x/sync/singleflight"
 	"google.golang.org/api/impersonate"
 )
 
@@ -50,11 +55,27 @@ const (
 	featureCreateRoleSelfGrant
 	featureSecurityLabel
 	featureMaintainPrivilege
+	featureAuthMembersSetOption
 )
+
+// defaultConnMaxIdleTime closes connections that stayed idle in the pool for
+// that long. Only used when max_idle_connections > 0.
+//
+// The provider keeps one pool per database it connects to, so the idle
+// connections it holds add up across pools. Busy pools reuse their connections
+// within milliseconds, so a short timeout costs little reuse, while it bounds
+// how long a pool that is no longer used (e.g. for a database whose resources
+// were all refreshed early in the run) keeps its sessions open on the server,
+// where they count against max_connections and block an out-of-band
+// DROP DATABASE.
+const defaultConnMaxIdleTime = 30 * time.Second
 
 var (
 	dbRegistryLock sync.Mutex
 	dbRegistry     map[string]*DBConnection = make(map[string]*DBConnection, 1)
+
+	// connectGroup de-duplicates concurrent Connect() calls per DSN.
+	connectGroup singleflight.Group
 
 	// Mapping of feature flags to versions
 	featureSupported = map[featureName]semver.Range{
@@ -129,17 +150,167 @@ var (
 
 		// MAINTAIN privilege on tables (PG 17+)
 		featureMaintainPrivilege: semver.MustParseRange(">=17.0.0"),
+
+		// pg_auth_members has a set_option column (PG 16+)
+		featureAuthMembersSetOption: semver.MustParseRange(">=16.0.0"),
 	}
 )
 
+// DBConnection is the connection handle the resources work with. The *sql.DB
+// pool and everything in pool are shared by every provider configuration that
+// connects with the same DSN (see Client.Connect); client and version belong
+// to the caller, so settings that are not part of the DSN (superuser,
+// database_username, expected_version, ...) are those of the configuration
+// that asked for the connection.
 type DBConnection struct {
 	*sql.DB
 
 	client *Client
 
-	// version is the version number of the database as determined by parsing the
-	// output of `SELECT VERSION()`.x
+	// version is the version number of the database: the caller's
+	// expected_version if set, otherwise the server version determined by
+	// parsing the output of `SELECT VERSION()`.
 	version semver.Version
+
+	pool *dbPool
+}
+
+// dbPool holds the state shared by all DBConnections for one DSN.
+type dbPool struct {
+	// config is the configuration of the client that opened the pool. The pool
+	// settings applied by configurePool (max_connections, max_idle_connections,
+	// conn_max_lifetime_seconds) come from it: they can't differ between
+	// callers of one *sql.DB, so the first configuration to connect to a DSN
+	// wins.
+	config Config
+
+	// serverVersion is the fingerprinted server version, nil until a caller
+	// without expected_version needed it.
+	serverVersion atomic.Pointer[semver.Version]
+
+	mu sync.Mutex
+	// poolSettingsWarned is set once a caller with different pool settings
+	// has been logged.
+	poolSettingsWarned bool
+
+	// sessionRole memoizes the login role of this pool and its rolsuper
+	// attribute; see sessionRoleMemo. It lives in the pool, not in
+	// DBConnection, because every caller gets its own DBConnection view.
+	sessionRole sessionRoleMemo
+}
+
+// forClient returns the view of the cached connection conn for client c: the
+// same pool, with c's configuration and version.
+func (conn *DBConnection) forClient(c *Client) (*DBConnection, error) {
+	if conn.client == c {
+		return conn, nil
+	}
+
+	version, err := conn.pool.versionFor(conn.DB, &c.config)
+	if err != nil {
+		return nil, err
+	}
+	conn.pool.warnPoolSettings(&c.config)
+
+	view := *conn
+	view.client = c
+	view.version = version
+	return &view, nil
+}
+
+// versionFor returns the version features are evaluated against for a client
+// with configuration c: its expected_version if set, otherwise the server
+// version, fingerprinted on first use.
+func (p *dbPool) versionFor(db *sql.DB, c *Config) (semver.Version, error) {
+	defaultVersion, _ := semver.Parse(defaultExpectedPostgreSQLVersion)
+	if !defaultVersion.Equals(c.ExpectedVersion) {
+		return c.ExpectedVersion, nil
+	}
+
+	if version := p.serverVersion.Load(); version != nil {
+		return *version, nil
+	}
+
+	// Fingerprinting happens once per pool: when it is opened, or later if it
+	// was opened by a configuration with expected_version set.
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if version := p.serverVersion.Load(); version != nil {
+		return *version, nil
+	}
+	version, err := fingerprintCapabilities(db)
+	if err != nil {
+		return semver.Version{}, fmt.Errorf("error detecting capabilities: %w", err)
+	}
+	p.serverVersion.Store(version)
+	return *version, nil
+}
+
+// warnPoolSettings logs, once per pool, that a configuration with pool
+// settings different from the ones the pool was opened with is using it.
+func (p *dbPool) warnPoolSettings(c *Config) {
+	if c.MaxConns == p.config.MaxConns &&
+		c.MaxIdleConns == p.config.MaxIdleConns &&
+		c.ConnMaxLifetimeSeconds == p.config.ConnMaxLifetimeSeconds {
+		return
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.poolSettingsWarned {
+		return
+	}
+	p.poolSettingsWarned = true
+	log.Printf("[WARN] a connection pool to %s:%d is shared by provider configurations with different pool settings; "+
+		"it keeps the ones it was opened with (max_connections=%d, max_idle_connections=%d, conn_max_lifetime_seconds=%d)",
+		p.config.Host, p.config.Port, p.config.MaxConns, p.config.MaxIdleConns, p.config.ConnMaxLifetimeSeconds)
+}
+
+// sessionRoleMemo caches CURRENT_USER and its rolsuper attribute for one
+// pool. A pool is keyed by DSN, so its login role is fixed for its whole
+// lifetime; only successful lookups are stored, and a lookup
+// racing with another one just stores the same value twice.
+type sessionRoleMemo struct {
+	mu             sync.Mutex
+	user           string
+	userKnown      bool
+	superuser      bool
+	superuserKnown bool
+}
+
+// currentUser returns the session user, querying it on q the first time.
+// q should be the transaction the caller already holds, so the first lookup
+// does not need a second connection from the pool.
+func (db *DBConnection) currentUser(q QueryAble) (string, error) {
+	db.pool.sessionRole.mu.Lock()
+	user, known := db.pool.sessionRole.user, db.pool.sessionRole.userKnown
+	db.pool.sessionRole.mu.Unlock()
+	if known {
+		return user, nil
+	}
+
+	user, err := getCurrentUser(q)
+	if err != nil {
+		return "", err
+	}
+
+	db.pool.sessionRole.mu.Lock()
+	db.pool.sessionRole.user, db.pool.sessionRole.userKnown = user, true
+	db.pool.sessionRole.mu.Unlock()
+	return user, nil
+}
+
+// cachedSuperuser returns the memoized rolsuper of the session user, if known.
+func (db *DBConnection) cachedSuperuser() (superuser, known bool) {
+	db.pool.sessionRole.mu.Lock()
+	defer db.pool.sessionRole.mu.Unlock()
+	return db.pool.sessionRole.superuser, db.pool.sessionRole.superuserKnown
+}
+
+func (db *DBConnection) storeSuperuser(superuser bool) {
+	db.pool.sessionRole.mu.Lock()
+	defer db.pool.sessionRole.mu.Unlock()
+	db.pool.sessionRole.superuser, db.pool.sessionRole.superuserKnown = superuser, true
 }
 
 // featureSupported returns true if a given feature is supported or not. This is
@@ -157,12 +328,17 @@ func (db *DBConnection) featureSupported(name featureName) bool {
 
 // isSuperuser returns true if connected user is a Postgres SUPERUSER
 func (db *DBConnection) isSuperuser() (bool, error) {
+	if superuser, known := db.cachedSuperuser(); known {
+		return superuser, nil
+	}
+
 	var superuser bool
 
 	if err := db.QueryRow("SELECT rolsuper FROM pg_roles WHERE rolname = CURRENT_USER").Scan(&superuser); err != nil {
 		return false, fmt.Errorf("could not check if current user is superuser: %w", err)
 	}
 
+	db.storeSuperuser(superuser)
 	return superuser, nil
 }
 
@@ -189,10 +365,20 @@ type Config struct {
 	ConnectionRetryTimeoutSeconds   int
 	ConnMaxLifetimeSeconds          int
 	MaxConns                        int
+	MaxIdleConns                    int
+	MaxTotalConns                   int
 	ExpectedVersion                 semver.Version
 	SSLClientCert                   *ClientCertificateConfig
 	SSLRootCertPath                 string
 	GCPIAMImpersonateServiceAccount string
+	AdvisoryLockTimeout             int
+	BinaryParameters                bool
+
+	// AuthTokens, when set, supplies the password of every new connection
+	// for the "postgres" scheme (AWS RDS IAM and Azure AD tokens), and
+	// Password is left empty, so the DSN and the dbRegistry key carry no
+	// token. It is a pointer: all Clients of a provider share the cache.
+	AuthTokens *authTokenSource
 }
 
 // Client struct holding connection string
@@ -249,10 +435,19 @@ func (c *Config) connParams() []string {
 		params["sslrootcert"] = c.SSLRootCertPath
 	}
 
+	// Send Parse/Bind/Describe/Execute/Sync in a single flush for statements
+	// with bind parameters instead of a separate prepare round-trip.
+	if c.BinaryParameters {
+		params["binary_parameters"] = "yes"
+	}
+
 	paramsArray := []string{}
 	for key, value := range params {
 		paramsArray = append(paramsArray, fmt.Sprintf("%s=%s", key, url.QueryEscape(value)))
 	}
+	// Map iteration order is random; sort so the DSN (the dbRegistry key) is
+	// stable and a database always maps to a single registry entry.
+	sort.Strings(paramsArray)
 
 	return paramsArray
 }
@@ -279,6 +474,33 @@ func (c *Config) connStr(database string) string {
 	return connStr
 }
 
+// registryKey returns the dbRegistry key of the pool for database: the DSN,
+// prefixed with how connections authenticate. The DSN alone isn't enough:
+//   - with auth tokens it carries no password, so a token-auth provider and a
+//     passwordless one (pgpass, trust) for the same server and user would
+//     share a pool;
+//   - gcp_iam_impersonate_service_account changes the identity the Cloud SQL
+//     client certificates are issued for, but isn't part of the DSN.
+func (c *Config) registryKey(database string) string {
+	key := c.authKind()
+	if c.GCPIAMImpersonateServiceAccount != "" {
+		key += " impersonate=" + c.GCPIAMImpersonateServiceAccount
+	}
+	return key + " " + c.connStr(database)
+}
+
+// authKind describes how connections authenticate, for registryKey.
+func (c *Config) authKind() string {
+	switch {
+	case c.AuthTokens != nil:
+		return "token:" + c.AuthTokens.name
+	case c.Password != "":
+		return "password"
+	default:
+		return "none"
+	}
+}
+
 func (c *Config) getDatabaseUsername() string {
 	if c.DatabaseUsername != "" {
 		return c.DatabaseUsername
@@ -289,65 +511,186 @@ func (c *Config) getDatabaseUsername() string {
 // Connect returns a copy to an sql.Open()'ed database connection wrapped in a DBConnection struct.
 // Callers must return their database resources. Use of QueryRow() or Exec() is encouraged.
 // Query() must have their rows.Close()'ed.
+//
+// One pool is kept per DSN and shared by every Client connecting with it, also
+// across provider configurations (e.g. consecutive provider configurations in
+// one acceptance test binary). The returned DBConnection carries c, so
+// settings read per call are always the caller's; see DBConnection.
 func (c *Client) Connect() (*DBConnection, error) {
-	ctx := context.Background()
-	dsn := c.config.connStr(c.databaseName)
+	return c.connect(context.Background(), c.config.openPostgres)
+}
 
-	dbRegistryLock.Lock()
-	conn, found := dbRegistry[dsn]
-	dbRegistryLock.Unlock()
-	if found {
-		return conn, nil
+// connect implements Connect. openPostgres opens the pool for the "postgres"
+// scheme (overridable by tests).
+func (c *Client) connect(ctx context.Context, openPostgres func(dsn string) (*sql.DB, error)) (*DBConnection, error) {
+	dsn := c.config.connStr(c.databaseName)
+	key := c.config.registryKey(c.databaseName)
+
+	if conn, found := lookupDBConnection(key); found {
+		return conn.forClient(c)
 	}
 
-	// Dialing and retrying happen outside the lock so a slow/flaky connection
-	// to one DSN doesn't stall Connect() calls for other DSNs.
-	db, err := c.connectWithRetry(ctx, proxyDriverName, dsn)
+	// Concurrent first calls for the same DSN share one dial + ping +
+	// fingerprint: without this every caller that misses the registry opens
+	// its own handle and all but one close it again, which with -parallelism=N
+	// costs N-1 extra connections per pool and a startup spike of N
+	// connections that no pool setting caps. Errors are not cached: the next
+	// call after a failed one dials again.
+	v, err, _ := connectGroup.Do(key, func() (any, error) {
+		// A previous flight may have published the connection between the
+		// lookup above and this call.
+		if conn, found := lookupDBConnection(key); found {
+			return conn, nil
+		}
+
+		// Dialing and retrying happen outside dbRegistryLock so a slow/flaky
+		// connection to one DSN doesn't stall Connect() calls for other DSNs.
+		conn, err := c.newDBConnection(ctx, openPostgres, dsn)
+		if err != nil {
+			return nil, err
+		}
+
+		dbRegistryLock.Lock()
+		defer dbRegistryLock.Unlock()
+		if existing, found := dbRegistry[key]; found {
+			// Defensive: only flights publish, and there is one flight per registry key.
+			_ = conn.Close()
+			return existing, nil
+		}
+		dbRegistry[key] = conn
+		return conn, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	// The flight ran with the first caller's Client; every caller gets its
+	// own view of the shared pool.
+	return v.(*DBConnection).forClient(c)
+}
+
+func lookupDBConnection(key string) (*DBConnection, bool) {
+	dbRegistryLock.Lock()
+	defer dbRegistryLock.Unlock()
+	conn, found := dbRegistry[key]
+	return conn, found
+}
+
+// newDBConnection opens and checks a new pool for dsn and fingerprints the
+// server version if no expected_version is set.
+func (c *Client) newDBConnection(ctx context.Context, openPostgres func(dsn string) (*sql.DB, error), dsn string) (*DBConnection, error) {
+	db, err := c.connectWithRetry(ctx, openPostgres, dsn)
 	if err != nil {
 		return nil, err
 	}
 
-	// We don't want to retain connection
-	// So when we connect on a specific database which might be managed by terraform,
-	// we don't keep opened connection in case of the db has to be dropped in the plan.
-	db.SetMaxIdleConns(0)
-	db.SetMaxOpenConns(c.config.MaxConns)
-	db.SetConnMaxLifetime(time.Duration(c.config.ConnMaxLifetimeSeconds) * time.Second)
+	c.config.configurePool(db)
 
-	defaultVersion, _ := semver.Parse(defaultExpectedPostgreSQLVersion)
-	version := &c.config.ExpectedVersion
-	if defaultVersion.Equals(c.config.ExpectedVersion) {
-		// Version hint not set by user, need to fingerprint
-		version, err = fingerprintCapabilities(db)
+	pool := &dbPool{config: c.config}
+	version, err := pool.versionFor(db, &c.config)
+	if err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+
+	return &DBConnection{
+		DB:      db,
+		client:  c,
+		version: version,
+		pool:    pool,
+	}, nil
+}
+
+// configurePool applies the provider's pool settings to a freshly opened
+// database handle.
+func (c *Config) configurePool(db *sql.DB) {
+	// By default (max_idle_connections = 0) no connection is retained: when we
+	// connect to a specific database which might be managed by terraform, we
+	// don't keep connections open in case the database has to be dropped in
+	// the plan. With max_idle_connections > 0 connections are reused, and
+	// postgresql_database evicts the pool of a database before dropping it
+	// (see evictDBConnection).
+	db.SetMaxIdleConns(c.MaxIdleConns)
+	if c.MaxIdleConns > 0 {
+		db.SetConnMaxIdleTime(defaultConnMaxIdleTime)
+	}
+	db.SetMaxOpenConns(c.effectiveMaxConns())
+	db.SetConnMaxLifetime(time.Duration(c.ConnMaxLifetimeSeconds) * time.Second)
+}
+
+// openPostgres opens a pool for the "postgres" scheme. Connections are dialed
+// through proxyDriver (honoring ALL_PROXY / HTTPS_PROXY), authenticate with a
+// fresh token when an auth token source is configured, and count against the
+// endpoint's connection budget when max_total_connections is set. The chain is
+// budgetConnector -> tokenAuthConnector -> pq, so a budget slot is taken before
+// the token fetch and the dial.
+//
+// The gocloud schemes (awspostgres, gcppostgres) open their pools themselves
+// and don't expose their connector, so the budget does not apply to them.
+func (c *Config) openPostgres(dsn string) (*sql.DB, error) {
+	var connector driver.Connector
+	if c.AuthTokens != nil {
+		tc, err := c.newPostgresConnector(dsn)
 		if err != nil {
-			_ = db.Close()
-			return nil, fmt.Errorf("error detecting capabilities: %w", err)
+			return nil, err
 		}
+		connector = tc
+	} else {
+		pc, err := pq.NewConnector(dsn)
+		if err != nil {
+			return nil, err
+		}
+		pc.Dialer(proxyDriver{})
+		connector = pc
 	}
+	if c.MaxTotalConns <= 0 {
+		return sql.OpenDB(connector), nil
+	}
+	budget := getEndpointBudget(c.endpointKey(), c.MaxTotalConns)
+	return openBudgetedDB(connector, budget, c.effectiveMaxConns(), c.MaxIdleConns, c.budgetWait()), nil
+}
 
-	conn = &DBConnection{
-		db,
-		c,
-		*version,
+// budgetWait is how long a dial waits for a free slot of the endpoint budget:
+// connect_timeout, or 3 minutes (its default) when connect_timeout is 0.
+func (c *Config) budgetWait() time.Duration {
+	if c.ConnectTimeoutSec > 0 {
+		return time.Duration(c.ConnectTimeoutSec) * time.Second
 	}
+	return defaultProviderConnectTimeoutSeconds * time.Second
+}
+
+// evictDBConnection removes the pooled connection to database from dbRegistry
+// and closes it, so no idle connection to a database that is about to be
+// dropped stays around, and a database later recreated under the same name
+// gets a fresh pool. Pools opened by a configuration with
+// max_idle_connections = 0 retain no idle connections and are left untouched.
+//
+// The entry is looked up by registryKey, which only matches because every
+// Client is created from the same provider Config (see NewClient) and
+// registryKey is deterministic. It returns true if a pool was found and evicted.
+// It must not be called while holding dbRegistryLock.
+func (c *Config) evictDBConnection(database string) bool {
+	key := c.registryKey(database)
 
 	dbRegistryLock.Lock()
-	defer dbRegistryLock.Unlock()
-	if existing, found := dbRegistry[dsn]; found {
-		// Another goroutine won the race and already published a connection
-		// for this DSN; keep that one and discard ours.
-		_ = db.Close()
-		return existing, nil
+	conn, found := dbRegistry[key]
+	if !found || conn.pool.config.MaxIdleConns == 0 {
+		dbRegistryLock.Unlock()
+		return false
 	}
-	dbRegistry[dsn] = conn
-	return conn, nil
+	delete(dbRegistry, key)
+	dbRegistryLock.Unlock()
+
+	if err := conn.Close(); err != nil {
+		log.Printf("[WARN] error closing connection pool to database %q: %v", database, err)
+	}
+	return true
 }
 
 // connectWithRetry opens a connection to dsn, retrying transient failures up
 // to c.config.MaxConnRetries times or until c.config.ConnectionRetryTimeoutSeconds
-// elapses, whichever comes first. postgresDriverName is the database/sql
-// driver used for the "postgres" scheme (overridable by tests).
-func (c *Client) connectWithRetry(ctx context.Context, postgresDriverName, dsn string) (*sql.DB, error) {
+// elapses, whichever comes first. openPostgres opens the pool for the
+// "postgres" scheme (overridable by tests).
+func (c *Client) connectWithRetry(ctx context.Context, openPostgres func(dsn string) (*sql.DB, error), dsn string) (*sql.DB, error) {
 	var db *sql.DB
 	var err error
 	retryCount := 0
@@ -355,7 +698,7 @@ func (c *Client) connectWithRetry(ctx context.Context, postgresDriverName, dsn s
 	connectRetryTimeout := time.Duration(c.config.ConnectionRetryTimeoutSeconds) * time.Second
 	retryError := retry.RetryContext(ctx, connectRetryTimeout, func() *retry.RetryError {
 		if c.config.Scheme == "postgres" {
-			db, err = sql.Open(postgresDriverName, dsn)
+			db, err = openPostgres(dsn)
 		} else if c.config.Scheme == "gcppostgres" && c.config.GCPIAMImpersonateServiceAccount != "" {
 			db, err = openImpersonatedGCPDBConnection(ctx, dsn, c.config.GCPIAMImpersonateServiceAccount)
 		} else {
@@ -387,7 +730,12 @@ func (c *Client) connectWithRetry(ctx context.Context, postgresDriverName, dsn s
 		if _, ok := errors.AsType[*pq.Error](retryError); ok {
 			return nil, fmt.Errorf("error connecting to PostgreSQL server %s (scheme: %s): %w", c.config.Host, c.config.Scheme, retryError)
 		}
-		errString := strings.Replace(retryError.Error(), c.config.Password, "XXXX", 2)
+		// On the auth token path Password is empty and the connector has
+		// already redacted the token.
+		errString := retryError.Error()
+		if c.config.Password != "" {
+			errString = strings.Replace(errString, c.config.Password, "XXXX", 2)
+		}
 		return nil, fmt.Errorf("error connecting to PostgreSQL server %s (scheme: %s): %s", c.config.Host, c.config.Scheme, errString)
 	}
 

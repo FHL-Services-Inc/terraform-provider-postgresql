@@ -91,17 +91,18 @@ func TestAccPostgresqlPublication_Database(t *testing.T) {
 	defer teardown()
 
 	dbName, _ := getTestDBNames(dbSuffix)
+	ownerName := testUniqueName("test")
 
 	testAccPostgresqlPublicationDatabaseConfig := fmt.Sprintf(`
 	resource "postgresql_role" "test" {
-		name = "test"
+		name = "%s"
 	}
 	resource "postgresql_publication" "test" {
 		name     = "publication"
 		database = "%s"
 		owner = postgresql_role.test.name
 	}
-	`, dbName)
+	`, ownerName, dbName)
 
 	resource.Test(t, resource.TestCase{
 		PreCheck: func() {
@@ -119,7 +120,7 @@ func TestAccPostgresqlPublication_Database(t *testing.T) {
 					resource.TestCheckResourceAttr(
 						"postgresql_publication.test", "name", "publication"),
 					resource.TestCheckResourceAttr(
-						"postgresql_publication.test", "owner", "test"),
+						"postgresql_publication.test", "owner", ownerName),
 					resource.TestCheckResourceAttr(
 						"postgresql_publication.test", "database", dbName),
 				),
@@ -355,7 +356,7 @@ func TestAccPostgresqlPublication_UpdateOwner(t *testing.T) {
 	defer teardown()
 
 	dbName, _ := getTestDBNames(dbSuffix)
-	testOwner := "test_owner"
+	testOwner := testUniqueName("test_owner")
 
 	testAccPostgresqlPublicationBaseConfig := fmt.Sprintf(`
 	resource "postgresql_publication" "test" {
@@ -504,9 +505,10 @@ func TestAccPostgresqlPublication_Basic(t *testing.T) {
 	createTestTables(t, dbSuffix, testTables, "")
 
 	dbName, _ := getTestDBNames(dbSuffix)
+	ownerName := testUniqueName("test_owner")
 	testAccPostgresqlPublicationBasicConfig := fmt.Sprintf(`
 resource "postgresql_role" "test_owner" {
-	name = "test_owner"
+	name = "%s"
 	login = true
 }
 
@@ -516,7 +518,7 @@ resource "postgresql_publication" "test" {
 	owner = "${postgresql_role.test_owner.name}"
 	all_tables = true
 }
-`, dbName)
+`, ownerName, dbName)
 
 	resource.Test(t, resource.TestCase{
 		PreCheck: func() {
@@ -539,7 +541,7 @@ resource "postgresql_publication" "test" {
 					resource.TestCheckResourceAttr(
 						"postgresql_publication.test", pubAllTablesAttr, "true"),
 					resource.TestCheckResourceAttr(
-						"postgresql_publication.test", pubOwnerAttr, "test_owner"),
+						"postgresql_publication.test", pubOwnerAttr, ownerName),
 					resource.TestCheckResourceAttr(
 						"postgresql_publication.test", fmt.Sprintf("%s.#", pubTablesAttr), "3"),
 					resource.TestCheckResourceAttr(
@@ -573,9 +575,10 @@ func TestAccPostgresqlPublication_BasicWithoutTruncate(t *testing.T) {
 	createTestTables(t, dbSuffix, testTables, "")
 
 	dbName, _ := getTestDBNames(dbSuffix)
+	ownerName := testUniqueName("test_owner")
 	testAccPostgresqlPublicationBasicConfig := fmt.Sprintf(`
 resource "postgresql_role" "test_owner" {
-	name = "test_owner"
+	name = "%s"
 	login = true
 }
 
@@ -585,7 +588,7 @@ resource "postgresql_publication" "test" {
 	owner = "${postgresql_role.test_owner.name}"
 	all_tables = true
 }
-`, dbName)
+`, ownerName, dbName)
 
 	resource.Test(t, resource.TestCase{
 		PreCheck: func() {
@@ -608,7 +611,7 @@ resource "postgresql_publication" "test" {
 					resource.TestCheckResourceAttr(
 						"postgresql_publication.test", pubAllTablesAttr, "true"),
 					resource.TestCheckResourceAttr(
-						"postgresql_publication.test", pubOwnerAttr, "test_owner"),
+						"postgresql_publication.test", pubOwnerAttr, ownerName),
 					resource.TestCheckResourceAttr(
 						"postgresql_publication.test", fmt.Sprintf("%s.#", pubTablesAttr), "3"),
 					resource.TestCheckResourceAttr(
@@ -814,6 +817,59 @@ resource "postgresql_publication" "test" {
 			{
 				Config:      testAccPostgresqlPublicationDuplicateKeys,
 				ExpectError: regexp.MustCompile("'insert' is duplicated for attribute `tables`")},
+		},
+	})
+}
+
+// A publication whose name contains a single quote and a backslash must be
+// created, owned by a similarly named role, read back after create (not
+// reported as gone) and produce no drift.
+func TestAccPostgresqlPublication_QuotedName(t *testing.T) {
+	skipIfNotAcc(t)
+
+	dbSuffix, teardown := setupTestDatabase(t, true, true)
+	defer teardown()
+
+	dbName, _ := getTestDBNames(dbSuffix)
+	const (
+		pubName   = `we'ird\name`
+		ownerName = `pub'owner\`
+	)
+
+	config := fmt.Sprintf(`
+resource "postgresql_role" "quoted_owner" {
+	name = %q
+}
+
+resource "postgresql_publication" "quoted" {
+	name     = %q
+	database = %q
+	owner    = postgresql_role.quoted_owner.name
+}
+`, ownerName, pubName, dbName)
+
+	resource.Test(t, resource.TestCase{
+		PreCheck: func() {
+			testAccPreCheck(t)
+			testCheckCompatibleVersion(t, featurePublication)
+			testSuperuserPreCheck(t)
+		},
+		Providers:    testAccProviders,
+		CheckDestroy: testAccCheckPostgresqlPublicationDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config: config,
+				Check: resource.ComposeTestCheckFunc(
+					testAccCheckPostgresqlPublicationExists("postgresql_publication.quoted"),
+					resource.TestCheckResourceAttr("postgresql_publication.quoted", "name", pubName),
+					resource.TestCheckResourceAttr("postgresql_publication.quoted", pubDatabaseAttr, dbName),
+					resource.TestCheckResourceAttr("postgresql_publication.quoted", pubOwnerAttr, ownerName),
+				),
+			},
+			{
+				Config:   config,
+				PlanOnly: true,
+			},
 		},
 	})
 }

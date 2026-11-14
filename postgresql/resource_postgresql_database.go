@@ -126,29 +126,27 @@ func createDatabase(db *DBConnection, d *schema.ResourceData) error {
 	currentUser := db.client.config.getDatabaseUsername()
 	owner := d.Get(dbOwnerAttr).(string)
 
-	var err error
+	// Statements below run on conn: the pool, or the connection holding the
+	// lock when an owner is set.
+	var conn QueryAble = db
 	if owner != "" {
 		// Take a lock on db currentUser to avoid multiple database creation at the same time
 		// It can fail if they grant the same owner to current at the same time as it's not done in transaction.
-		lockTxn, err := startTransaction(db.client, "")
+		lockConn, release, err := lockRoleConn(db, currentUser)
 		if err != nil {
 			return err
 		}
-		if err := pgLockRole(lockTxn, currentUser); err != nil {
-			return err
-		}
-		defer deferredRollback(lockTxn)
+		defer release()
+		conn = lockConn
 
 		// Needed in order to set the owner of the db if the connection user is not a
 		// superuser
-		ownerGranted, err := grantRoleMembership(db, owner, currentUser)
+		ownerGranted, err := grantRoleMembership(conn, db.featureSupported(featureAuthMembersSetOption), owner, currentUser)
 		if err != nil {
 			return err
 		}
 		if ownerGranted {
-			defer func() {
-				_, err = revokeRoleMembership(db, owner, currentUser)
-			}()
+			defer revokeRoleMembershipDeferred(conn, db.featureSupported(featureAuthMembersSetOption), owner, currentUser)
 		}
 	}
 
@@ -172,6 +170,11 @@ func createDatabase(db *DBConnection, d *schema.ResourceData) error {
 		fmt.Fprint(b, " TEMPLATE DEFAULT")
 	case ok:
 		fmt.Fprint(b, " TEMPLATE ", pq.QuoteIdentifier(v.(string)))
+		// CREATE DATABASE fails while any session is connected to the
+		// template, including our own idle pooled ones (only kept with
+		// max_idle_connections > 0), e.g. when the template is a database
+		// managed by this provider.
+		evictOtherDBPool(db, v.(string))
 	case v.(string) == "":
 		fmt.Fprint(b, " TEMPLATE template0")
 	}
@@ -180,7 +183,7 @@ func createDatabase(db *DBConnection, d *schema.ResourceData) error {
 	case ok && strings.ToUpper(v.(string)) == "DEFAULT":
 		fmt.Fprintf(b, " ENCODING DEFAULT")
 	case ok:
-		fmt.Fprintf(b, " ENCODING '%s' ", pqQuoteLiteral(v.(string)))
+		fmt.Fprintf(b, " ENCODING %s ", pq.QuoteLiteral(v.(string)))
 	case v.(string) == "":
 		fmt.Fprint(b, ` ENCODING 'UTF8'`)
 	}
@@ -191,7 +194,7 @@ func createDatabase(db *DBConnection, d *schema.ResourceData) error {
 	case ok && strings.ToUpper(v.(string)) == "DEFAULT":
 		fmt.Fprintf(b, " LC_COLLATE DEFAULT")
 	case ok:
-		fmt.Fprintf(b, " LC_COLLATE '%s' ", pqQuoteLiteral(v.(string)))
+		fmt.Fprintf(b, " LC_COLLATE %s ", pq.QuoteLiteral(v.(string)))
 	}
 
 	// Don't specify LC_CTYPE if user didn't specify it
@@ -200,7 +203,7 @@ func createDatabase(db *DBConnection, d *schema.ResourceData) error {
 	case ok && strings.ToUpper(v.(string)) == "DEFAULT":
 		fmt.Fprintf(b, " LC_CTYPE DEFAULT")
 	case ok:
-		fmt.Fprintf(b, " LC_CTYPE '%s' ", pqQuoteLiteral(v.(string)))
+		fmt.Fprintf(b, " LC_CTYPE %s ", pq.QuoteLiteral(v.(string)))
 	}
 
 	switch v, ok := d.GetOk(dbTablespaceAttr); {
@@ -226,13 +229,11 @@ func createDatabase(db *DBConnection, d *schema.ResourceData) error {
 	}
 
 	sql := b.String()
-	if _, err := db.Exec(sql); err != nil {
+	if _, err := conn.Exec(sql); err != nil {
 		return fmt.Errorf("error creating database %q: %w", dbName, err)
 	}
 
-	// Set err outside of the return so that the deferred revoke can override err
-	// if necessary.
-	return err
+	return nil
 }
 
 func resourcePostgreSQLDatabaseDelete(db *DBConnection, d *schema.ResourceData) error {
@@ -240,24 +241,25 @@ func resourcePostgreSQLDatabaseDelete(db *DBConnection, d *schema.ResourceData) 
 	owner := d.Get(dbOwnerAttr).(string)
 
 	var dropWithForce string
-	var err error
+	// Statements below run on conn: the pool, or the connection holding the
+	// lock when an owner is set.
+	var conn QueryAble = db
 	if owner != "" {
-		lockTxn, err := startTransaction(db.client, "")
-		if err := pgLockRole(lockTxn, currentUser); err != nil {
+		lockConn, release, err := lockRoleConn(db, currentUser)
+		if err != nil {
 			return err
 		}
-		defer deferredRollback(lockTxn)
+		defer release()
+		conn = lockConn
 
 		// Needed in order to set the owner of the db if the connection user is not a
 		// superuser
-		ownerGranted, err := grantRoleMembership(db, owner, currentUser)
+		ownerGranted, err := grantRoleMembership(conn, db.featureSupported(featureAuthMembersSetOption), owner, currentUser)
 		if err != nil {
 			return err
 		}
 		if ownerGranted {
-			defer func() {
-				_, err = revokeRoleMembership(db, owner, currentUser)
-			}()
+			defer revokeRoleMembershipDeferred(conn, db.featureSupported(featureAuthMembersSetOption), owner, currentUser)
 		}
 	}
 
@@ -266,18 +268,24 @@ func resourcePostgreSQLDatabaseDelete(db *DBConnection, d *schema.ResourceData) 
 		if isTemplate := d.Get(dbIsTemplateAttr).(bool); isTemplate {
 			// Template databases must have this attribute cleared before
 			// they can be dropped.
-			if err := doSetDBIsTemplate(db, dbName, false); err != nil {
+			if err := doSetDBIsTemplate(db, conn, dbName, false); err != nil {
 				return fmt.Errorf("error updating database IS_TEMPLATE during DROP DATABASE: %w", err)
 			}
 		}
 	}
 
-	if err := setDBIsTemplate(db, d); err != nil {
+	if err := setDBIsTemplate(db, conn, d); err != nil {
 		return err
 	}
 
+	// Close our own pooled connections to the database (only kept with
+	// max_idle_connections > 0) before terminating the remaining ones.
+	if db.client.config.evictDBConnection(dbName) {
+		log.Printf("[DEBUG] evicted pooled connections to database %q before dropping it", dbName)
+	}
+
 	// Terminate all active connections and block new one
-	if err := terminateBConnections(db, dbName); err != nil {
+	if err := terminateBConnections(db, conn, dbName); err != nil {
 		return err
 	}
 
@@ -287,14 +295,13 @@ func resourcePostgreSQLDatabaseDelete(db *DBConnection, d *schema.ResourceData) 
 	}
 
 	sql := fmt.Sprintf("DROP DATABASE %s %s", pq.QuoteIdentifier(dbName), dropWithForce)
-	if _, err := db.Exec(sql); err != nil {
+	if _, err := conn.Exec(sql); err != nil {
 		return fmt.Errorf("error dropping database: %w", err)
 	}
 
 	d.SetId("")
 
-	// Returning err even if it's nil so defer func can modify it.
-	return err
+	return nil
 }
 
 func resourcePostgreSQLDatabaseRead(db *DBConnection, d *schema.ResourceData) error {
@@ -396,7 +403,7 @@ func resourcePostgreSQLDatabaseUpdate(db *DBConnection, d *schema.ResourceData) 
 		return err
 	}
 
-	if err := setDBIsTemplate(db, d); err != nil {
+	if err := setDBIsTemplate(db, db, d); err != nil {
 		return err
 	}
 
@@ -405,7 +412,7 @@ func resourcePostgreSQLDatabaseUpdate(db *DBConnection, d *schema.ResourceData) 
 	return resourcePostgreSQLDatabaseReadImpl(db, d)
 }
 
-func setDBName(db QueryAble, d *schema.ResourceData) error {
+func setDBName(db *DBConnection, d *schema.ResourceData) error {
 	if !d.HasChange(dbNameAttr) {
 		return nil
 	}
@@ -417,6 +424,13 @@ func setDBName(db QueryAble, d *schema.ResourceData) error {
 		return errors.New("error setting database name to an empty string")
 	}
 
+	// RENAME fails while any session is connected to the database, including
+	// our own idle pooled ones (only kept with max_idle_connections > 0).
+	// A pool registered under the new name can only be a stale one from an
+	// earlier database with that name, drop it as well.
+	evictOtherDBPool(db, o)
+	evictOtherDBPool(db, n)
+
 	sql := fmt.Sprintf("ALTER DATABASE %s RENAME TO %s", pq.QuoteIdentifier(o), pq.QuoteIdentifier(n))
 	if _, err := db.Exec(sql); err != nil {
 		return fmt.Errorf("error updating database name: %w", err)
@@ -424,6 +438,19 @@ func setDBName(db QueryAble, d *schema.ResourceData) error {
 	d.SetId(n)
 
 	return nil
+}
+
+// evictOtherDBPool closes this provider's pooled connections to database
+// (see evictDBConnection), unless database is the one db itself is connected
+// to: the statement that follows still needs that pool, and PostgreSQL refuses
+// to rename or copy the database of the current session anyway.
+func evictOtherDBPool(db *DBConnection, database string) {
+	if database == db.client.databaseName {
+		return
+	}
+	if db.client.config.evictDBConnection(database) {
+		log.Printf("[DEBUG] evicted pooled connections to database %q", database)
+	}
 }
 
 func setDBOwner(db *DBConnection, d *schema.ResourceData) error {
@@ -437,31 +464,44 @@ func setDBOwner(db *DBConnection, d *schema.ResourceData) error {
 	}
 	currentUser := db.client.config.getDatabaseUsername()
 
-	lockTxn, err := startTransaction(db.client, "")
-	if err := pgLockRole(lockTxn, currentUser); err != nil {
+	conn, release, err := lockRoleConn(db, currentUser)
+	if err != nil {
 		return err
 	}
-	defer deferredRollback(lockTxn)
+	defer release()
 
 	//needed in order to set the owner of the db if the connection user is not a superuser
-	ownerGranted, err := grantRoleMembership(db, owner, currentUser)
+	ownerGranted, err := grantRoleMembership(conn, db.featureSupported(featureAuthMembersSetOption), owner, currentUser)
 	if err != nil {
 		return err
 	}
 	if ownerGranted {
-		defer func() {
-			_, err = revokeRoleMembership(db, owner, currentUser)
-		}()
+		defer revokeRoleMembershipDeferred(conn, db.featureSupported(featureAuthMembersSetOption), owner, currentUser)
 	}
 
 	dbName := d.Get(dbNameAttr).(string)
 
+	// ALTER DATABASE ... OWNER TO also requires owning the database, i.e.
+	// membership in its current owner, which a non-superuser connection role
+	// usually does not have.
+	currentOwner, err := getDatabaseOwner(conn, dbName)
+	if err != nil {
+		return fmt.Errorf("error getting current database OWNER: %w", err)
+	}
+	currentOwnerGranted, err := grantRoleMembership(conn, db.featureSupported(featureAuthMembersSetOption), currentOwner, currentUser)
+	if err != nil {
+		return err
+	}
+	if currentOwnerGranted {
+		defer revokeRoleMembershipDeferred(conn, db.featureSupported(featureAuthMembersSetOption), currentOwner, currentUser)
+	}
+
 	sql := fmt.Sprintf("ALTER DATABASE %s OWNER TO %s", pq.QuoteIdentifier(dbName), pq.QuoteIdentifier(owner))
-	if _, err := db.Exec(sql); err != nil {
+	if _, err := conn.Exec(sql); err != nil {
 		return fmt.Errorf("error updating database OWNER: %w", err)
 	}
 
-	return err
+	return nil
 }
 
 func setAlterOwnership(db *DBConnection, d *schema.ResourceData) error {
@@ -481,13 +521,19 @@ func setAlterOwnership(db *DBConnection, d *schema.ResourceData) error {
 
 	dbName := d.Get(dbNameAttr).(string)
 
-	lockTxn, err := startTransaction(db.client, dbName)
-	if err := pgLockRole(lockTxn, currentUser); err != nil {
+	// REASSIGN OWNED only affects the database it runs in, so the lock is
+	// taken on a connection to that database.
+	targetDB, err := initConnection(db.client, dbName)
+	if err != nil {
 		return err
 	}
-	defer deferredRollback(lockTxn)
+	conn, release, err := lockRoleConn(targetDB, currentUser)
+	if err != nil {
+		return err
+	}
+	defer release()
 
-	currentOwner, err := getDatabaseOwner(db, dbName)
+	currentOwner, err := getDatabaseOwner(conn, dbName)
 	if err != nil {
 		return fmt.Errorf("error getting current database OWNER: %w", err)
 	}
@@ -498,15 +544,25 @@ func setAlterOwnership(db *DBConnection, d *schema.ResourceData) error {
 		return nil
 	}
 
-	currentOwnerGranted, err := grantRoleMembership(db, currentOwner, currentUser)
+	currentOwnerGranted, err := grantRoleMembership(conn, db.featureSupported(featureAuthMembersSetOption), currentOwner, currentUser)
 	if err != nil {
 		return err
 	}
 	if currentOwnerGranted {
-		defer func() {
-			_, err = revokeRoleMembership(db, currentOwner, currentUser)
-		}()
+		defer revokeRoleMembershipDeferred(conn, db.featureSupported(featureAuthMembersSetOption), currentOwner, currentUser)
 	}
+
+	lockTxn, err := conn.Begin()
+	if err != nil {
+		return fmt.Errorf("could not start transaction: %w", err)
+	}
+	defer deferredRollback(lockTxn)
+	// REASSIGN used to run in the pgLockRole transaction, which had
+	// statement_timeout disabled.
+	if _, err := lockTxn.Exec("SET LOCAL statement_timeout = 0"); err != nil {
+		return fmt.Errorf("could not disable statement_timeout: %w", err)
+	}
+
 	sql := fmt.Sprintf("REASSIGN OWNED BY %s TO %s", pq.QuoteIdentifier(currentOwner), pq.QuoteIdentifier(newOwner))
 	if _, err := lockTxn.Exec(sql); err != nil {
 		return fmt.Errorf("error reassigning objects owned by '%s': %w", currentOwner, err)
@@ -573,38 +629,38 @@ func setDBAllowConns(db *DBConnection, d *schema.ResourceData) error {
 	return nil
 }
 
-func setDBIsTemplate(db *DBConnection, d *schema.ResourceData) error {
+func setDBIsTemplate(db *DBConnection, conn QueryAble, d *schema.ResourceData) error {
 	if !d.HasChange(dbIsTemplateAttr) {
 		return nil
 	}
 
-	if err := doSetDBIsTemplate(db, d.Get(dbNameAttr).(string), d.Get(dbIsTemplateAttr).(bool)); err != nil {
+	if err := doSetDBIsTemplate(db, conn, d.Get(dbNameAttr).(string), d.Get(dbIsTemplateAttr).(bool)); err != nil {
 		return fmt.Errorf("error updating database IS_TEMPLATE: %w", err)
 	}
 
 	return nil
 }
 
-func doSetDBIsTemplate(db *DBConnection, dbName string, isTemplate bool) error {
+func doSetDBIsTemplate(db *DBConnection, conn QueryAble, dbName string, isTemplate bool) error {
 	if !db.featureSupported(featureDBIsTemplate) {
 		return fmt.Errorf("PostgreSQL client is talking with a server (%q) that does not support database IS_TEMPLATE", db.version.String())
 	}
 
 	sql := fmt.Sprintf("ALTER DATABASE %s IS_TEMPLATE %t", pq.QuoteIdentifier(dbName), isTemplate)
-	if _, err := db.Exec(sql); err != nil {
+	if _, err := conn.Exec(sql); err != nil {
 		return fmt.Errorf("error updating database IS_TEMPLATE: %w", err)
 	}
 
 	return nil
 }
 
-func terminateBConnections(db *DBConnection, dbName string) error {
+func terminateBConnections(db *DBConnection, conn QueryAble, dbName string) error {
 	var terminateSql string
 
 	if db.featureSupported(featureDBAllowConnections) {
 		alterSql := fmt.Sprintf("ALTER DATABASE %s ALLOW_CONNECTIONS false", pq.QuoteIdentifier(dbName))
 
-		if _, err := db.Exec(alterSql); err != nil {
+		if _, err := conn.Exec(alterSql); err != nil {
 			return fmt.Errorf("error blocking connections to database: %w", err)
 		}
 	}
@@ -612,8 +668,8 @@ func terminateBConnections(db *DBConnection, dbName string) error {
 	if db.featureSupported(featurePid) {
 		pid = "pid"
 	}
-	terminateSql = fmt.Sprintf("SELECT pg_terminate_backend(%s) FROM pg_stat_activity WHERE datname = '%s' AND %s <> pg_backend_pid()", pid, dbName, pid)
-	if _, err := db.Exec(terminateSql); err != nil {
+	terminateSql = fmt.Sprintf("SELECT pg_terminate_backend(%s) FROM pg_stat_activity WHERE datname = %s AND %s <> pg_backend_pid()", pid, pq.QuoteLiteral(dbName), pid)
+	if _, err := conn.Exec(terminateSql); err != nil {
 		return fmt.Errorf("error terminating database connections: %w", err)
 	}
 

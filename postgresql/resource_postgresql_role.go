@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -294,8 +295,7 @@ func resourcePostgreSQLRoleCreate(db *DBConnection, d *schema.ResourceData) erro
 				} else {
 					createOpts = append(createOpts, "UNENCRYPTED")
 				}
-				createOpts = append(createOpts,
-					fmt.Sprintf("%s '%s'", opt.sqlKey, pqQuoteLiteral(val)))
+				createOpts = append(createOpts, rolePasswordClause(val))
 			}
 
 		case roleValidUntilAttr:
@@ -304,7 +304,7 @@ func resourcePostgreSQLRoleCreate(db *DBConnection, d *schema.ResourceData) erro
 					fmt.Sprintf("%s 'infinity'", opt.sqlKey))
 			} else {
 				createOpts = append(createOpts,
-					fmt.Sprintf("%s '%s'", opt.sqlKey, pqQuoteLiteral(val)))
+					fmt.Sprintf("%s %s", opt.sqlKey, pq.QuoteLiteral(val)))
 			}
 
 		default:
@@ -387,12 +387,12 @@ func resourcePostgreSQLRoleDelete(db *DBConnection, d *schema.ResourceData) erro
 	}
 	defer deferredRollback(txn)
 
-	if err := pgLockRole(txn, roleName); err != nil {
+	if err := pgLockRole(db, txn, roleName); err != nil {
 		return err
 	}
 
 	if !d.Get(roleSkipReassignOwnedAttr).(bool) {
-		if err := withRolesGranted(txn, []string{roleName}, func() error {
+		if err := withRolesGranted(db, txn, []string{roleName}, func() error {
 			currentUser := db.client.config.getDatabaseUsername()
 			if _, err := txn.Exec(fmt.Sprintf("REASSIGN OWNED BY %s TO %s", pq.QuoteIdentifier(roleName), pq.QuoteIdentifier(currentUser))); err != nil {
 				return fmt.Errorf("could not reassign owned by role %s to %s: %w", roleName, currentUser, err)
@@ -662,7 +662,7 @@ func resourcePostgreSQLRoleUpdate(db *DBConnection, d *schema.ResourceData) erro
 	defer deferredRollback(txn)
 
 	oldName, _ := d.GetChange(roleNameAttr)
-	if err := pgLockRole(txn, oldName.(string)); err != nil {
+	if err := pgLockRole(db, txn, oldName.(string)); err != nil {
 		return err
 	}
 
@@ -710,13 +710,14 @@ func resourcePostgreSQLRoleUpdate(db *DBConnection, d *schema.ResourceData) erro
 		return err
 	}
 
-	// applying roles: let's revoke all / grant the right ones
-	if err = revokeRoles(txn, d); err != nil {
-		return err
-	}
-
-	if err = grantRoles(txn, d); err != nil {
-		return err
+	// applying roles: revoke the removed ones / grant the added ones.
+	// Memberships kept in roles are left alone, so they keep their ADMIN
+	// OPTION, and memberships granted by postgresql_grant_role since the last
+	// refresh are not revoked.
+	if d.HasChange(roleRolesAttr) {
+		if err = updateRoleRoles(txn, d); err != nil {
+			return err
+		}
 	}
 
 	if err = alterSearchPath(txn, d); err != nil {
@@ -791,12 +792,20 @@ func setRolePassword(txn *sql.Tx, d *schema.ResourceData) error {
 		return nil
 	}
 
-	sql := fmt.Sprintf("ALTER ROLE %s PASSWORD '%s'", pq.QuoteIdentifier(roleName), pqQuoteLiteral(password))
+	sql := fmt.Sprintf("ALTER ROLE %s %s", pq.QuoteIdentifier(roleName), rolePasswordClause(password))
 	if _, err := txn.Exec(sql); err != nil {
 		return fmt.Errorf("error updating role password: %w", err)
 	}
 
 	return nil
+}
+
+// rolePasswordClause returns the PASSWORD clause of CREATE/ALTER ROLE for a
+// clear-text password. pq.QuoteLiteral produces an escape string literal
+// (E'...') when the password contains a backslash, so the value is stored as
+// configured whatever standard_conforming_strings is set to.
+func rolePasswordClause(password string) string {
+	return "PASSWORD " + pq.QuoteLiteral(password)
 }
 
 func setRoleBypassRLS(db *DBConnection, txn *sql.Tx, d *schema.ResourceData) error {
@@ -964,7 +973,7 @@ func setRoleValidUntil(txn *sql.Tx, d *schema.ResourceData) error {
 	}
 
 	roleName := d.Get(roleNameAttr).(string)
-	sql := fmt.Sprintf("ALTER ROLE %s VALID UNTIL '%s'", pq.QuoteIdentifier(roleName), pqQuoteLiteral(validUntil))
+	sql := fmt.Sprintf("ALTER ROLE %s VALID UNTIL %s", pq.QuoteIdentifier(roleName), pq.QuoteLiteral(validUntil))
 	if _, err := txn.Exec(sql); err != nil {
 		return fmt.Errorf("error updating role VALID UNTIL: %w", err)
 	}
@@ -972,17 +981,43 @@ func setRoleValidUntil(txn *sql.Tx, d *schema.ResourceData) error {
 	return nil
 }
 
-func revokeRoles(txn *sql.Tx, d *schema.ResourceData) error {
-	role := d.Get(roleNameAttr).(string)
+// roleRolesStatements returns the REVOKE statements for the roles in old but
+// not in new that the role is currently a member of, then the GRANT
+// statements for the roles in new but not in old, each sorted by role name.
+//
+// Revokes are limited to current memberships because a removed role may
+// already be gone: when its postgresql_role is destroyed in the same apply,
+// DROP ROLE has removed the membership with it and REVOKE would fail.
+func roleRolesStatements(role string, old, new *schema.Set, current map[string]bool) []string {
+	var stmts []string
+	for _, r := range sortedSetStrings(old.Difference(new)) {
+		if current[r] {
+			stmts = append(stmts, fmt.Sprintf("REVOKE %s FROM %s", pq.QuoteIdentifier(r), pq.QuoteIdentifier(role)))
+		}
+	}
+	for _, r := range sortedSetStrings(new.Difference(old)) {
+		stmts = append(stmts, fmt.Sprintf("GRANT %s TO %s", pq.QuoteIdentifier(r), pq.QuoteIdentifier(role)))
+	}
+	return stmts
+}
 
-	query := `SELECT pg_get_userbyid(roleid)
+func sortedSetStrings(s *schema.Set) []string {
+	out := make([]string, 0, s.Len())
+	for _, v := range s.List() {
+		out = append(out, v.(string))
+	}
+	sort.Strings(out)
+	return out
+}
+
+// currentRoleRoles returns the roles the role is currently a member of.
+func currentRoleRoles(txn *sql.Tx, role string) (map[string]bool, error) {
+	rows, err := txn.Query(`SELECT pg_get_userbyid(roleid)
 		FROM pg_catalog.pg_auth_members members
 		JOIN pg_catalog.pg_roles ON members.member = pg_roles.oid
-		WHERE rolname = $1`
-
-	rows, err := txn.Query(query, role)
+		WHERE rolname = $1`, role)
 	if err != nil {
-		return fmt.Errorf("could not get roles list for role %s: %w", role, err)
+		return nil, fmt.Errorf("could not get roles list for role %s: %w", role, err)
 	}
 	defer func() {
 		if err := rows.Close(); err != nil {
@@ -990,27 +1025,33 @@ func revokeRoles(txn *sql.Tx, d *schema.ResourceData) error {
 		}
 	}()
 
-	grantedRoles := []string{}
+	current := map[string]bool{}
 	for rows.Next() {
 		var grantedRole string
-
-		if err = rows.Scan(&grantedRole); err != nil {
-			return fmt.Errorf("could not scan role name for role %s: %w", role, err)
+		if err := rows.Scan(&grantedRole); err != nil {
+			return nil, fmt.Errorf("could not scan role name for role %s: %w", role, err)
 		}
-		// We cannot revoke directly here as it shares the same cursor (with Tx)
-		// and rows.Next seems to retrieve result row by row.
-		// see: https://github.com/lib/pq/issues/81
-		grantedRoles = append(grantedRoles, grantedRole)
+		current[grantedRole] = true
+	}
+	return current, rows.Err()
+}
+
+// updateRoleRoles applies the change of roles (from the prior state to the
+// plan) to the role's memberships.
+func updateRoleRoles(txn *sql.Tx, d *schema.ResourceData) error {
+	role := d.Get(roleNameAttr).(string)
+	oldRoles, newRoles := d.GetChange(roleRolesAttr)
+
+	current, err := currentRoleRoles(txn, role)
+	if err != nil {
+		return err
 	}
 
-	for _, grantedRole := range grantedRoles {
-		query = fmt.Sprintf("REVOKE %s FROM %s", pq.QuoteIdentifier(grantedRole), pq.QuoteIdentifier(role))
-
-		if _, err := txn.Exec(query); err != nil {
-			return fmt.Errorf("could not revoke role %s from %s: %w", string(grantedRole), role, err)
+	for _, stmt := range roleRolesStatements(role, oldRoles.(*schema.Set), newRoles.(*schema.Set), current) {
+		if _, err := txn.Exec(stmt); err != nil {
+			return fmt.Errorf("could not update roles of role %s (%s): %w", role, stmt, err)
 		}
 	}
-
 	return nil
 }
 

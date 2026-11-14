@@ -176,8 +176,67 @@ The following arguments are supported:
   seconds, across all connection retries. The default is `5`.
 * `max_connections` - (Optional) Set the maximum number of open connections to
   the database. The default is `20`.  Zero means unlimited open connections.
+  The provider keeps a separate pool for each database it connects to, so this
+  limit applies per database; use `max_total_connections` for a limit across
+  all databases.
+* `max_idle_connections` - (Optional) Maximum number of idle connections kept
+  open for reuse, per database the provider connects to. The default is `0`:
+  every connection is closed once it is returned, so each query opens a new
+  connection. Setting it above zero avoids a new connection (TCP, TLS and
+  authentication handshake) for most queries, which noticeably speeds up plans
+  and applies with many resources. Idle connections are closed after 30
+  seconds. Each database the provider connects to gets its own pool, so the
+  limit applies per database, not in total. `postgresql_database` closes the provider's own connections to a
+  database before dropping or renaming it, or before using it as the
+  `template` of another database. While Terraform runs, a plain
+  `DROP DATABASE`, `ALTER DATABASE ... RENAME` or `CREATE DATABASE ... TEMPLATE`
+  issued outside of the provider can fail with "database is being accessed by
+  other users" because of these idle connections; terminate them first
+  (`pg_terminate_backend`) or use `DROP DATABASE ... WITH (FORCE)` on
+  PostgreSQL 13+. The value is capped to `max_connections` when the latter is
+  non-zero. It can also be set with the `PGMAXIDLECONNECTIONS` environment
+  variable.
+* `max_total_connections` - (Optional) Maximum number of connections open at
+  once to the server, across all the databases the provider connects to. The
+  limit is shared by every provider configuration (alias) that connects to the
+  same host and port as the same user. The default is `0`: no limit besides
+  `max_connections` per database. Without it, the connections the provider
+  holds add up across databases: with `max_idle_connections` set, each
+  database's pool can keep up to `max_connections` connections, so peak usage
+  grows with the number of databases. When the limit is reached, the provider
+  closes an idle connection of another database to open the one it needs, and
+  otherwise waits for one to be returned. If none becomes available within
+  `connect_timeout` (180 seconds when `connect_timeout` is zero), the operation
+  fails with an error instead of waiting forever; raise the limit or lower
+  `terraform -parallelism`. Setting it also caps `max_connections` to the same
+  value. With pooling, set `max_idle_connections = max_total_connections`.
+  Each connection belongs to one database, so a limit close to or below
+  `-parallelism` makes the provider close and reopen connections to move them
+  between databases; about twice `-parallelism` keeps almost all of the reuse.
+  Only supported with the `postgres`
+  scheme; ignored for `awspostgres` and `gcppostgres`. It can also be set with
+  the `PGMAXTOTALCONNECTIONS` environment variable.
 * `conn_max_lifetime_seconds` - (Optional) Maximum lifetime of a connection,
   in seconds. The default is `0`.  Zero means unlimited.
+* `advisory_lock_timeout` - (Optional) Maximum wait, in milliseconds, for the
+  advisory locks the provider takes on a role (and its members) or a database
+  before changing grants, default privileges, roles and database ownership.
+  The default is `0`, which waits indefinitely (previous behavior). When set,
+  an apply that cannot get the lock in time fails with an error naming the
+  locked role or database instead of hanging, e.g. when another Terraform run
+  or session holds it. Only the lock acquisition is bounded; the statements
+  that follow keep their usual lock waits. Resources in the same apply also
+  queue on these locks (e.g. every `postgresql_database` with an `owner` locks
+  the provider's own role while it is created), so pick a value well above how
+  long such operations take rather than a few hundred milliseconds.
+* `binary_parameters` - (Optional) If set to `true`, adds `binary_parameters=yes`
+  to the connection string. The driver then sends each statement that has bind
+  parameters (almost every query the provider runs) in a single round-trip
+  instead of two (a separate prepare step followed by the execution). This
+  mostly helps when the database is far from where Terraform runs. Only
+  `[]byte` parameters are sent in binary format, which the provider does not
+  use, and results are still read as text. Can also be set with the
+  `PGBINARYPARAMETERS` environment variable. The default is `false`.
 * `expected_version` - (Optional) Specify a hint to Terraform regarding the
   expected version that the provider will be talking with.  This is a required
   hint in order for Terraform to talk with an ancient version of PostgreSQL.
@@ -186,11 +245,15 @@ The following arguments are supported:
   connection has been established, Terraform will fingerprint the actual
   version.  Default: `9.0.0`.
 * `aws_rds_iam_auth` - (Optional) If set to `true`, call the AWS RDS API to grab a temporary password, using AWS Credentials
-  from the environment (or the given profile, see `aws_rds_iam_profile`)
+  from the environment (or the given profile, see `aws_rds_iam_profile`). With `scheme = "postgres"` (the default) the
+  token is cached and renewed before it expires (RDS tokens are valid for 15 minutes), and every new connection uses
+  a current one, so long-running applies keep working. With the GoCloud schemes the token obtained at provider
+  configuration is used for the whole run.
 * `aws_rds_iam_profile` - (Optional) The AWS IAM Profile to use while using AWS RDS IAM Auth.
 * `aws_rds_iam_region` - (Optional) The AWS region to use while using AWS RDS IAM Auth.
 * `aws_rds_iam_provider_role_arn` - (Optional) AWS IAM role to assume while using AWS RDS IAM Auth.
-* `azure_identity_auth` - (Optional) If set to `true`, call the Azure OAuth token endpoint for temporary token
+* `azure_identity_auth` - (Optional) If set to `true`, call the Azure OAuth token endpoint for temporary token. As with
+  `aws_rds_iam_auth`, the token is renewed before it expires and every new connection uses a current one.
 * `azure_tenant_id` - (Optional) (Required if `azure_identity_auth` is `true`) Azure tenant ID [read more](https://registry.terraform.io/providers/hashicorp/azurerm/latest/docs/data-sources/client_config.html)
 
 ## GoCloud

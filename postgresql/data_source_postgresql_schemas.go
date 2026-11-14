@@ -80,11 +80,10 @@ func dataSourcePostgreSQLDatabaseSchemas() *schema.Resource {
 func dataSourcePostgreSQLSchemasRead(db *DBConnection, d *schema.ResourceData) error {
 	database := d.Get("database").(string)
 
-	txn, err := startTransaction(db.client, database)
+	dbc, err := initConnection(db.client, database)
 	if err != nil {
 		return err
 	}
-	defer deferredRollback(txn)
 
 	includeSystemSchemas := d.Get("include_system_schemas").(bool)
 
@@ -98,9 +97,9 @@ func dataSourcePostgreSQLSchemasRead(db *DBConnection, d *schema.ResourceData) e
 		queryConcatKeyword = queryConcatKeywordAnd
 	}
 
-	query = applySchemaDataSourceQueryFilters(query, queryConcatKeyword, d)
+	query, args := applySchemaDataSourceQueryFilters(query, queryConcatKeyword, d)
 
-	rows, err := txn.Query(query)
+	rows, err := dbc.Query(query, args...)
 	if err != nil {
 		return err
 	}
@@ -136,9 +135,10 @@ func generateDataSourceSchemasID(d *schema.ResourceData, databaseName string) st
 	}, "_")
 }
 
-func applySchemaDataSourceQueryFilters(query string, queryConcatKeyword string, d *schema.ResourceData) string {
+func applySchemaDataSourceQueryFilters(query string, queryConcatKeyword string, d *schema.ResourceData) (string, []any) {
+	var args queryArgs
 	filters := []string{}
-	filters = append(filters, applyPatternMatchingToQuery(schemaPatternMatchingTarget, d)...)
+	filters = append(filters, applyPatternMatchingToQuery(schemaPatternMatchingTarget, d, &args)...)
 
-	return finalizeQueryWithFilters(query, queryConcatKeyword, filters)
+	return finalizeQueryWithFilters(query, queryConcatKeyword, filters), args
 }

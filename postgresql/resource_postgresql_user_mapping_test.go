@@ -11,23 +11,28 @@ import (
 )
 
 func TestAccPostgresqlUserMapping_Basic(t *testing.T) {
+	serverName := testUniqueName("myserver_postgres")
+	remoteRole := testUniqueName("remote")
+	specialRole := testUniqueName("special")
+
 	resource.Test(t, resource.TestCase{
 		PreCheck: func() {
 			testAccPreCheck(t)
 			testCheckCompatibleVersion(t, featureServer)
 			testSuperuserPreCheck(t)
+			testDropExtensionsIfExist(t, "postgres_fdw")
 		},
 		Providers:    testAccProviders,
 		CheckDestroy: testAccCheckPostgresqlUserMappingDestroy,
 		Steps: []resource.TestStep{
 			{
-				Config: testAccPostgresqlUserMappingConfig,
+				Config: testAccPostgresqlUserMappingConfig(serverName, remoteRole, specialRole),
 				Check: resource.ComposeTestCheckFunc(
 					testAccCheckPostgresqlUserMappingExists("postgresql_user_mapping.remote"),
 					resource.TestCheckResourceAttr(
-						"postgresql_user_mapping.remote", "server_name", "myserver_postgres"),
+						"postgresql_user_mapping.remote", "server_name", serverName),
 					resource.TestCheckResourceAttr(
-						"postgresql_user_mapping.remote", "user_name", "remote"),
+						"postgresql_user_mapping.remote", "user_name", remoteRole),
 					resource.TestCheckResourceAttr(
 						"postgresql_user_mapping.remote", "options.user", "admin"),
 					resource.TestCheckResourceAttr(
@@ -41,27 +46,32 @@ func TestAccPostgresqlUserMapping_Basic(t *testing.T) {
 }
 
 func TestAccPostgresqlUserMapping_Update(t *testing.T) {
+	serverName := testUniqueName("myserver_postgres")
+	remoteRole := testUniqueName("remote")
+	specialRole := testUniqueName("special")
+
 	resource.Test(t, resource.TestCase{
 		PreCheck: func() {
 			testAccPreCheck(t)
 			testCheckCompatibleVersion(t, featureServer)
 			testSuperuserPreCheck(t)
+			testDropExtensionsIfExist(t, "postgres_fdw")
 		},
 		Providers:    testAccProviders,
 		CheckDestroy: testAccCheckPostgresqlUserMappingDestroy,
 		Steps: []resource.TestStep{
 			{
-				Config: testAccPostgresqlUserMappingConfig,
+				Config: testAccPostgresqlUserMappingConfig(serverName, remoteRole, specialRole),
 				Check: resource.ComposeTestCheckFunc(
 					testAccCheckPostgresqlServerExists("postgresql_user_mapping.remote"),
 					resource.TestCheckResourceAttr(
-						"postgresql_user_mapping.remote", "server_name", "myserver_postgres"),
+						"postgresql_user_mapping.remote", "server_name", serverName),
 					resource.TestCheckResourceAttr(
 						"postgresql_user_mapping.remote", "options.password", "pass"),
 				),
 			},
 			{
-				Config: testAccPostgresqlUserMappingChanges2,
+				Config: testAccPostgresqlUserMappingChanges2(serverName, remoteRole),
 				Check: resource.ComposeTestCheckFunc(
 					testAccCheckPostgresqlServerExists("postgresql_user_mapping.remote"),
 					resource.TestCheckResourceAttr(
@@ -69,7 +79,7 @@ func TestAccPostgresqlUserMapping_Update(t *testing.T) {
 				),
 			},
 			{
-				Config: testAccPostgresqlUserMappingChanges3,
+				Config: testAccPostgresqlUserMappingChanges3(serverName, remoteRole),
 				Check: resource.ComposeTestCheckFunc(
 					testAccCheckPostgresqlServerExists("postgresql_user_mapping.remote"),
 					resource.TestCheckResourceAttr(
@@ -164,13 +174,14 @@ func testAccCheckPostgresqlUserMappingExists(n string) resource.TestCheckFunc {
 	}
 }
 
-var testAccPostgresqlUserMappingConfig = `
+func testAccPostgresqlUserMappingConfig(serverName, remoteRole, specialRole string) string {
+	return fmt.Sprintf(`
 resource "postgresql_extension" "ext_postgres_fdw" {
   name = "postgres_fdw"
 }
 
 resource "postgresql_server" "myserver_postgres" {
-  server_name = "myserver_postgres"
+  server_name = "%[1]s"
   fdw_name    = "postgres_fdw"
   options = {
     host   = "foo"
@@ -182,7 +193,7 @@ resource "postgresql_server" "myserver_postgres" {
 }
 
 resource "postgresql_role" "remote" {
-  name = "remote"
+  name = "%[2]s"
 }
 
 resource "postgresql_user_mapping" "remote" {
@@ -195,7 +206,7 @@ resource "postgresql_user_mapping" "remote" {
 }
 
 resource "postgresql_role" "special" {
-  name = "special"
+  name = "%[3]s"
 }
 
 resource "postgresql_user_mapping" "special_chars" {
@@ -206,15 +217,17 @@ resource "postgresql_user_mapping" "special_chars" {
 	password = "pass=$*'"
   }
 }
-`
+`, serverName, remoteRole, specialRole)
+}
 
-var testAccPostgresqlUserMappingChanges2 = `
+func testAccPostgresqlUserMappingChanges2(serverName, remoteRole string) string {
+	return fmt.Sprintf(`
 resource "postgresql_extension" "ext_postgres_fdw" {
 	name = "postgres_fdw"
   }
   
   resource "postgresql_server" "myserver_postgres" {
-	server_name = "myserver_postgres"
+	server_name = "%[1]s"
 	fdw_name    = "postgres_fdw"
 	options = {
 	  host   = "foo"
@@ -226,7 +239,7 @@ resource "postgresql_extension" "ext_postgres_fdw" {
   }
   
   resource "postgresql_role" "remote" {
-	name = "remote"
+	name = "%[2]s"
   }
   
   resource "postgresql_user_mapping" "remote" {
@@ -237,15 +250,17 @@ resource "postgresql_extension" "ext_postgres_fdw" {
 	  password = "passUpdated"
 	}
   }
-`
+`, serverName, remoteRole)
+}
 
-var testAccPostgresqlUserMappingChanges3 = `
+func testAccPostgresqlUserMappingChanges3(serverName, remoteRole string) string {
+	return fmt.Sprintf(`
 resource "postgresql_extension" "ext_postgres_fdw" {
 	name = "postgres_fdw"
   }
   
   resource "postgresql_server" "myserver_postgres" {
-	server_name = "myserver_postgres"
+	server_name = "%[1]s"
 	fdw_name    = "postgres_fdw"
 	options = {
 	  host   = "foo"
@@ -257,11 +272,12 @@ resource "postgresql_extension" "ext_postgres_fdw" {
   }
   
   resource "postgresql_role" "remote" {
-	name = "remote"
+	name = "%[2]s"
   }
   
   resource "postgresql_user_mapping" "remote" {
 	server_name = postgresql_server.myserver_postgres.server_name
 	user_name   = postgresql_role.remote.name
   }
-`
+`, serverName, remoteRole)
+}

@@ -17,6 +17,7 @@ func TestAccPostgresqlExtension_Basic(t *testing.T) {
 			// TODO: Need to check how RDS manage to allow `rds_superuser` to create extension
 			// even it's not a real superuser
 			testSuperuserPreCheck(t)
+			testDropExtensionsIfExist(t, "pg_trgm")
 		},
 		Providers:    testAccProviders,
 		CheckDestroy: testAccCheckPostgresqlExtensionDestroy,
@@ -115,39 +116,43 @@ func testAccCheckPostgresqlExtensionExists(n string) resource.TestCheckFunc {
 }
 
 func TestAccPostgresqlExtension_SchemaRename(t *testing.T) {
+	schemaFoo := testUniqueName("foo")
+	schemaBar := testUniqueName("bar")
+
 	resource.Test(t, resource.TestCase{
 		PreCheck: func() {
 			testAccPreCheck(t)
 			testCheckCompatibleVersion(t, featureExtension)
 			testSuperuserPreCheck(t)
+			testDropExtensionsIfExist(t, "pg_trgm")
 		},
 		Providers:    testAccProviders,
 		CheckDestroy: testAccCheckPostgresqlExtensionDestroy,
 		Steps: []resource.TestStep{
 			{
-				Config: testAccPostgresqlExtensionSchemaChange1,
+				Config: testAccPostgresqlExtensionSchemaConfig(schemaFoo),
 				Check: resource.ComposeTestCheckFunc(
 					testAccCheckPostgresqlExtensionExists("postgresql_extension.ext1trgm"),
 					resource.TestCheckResourceAttr(
-						"postgresql_schema.ext1foo", "name", "foo"),
+						"postgresql_schema.ext1foo", "name", schemaFoo),
 					resource.TestCheckResourceAttr(
 						"postgresql_extension.ext1trgm", "name", "pg_trgm"),
 					resource.TestCheckResourceAttr(
 						"postgresql_extension.ext1trgm", "name", "pg_trgm"),
 					resource.TestCheckResourceAttr(
-						"postgresql_extension.ext1trgm", "schema", "foo"),
+						"postgresql_extension.ext1trgm", "schema", schemaFoo),
 				),
 			},
 			{
-				Config: testAccPostgresqlExtensionSchemaChange2,
+				Config: testAccPostgresqlExtensionSchemaConfig(schemaBar),
 				Check: resource.ComposeTestCheckFunc(
 					testAccCheckPostgresqlExtensionExists("postgresql_extension.ext1trgm"),
 					resource.TestCheckResourceAttr(
-						"postgresql_schema.ext1foo", "name", "bar"),
+						"postgresql_schema.ext1foo", "name", schemaBar),
 					resource.TestCheckResourceAttr(
 						"postgresql_extension.ext1trgm", "name", "pg_trgm"),
 					resource.TestCheckResourceAttr(
-						"postgresql_extension.ext1trgm", "schema", "bar"),
+						"postgresql_extension.ext1trgm", "schema", schemaBar),
 				),
 			},
 		},
@@ -223,6 +228,7 @@ resource "postgresql_extension" "cascade" {
 			testAccPreCheck(t)
 			testCheckCompatibleVersion(t, featureExtension)
 			testSuperuserPreCheck(t)
+			testDropExtensionsIfExist(t, "pgcrypto")
 		},
 		Providers:    testAccProviders,
 		CheckDestroy: testAccCheckPostgresqlExtensionDestroy,
@@ -272,6 +278,7 @@ resource "postgresql_extension" "cascade" {
 			testAccPreCheck(t)
 			testCheckCompatibleVersion(t, featureExtension)
 			testSuperuserPreCheck(t)
+			testDropExtensionsIfExist(t, "earthdistance", "cube")
 		},
 		Providers:    testAccProviders,
 		CheckDestroy: testAccCheckPostgresqlExtensionDestroy,
@@ -317,24 +324,15 @@ resource "postgresql_extension" "myextension" {
 }
 `
 
-var testAccPostgresqlExtensionSchemaChange1 = `
+func testAccPostgresqlExtensionSchemaConfig(schemaName string) string {
+	return fmt.Sprintf(`
 resource "postgresql_schema" "ext1foo" {
-  name = "foo"
+  name = "%s"
 }
 
 resource "postgresql_extension" "ext1trgm" {
   name = "pg_trgm"
   schema = "${postgresql_schema.ext1foo.name}"
 }
-`
-
-var testAccPostgresqlExtensionSchemaChange2 = `
-resource "postgresql_schema" "ext1foo" {
-  name = "bar"
+`, schemaName)
 }
-
-resource "postgresql_extension" "ext1trgm" {
-  name = "pg_trgm"
-  schema = "${postgresql_schema.ext1foo.name}"
-}
-`

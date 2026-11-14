@@ -3,7 +3,9 @@ package postgresql
 import (
 	"database/sql"
 	"fmt"
+	"reflect"
 	"regexp"
+	"sort"
 	"strings"
 	"testing"
 
@@ -18,12 +20,15 @@ import (
 // exactly three arguments ("empty means all objects in the schema"). With an
 // explicit objects list the relname filter must be pushed into SQL as
 // "relname = ANY($4)" with a fourth bind argument, so the whole schema is not
-// transferred only to be discarded by the Go filter afterwards.
+// transferred only to be discarded by the Go filter afterwards. In both cases
+// the ACL must be exploded per selected relation (LEFT JOIN LATERAL), not for
+// every relation of pg_class in a subquery that is then joined back: with
+// objects listed the planner re-ran that subquery once per matched relation.
+// The role and the schema are resolved in the same statement, which reports
+// whether each of them exists.
 func TestBuildReadTableRolePrivilegesQuery(t *testing.T) {
-	roleOID := uint32(1234)
-
 	emptyQuery, emptyArgs := buildReadTableRolePrivilegesQuery(
-		roleOID, "test_schema", "r", schema.NewSet(schema.HashString, nil),
+		"test_role", "test_schema", "r", schema.NewSet(schema.HashString, nil),
 	)
 	if strings.Contains(emptyQuery, "ANY(") {
 		t.Fatalf("empty objects must not push a relname filter, got: %q", emptyQuery)
@@ -33,8 +38,8 @@ func TestBuildReadTableRolePrivilegesQuery(t *testing.T) {
 	}
 
 	objects := schema.NewSet(schema.HashString, []interface{}{"test_table", "test_table2"})
-	query, args := buildReadTableRolePrivilegesQuery(roleOID, "test_schema", "r", objects)
-	if !strings.Contains(query, "AND pg_class.relname = ANY($4)") {
+	query, args := buildReadTableRolePrivilegesQuery("test_role", "test_schema", "r", objects)
+	if !strings.Contains(query, "AND c.relname = ANY($4)") {
 		t.Fatalf("explicit objects must push relname = ANY($4), got: %q", query)
 	}
 	if len(args) != 4 {
@@ -42,12 +47,185 @@ func TestBuildReadTableRolePrivilegesQuery(t *testing.T) {
 	}
 
 	for _, q := range []string{emptyQuery, query} {
-		if !strings.Contains(q, "GROUP BY pg_class.relname") {
-			t.Fatalf("query missing GROUP BY pg_class.relname: %q", q)
+		for _, want := range []string{
+			"SELECT r.oid IS NOT NULL, EXISTS (SELECT 1 FROM n), o.relname, o.privileges",
+			"WHEN $1::name = 'public' THEN 0::oid",
+			"SELECT oid FROM pg_namespace WHERE nspname = $2",
+			"SELECT c.relname, array_remove(array_agg(a.privilege_type), NULL) AS privileges",
+			"LEFT JOIN LATERAL (\n        SELECT privilege_type FROM aclexplode(c.relacl) WHERE grantee = r.oid\n    ) a ON true",
+			"WHERE c.relkind = $3",
+			"GROUP BY c.relname",
+		} {
+			if !strings.Contains(q, want) {
+				t.Fatalf("query missing %q:\n%s", want, q)
+			}
 		}
-		if !strings.Contains(q, "SELECT pg_class.relname, array_remove(array_agg(privilege_type), NULL)") {
-			t.Fatalf("query changed its selected columns: %q", q)
+		if strings.Count(q, "pg_class") != 1 {
+			t.Fatalf("query must scan pg_class once: %q", q)
 		}
+	}
+}
+
+// TestAccPostgresqlGrantReadTablePrivilegesQuery pins the rows returned by the
+// table/sequence Read query against a real catalog: one row per relation of the
+// requested relkind in the schema (or per listed object that exists), with the
+// privileges granted to the role, and an empty array for relations with a NULL
+// ACL or an ACL without an entry for the role. PUBLIC is read with grantee 0.
+// Every row carries the role_exists/schema_exists flags; with no matching
+// relation a single row with a NULL relation is returned.
+func TestAccPostgresqlGrantReadTablePrivilegesQuery(t *testing.T) {
+	skipIfNotAcc(t)
+
+	config := getTestConfig(t)
+	dbSuffix, teardown := setupTestDatabase(t, true, true)
+	defer teardown()
+
+	dbName, roleName := getTestDBNames(dbSuffix)
+
+	db, err := sql.Open("postgres", config.connStr(dbName))
+	if err != nil {
+		t.Fatalf("could not open connection pool for db %s: %v", dbName, err)
+	}
+	defer closeDB(t, db)
+
+	for _, stmt := range []string{
+		"CREATE TABLE test_schema.t_default (val text)",
+		"CREATE TABLE test_schema.t_granted (val text)",
+		"CREATE TABLE test_schema.t_public (val text)",
+		"CREATE TABLE test_schema.t_revoked (val text)",
+		"CREATE VIEW test_schema.v_granted AS SELECT 1 AS val",
+		"CREATE SEQUENCE test_schema.s_default",
+		"CREATE SEQUENCE test_schema.s_granted",
+		"CREATE TABLE dev_schema.t_granted (val text)",
+		fmt.Sprintf("GRANT SELECT, INSERT ON test_schema.t_granted TO %s", roleName),
+		"GRANT SELECT ON test_schema.t_public TO PUBLIC",
+		fmt.Sprintf("GRANT SELECT ON test_schema.t_revoked TO %s", roleName),
+		fmt.Sprintf("REVOKE ALL ON test_schema.t_revoked FROM %s", roleName),
+		fmt.Sprintf("GRANT SELECT ON test_schema.v_granted TO %s", roleName),
+		fmt.Sprintf("GRANT USAGE ON SEQUENCE test_schema.s_granted TO %s", roleName),
+		fmt.Sprintf("GRANT UPDATE ON dev_schema.t_granted TO %s", roleName),
+	} {
+		if _, err := db.Exec(stmt); err != nil {
+			t.Fatalf("could not execute %q: %v", stmt, err)
+		}
+	}
+
+	cases := []struct {
+		name         string
+		role         string
+		schema       string
+		relkind      string
+		objects      []any
+		roleExists   bool
+		schemaExists bool
+		expected     map[string][]string
+	}{
+		{
+			name: "all tables", role: roleName, schema: "test_schema", relkind: "r", roleExists: true, schemaExists: true,
+			expected: map[string][]string{
+				"t_default": {}, "t_granted": {"INSERT", "SELECT"}, "t_public": {}, "t_revoked": {},
+			},
+		},
+		{
+			name: "listed tables", role: roleName, schema: "test_schema", relkind: "r", roleExists: true, schemaExists: true,
+			objects:  []any{"t_granted", "t_default", "t_missing"},
+			expected: map[string][]string{"t_default": {}, "t_granted": {"INSERT", "SELECT"}},
+		},
+		{
+			name: "listed table with ACL but no entry for the role", role: roleName, schema: "test_schema", relkind: "r",
+			roleExists: true, schemaExists: true,
+			objects:  []any{"t_revoked"},
+			expected: map[string][]string{"t_revoked": {}},
+		},
+		{
+			name: "public", role: "public", schema: "test_schema", relkind: "r", roleExists: true, schemaExists: true,
+			expected: map[string][]string{
+				"t_default": {}, "t_granted": {}, "t_public": {"SELECT"}, "t_revoked": {},
+			},
+		},
+		{
+			name: "listed public", role: "public", schema: "test_schema", relkind: "r", roleExists: true, schemaExists: true,
+			objects:  []any{"t_public"},
+			expected: map[string][]string{"t_public": {"SELECT"}},
+		},
+		{
+			name: "all sequences", role: roleName, schema: "test_schema", relkind: "S", roleExists: true, schemaExists: true,
+			expected: map[string][]string{"s_default": {}, "s_granted": {"USAGE"}},
+		},
+		{
+			name: "listed sequences", role: roleName, schema: "test_schema", relkind: "S", roleExists: true, schemaExists: true,
+			objects:  []any{"s_granted"},
+			expected: map[string][]string{"s_granted": {"USAGE"}},
+		},
+		{
+			name: "other schema", role: roleName, schema: "dev_schema", relkind: "r", roleExists: true, schemaExists: true,
+			expected: map[string][]string{"t_granted": {"UPDATE"}},
+		},
+		{
+			name: "only missing objects listed", role: roleName, schema: "test_schema", relkind: "r", roleExists: true, schemaExists: true,
+			objects:  []any{"t_missing"},
+			expected: map[string][]string{},
+		},
+		{
+			name: "missing role", role: roleName + "_missing", schema: "test_schema", relkind: "r", roleExists: false, schemaExists: true,
+			objects:  []any{"t_granted"},
+			expected: map[string][]string{"t_granted": {}},
+		},
+		{
+			name: "missing schema", role: roleName, schema: "missing_schema", relkind: "r", roleExists: true, schemaExists: false,
+			expected: map[string][]string{},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			query, args := buildReadTableRolePrivilegesQuery(
+				tc.role, tc.schema, tc.relkind, schema.NewSet(schema.HashString, tc.objects),
+			)
+			rows, err := db.Query(query, args...)
+			if err != nil {
+				t.Fatalf("could not run read query: %v", err)
+			}
+			defer func() {
+				if err := rows.Close(); err != nil {
+					t.Errorf("could not close rows: %v", err)
+				}
+			}()
+
+			got := map[string][]string{}
+			nRows := 0
+			for rows.Next() {
+				nRows++
+				var roleExists, schemaExists bool
+				var objName sql.NullString
+				var privileges pq.ByteaArray
+				if err := rows.Scan(&roleExists, &schemaExists, &objName, &privileges); err != nil {
+					t.Fatalf("could not scan row: %v", err)
+				}
+				if roleExists != tc.roleExists || schemaExists != tc.schemaExists {
+					t.Fatalf("role_exists, schema_exists = %t, %t; want %t, %t", roleExists, schemaExists, tc.roleExists, tc.schemaExists)
+				}
+				if !objName.Valid {
+					continue
+				}
+				privs := make([]string, 0, len(privileges))
+				for _, p := range privileges {
+					privs = append(privs, string(p))
+				}
+				sort.Strings(privs)
+				got[objName.String] = privs
+			}
+			if err := rows.Err(); err != nil {
+				t.Fatalf("could not read rows: %v", err)
+			}
+			if nRows == 0 {
+				t.Fatalf("query must always return at least one row (the existence flags)")
+			}
+
+			if !reflect.DeepEqual(got, tc.expected) {
+				t.Fatalf("unexpected read result:\n got: %v\nwant: %v", got, tc.expected)
+			}
+		})
 	}
 }
 
@@ -868,38 +1046,43 @@ func TestAccPostgresqlGrantFunction(t *testing.T) {
 
 	config := getTestConfig(t)
 	dsn := config.connStr("postgres")
+	testRole := testUniqueName("test_role")
+	testSchema := testUniqueName("test_schema")
 
 	// Create a test role and a schema as public has too wide open privileges
-	dbExecute(t, dsn, fmt.Sprintf("CREATE ROLE test_role LOGIN PASSWORD '%s'", testRolePassword))
-	dbExecute(t, dsn, "CREATE SCHEMA test_schema")
-	dbExecute(t, dsn, "GRANT USAGE ON SCHEMA test_schema TO test_role")
-	dbExecute(t, dsn, "ALTER DEFAULT PRIVILEGES REVOKE ALL ON FUNCTIONS FROM PUBLIC")
+	dbExecute(t, dsn, fmt.Sprintf("CREATE ROLE %s LOGIN PASSWORD '%s'", testRole, testRolePassword))
+	dbExecute(t, dsn, fmt.Sprintf("CREATE SCHEMA %s", testSchema))
+	dbExecute(t, dsn, fmt.Sprintf("GRANT USAGE ON SCHEMA %s TO %s", testSchema, testRole))
 
 	// Create test function in this schema
-	dbExecute(t, dsn, `
-CREATE FUNCTION test_schema.test() RETURNS text
+	dbExecute(t, dsn, fmt.Sprintf(`
+CREATE FUNCTION %s.test() RETURNS text
 	AS $$ select 'foo'::text $$
     LANGUAGE SQL;
-`)
+`, testSchema))
+	// Functions are executable by PUBLIC by default. Revoke that on the test
+	// routines only, ALTER DEFAULT PRIVILEGES would leak into later tests.
+	dbExecute(t, dsn, fmt.Sprintf("REVOKE ALL ON ALL ROUTINES IN SCHEMA %s FROM PUBLIC", testSchema))
 	defer func() {
-		dbExecute(t, dsn, "DROP SCHEMA test_schema CASCADE")
-		dbExecute(t, dsn, "DROP ROLE test_role")
+		dbExecute(t, dsn, fmt.Sprintf("DROP SCHEMA %s CASCADE", testSchema))
+		dbExecute(t, dsn, fmt.Sprintf("DROP ROLE %s", testRole))
 	}()
 
 	// Test to grant directly to test_role and to public
 	// in both case test_case should have the right
-	for _, role := range []string{"test_role", "public"} {
-		t.Run(role, func(t *testing.T) {
+	for _, tc := range []struct{ name, role string }{{"test_role", testRole}, {"public", "public"}} {
+		role := tc.role
+		t.Run(tc.name, func(t *testing.T) {
 
 			tfConfig := fmt.Sprintf(`
 resource postgresql_grant "test" {
   database    = "postgres"
   role        = "%s"
-  schema      = "test_schema"
+  schema      = "%s"
   object_type = "function"
   privileges  = ["EXECUTE"]
 }
-	`, role)
+	`, role, testSchema)
 
 			resource.Test(t, resource.TestCase{
 				PreCheck: func() {
@@ -911,11 +1094,11 @@ resource postgresql_grant "test" {
 					{
 						Config: tfConfig,
 						Check: resource.ComposeTestCheckFunc(
-							resource.TestCheckResourceAttr("postgresql_grant.test", "id", fmt.Sprintf("%s_postgres_test_schema_function", role)),
+							resource.TestCheckResourceAttr("postgresql_grant.test", "id", fmt.Sprintf("%s_postgres_%s_function", role, testSchema)),
 							resource.TestCheckResourceAttr("postgresql_grant.test", "privileges.#", "1"),
 							resource.TestCheckResourceAttr("postgresql_grant.test", "privileges.0", "EXECUTE"),
 							resource.TestCheckResourceAttr("postgresql_grant.test", "with_grant_option", "false"),
-							testCheckFunctionExecutable(t, "test_role", "test_schema.test"),
+							testCheckFunctionExecutable(t, testRole, testSchema+".test"),
 						),
 					},
 				},
@@ -929,39 +1112,44 @@ func TestAccPostgresqlGrantFunctionWithArgs(t *testing.T) {
 
 	config := getTestConfig(t)
 	dsn := config.connStr("postgres")
+	testRole := testUniqueName("test_role")
+	testSchema := testUniqueName("test_schema")
 
 	// Create a test role and a schema as public has too wide open privileges
-	dbExecute(t, dsn, fmt.Sprintf("CREATE ROLE test_role LOGIN PASSWORD '%s'", testRolePassword))
-	dbExecute(t, dsn, "CREATE SCHEMA test_schema")
-	dbExecute(t, dsn, "GRANT USAGE ON SCHEMA test_schema TO test_role")
-	dbExecute(t, dsn, "ALTER DEFAULT PRIVILEGES REVOKE ALL ON FUNCTIONS FROM PUBLIC")
+	dbExecute(t, dsn, fmt.Sprintf("CREATE ROLE %s LOGIN PASSWORD '%s'", testRole, testRolePassword))
+	dbExecute(t, dsn, fmt.Sprintf("CREATE SCHEMA %s", testSchema))
+	dbExecute(t, dsn, fmt.Sprintf("GRANT USAGE ON SCHEMA %s TO %s", testSchema, testRole))
 
 	// Create test function in this schema
-	dbExecute(t, dsn, `
-CREATE FUNCTION test_schema.test(arg1 text, arg2 character) RETURNS text
+	dbExecute(t, dsn, fmt.Sprintf(`
+CREATE FUNCTION %s.test(arg1 text, arg2 character) RETURNS text
 	AS $$ select 'foo'::text $$
     LANGUAGE SQL;
-`)
+`, testSchema))
+	// Functions are executable by PUBLIC by default. Revoke that on the test
+	// routines only, ALTER DEFAULT PRIVILEGES would leak into later tests.
+	dbExecute(t, dsn, fmt.Sprintf("REVOKE ALL ON ALL ROUTINES IN SCHEMA %s FROM PUBLIC", testSchema))
 	defer func() {
-		dbExecute(t, dsn, "DROP SCHEMA test_schema CASCADE")
-		dbExecute(t, dsn, "DROP ROLE test_role")
+		dbExecute(t, dsn, fmt.Sprintf("DROP SCHEMA %s CASCADE", testSchema))
+		dbExecute(t, dsn, fmt.Sprintf("DROP ROLE %s", testRole))
 	}()
 
 	// Test to grant directly to test_role and to public
 	// in both case test_case should have the right
-	for _, role := range []string{"test_role", "public"} {
-		t.Run(role, func(t *testing.T) {
+	for _, tc := range []struct{ name, role string }{{"test_role", testRole}, {"public", "public"}} {
+		role := tc.role
+		t.Run(tc.name, func(t *testing.T) {
 
 			tfConfig := fmt.Sprintf(`
 resource postgresql_grant "test" {
   database    = "postgres"
   role        = "%s"
-  schema      = "test_schema"
+  schema      = "%s"
   object_type = "function"
   privileges  = ["EXECUTE"]
   objects 	  = ["test(text, char)"]
 }
-	`, role)
+	`, role, testSchema)
 
 			resource.Test(t, resource.TestCase{
 				PreCheck: func() {
@@ -973,11 +1161,11 @@ resource postgresql_grant "test" {
 					{
 						Config: tfConfig,
 						Check: resource.ComposeTestCheckFunc(
-							resource.TestCheckResourceAttr("postgresql_grant.test", "id", fmt.Sprintf("%s_postgres_test_schema_function_test(text, char)", role)),
+							resource.TestCheckResourceAttr("postgresql_grant.test", "id", fmt.Sprintf("%s_postgres_%s_function_test(text, char)", role, testSchema)),
 							resource.TestCheckResourceAttr("postgresql_grant.test", "privileges.#", "1"),
 							resource.TestCheckResourceAttr("postgresql_grant.test", "privileges.0", "EXECUTE"),
 							resource.TestCheckResourceAttr("postgresql_grant.test", "with_grant_option", "false"),
-							testCheckFunctionWithArgsExecutable(t, "test_role", "test_schema.test", []string{pq.QuoteLiteral("value 1"), pq.QuoteLiteral("value 2")}),
+							testCheckFunctionWithArgsExecutable(t, testRole, testSchema+".test", []string{pq.QuoteLiteral("value 1"), pq.QuoteLiteral("value 2")}),
 						),
 					},
 				},
@@ -992,38 +1180,43 @@ func TestAccPostgresqlGrantProcedure(t *testing.T) {
 
 	config := getTestConfig(t)
 	dsn := config.connStr("postgres")
+	testRole := testUniqueName("test_role")
+	testSchema := testUniqueName("test_schema")
 
 	// Create a test role and a schema as public has too wide open privileges
-	dbExecute(t, dsn, fmt.Sprintf("CREATE ROLE test_role LOGIN PASSWORD '%s'", testRolePassword))
-	dbExecute(t, dsn, "CREATE SCHEMA test_schema")
-	dbExecute(t, dsn, "GRANT USAGE ON SCHEMA test_schema TO test_role")
-	dbExecute(t, dsn, "ALTER DEFAULT PRIVILEGES REVOKE ALL ON FUNCTIONS FROM PUBLIC")
+	dbExecute(t, dsn, fmt.Sprintf("CREATE ROLE %s LOGIN PASSWORD '%s'", testRole, testRolePassword))
+	dbExecute(t, dsn, fmt.Sprintf("CREATE SCHEMA %s", testSchema))
+	dbExecute(t, dsn, fmt.Sprintf("GRANT USAGE ON SCHEMA %s TO %s", testSchema, testRole))
 
 	// Create test procedure in this schema
-	dbExecute(t, dsn, `
-CREATE PROCEDURE test_schema.test()
+	dbExecute(t, dsn, fmt.Sprintf(`
+CREATE PROCEDURE %s.test()
 	AS $$ select 'foo'::text $$
     LANGUAGE SQL;
-`)
+`, testSchema))
+	// Functions are executable by PUBLIC by default. Revoke that on the test
+	// routines only, ALTER DEFAULT PRIVILEGES would leak into later tests.
+	dbExecute(t, dsn, fmt.Sprintf("REVOKE ALL ON ALL ROUTINES IN SCHEMA %s FROM PUBLIC", testSchema))
 	defer func() {
-		dbExecute(t, dsn, "DROP SCHEMA test_schema CASCADE")
-		dbExecute(t, dsn, "DROP ROLE test_role")
+		dbExecute(t, dsn, fmt.Sprintf("DROP SCHEMA %s CASCADE", testSchema))
+		dbExecute(t, dsn, fmt.Sprintf("DROP ROLE %s", testRole))
 	}()
 
 	// Test to grant directly to test_role and to public
 	// in both case test_case should have the right
-	for _, role := range []string{"test_role", "public"} {
-		t.Run(role, func(t *testing.T) {
+	for _, tc := range []struct{ name, role string }{{"test_role", testRole}, {"public", "public"}} {
+		role := tc.role
+		t.Run(tc.name, func(t *testing.T) {
 
 			tfConfig := fmt.Sprintf(`
 resource postgresql_grant "test" {
   database    = "postgres"
   role        = "%s"
-  schema      = "test_schema"
+  schema      = "%s"
   object_type = "procedure"
   privileges  = ["EXECUTE"]
 }
-	`, role)
+	`, role, testSchema)
 
 			resource.Test(t, resource.TestCase{
 				PreCheck: func() {
@@ -1035,11 +1228,11 @@ resource postgresql_grant "test" {
 					{
 						Config: tfConfig,
 						Check: resource.ComposeTestCheckFunc(
-							resource.TestCheckResourceAttr("postgresql_grant.test", "id", fmt.Sprintf("%s_postgres_test_schema_procedure", role)),
+							resource.TestCheckResourceAttr("postgresql_grant.test", "id", fmt.Sprintf("%s_postgres_%s_procedure", role, testSchema)),
 							resource.TestCheckResourceAttr("postgresql_grant.test", "privileges.#", "1"),
 							resource.TestCheckResourceAttr("postgresql_grant.test", "privileges.0", "EXECUTE"),
 							resource.TestCheckResourceAttr("postgresql_grant.test", "with_grant_option", "false"),
-							testCheckProcedureExecutable(t, "test_role", "test_schema.test"),
+							testCheckProcedureExecutable(t, testRole, testSchema+".test"),
 						),
 					},
 				},
@@ -1054,44 +1247,49 @@ func TestAccPostgresqlGrantRoutine(t *testing.T) {
 
 	config := getTestConfig(t)
 	dsn := config.connStr("postgres")
+	testRole := testUniqueName("test_role")
+	testSchema := testUniqueName("test_schema")
 
 	// Create a test role and a schema as public has too wide open privileges
-	dbExecute(t, dsn, fmt.Sprintf("CREATE ROLE test_role LOGIN PASSWORD '%s'", testRolePassword))
-	dbExecute(t, dsn, "CREATE SCHEMA test_schema")
-	dbExecute(t, dsn, "GRANT USAGE ON SCHEMA test_schema TO test_role")
-	dbExecute(t, dsn, "ALTER DEFAULT PRIVILEGES REVOKE ALL ON FUNCTIONS FROM PUBLIC")
+	dbExecute(t, dsn, fmt.Sprintf("CREATE ROLE %s LOGIN PASSWORD '%s'", testRole, testRolePassword))
+	dbExecute(t, dsn, fmt.Sprintf("CREATE SCHEMA %s", testSchema))
+	dbExecute(t, dsn, fmt.Sprintf("GRANT USAGE ON SCHEMA %s TO %s", testSchema, testRole))
 
 	// Create test function in this schema
-	dbExecute(t, dsn, `
-CREATE FUNCTION test_schema.test_function() RETURNS text
+	dbExecute(t, dsn, fmt.Sprintf(`
+CREATE FUNCTION %s.test_function() RETURNS text
 	AS $$ select 'foo'::text $$
     LANGUAGE SQL;
-`)
+`, testSchema))
 	// Create test procedure in this schema
-	dbExecute(t, dsn, `
-CREATE PROCEDURE test_schema.test_procedure()
+	dbExecute(t, dsn, fmt.Sprintf(`
+CREATE PROCEDURE %s.test_procedure()
 	AS $$ select 'foo'::text $$
     LANGUAGE SQL;
-`)
+`, testSchema))
+	// Functions are executable by PUBLIC by default. Revoke that on the test
+	// routines only, ALTER DEFAULT PRIVILEGES would leak into later tests.
+	dbExecute(t, dsn, fmt.Sprintf("REVOKE ALL ON ALL ROUTINES IN SCHEMA %s FROM PUBLIC", testSchema))
 	defer func() {
-		dbExecute(t, dsn, "DROP SCHEMA test_schema CASCADE")
-		dbExecute(t, dsn, "DROP ROLE test_role")
+		dbExecute(t, dsn, fmt.Sprintf("DROP SCHEMA %s CASCADE", testSchema))
+		dbExecute(t, dsn, fmt.Sprintf("DROP ROLE %s", testRole))
 	}()
 
 	// Test to grant directly to test_role and to public
 	// in both case test_case should have the right
-	for _, role := range []string{"test_role", "public"} {
-		t.Run(role, func(t *testing.T) {
+	for _, tc := range []struct{ name, role string }{{"test_role", testRole}, {"public", "public"}} {
+		role := tc.role
+		t.Run(tc.name, func(t *testing.T) {
 
 			tfConfigRoutine := fmt.Sprintf(`
 resource postgresql_grant "test" {
   database    = "postgres"
   role        = "%s"
-  schema      = "test_schema"
+  schema      = "%s"
   object_type = "routine"
   privileges  = ["EXECUTE"]
 }
-	`, role)
+	`, role, testSchema)
 
 			resource.Test(t, resource.TestCase{
 				PreCheck: func() {
@@ -1103,12 +1301,12 @@ resource postgresql_grant "test" {
 					{
 						Config: tfConfigRoutine,
 						Check: resource.ComposeTestCheckFunc(
-							resource.TestCheckResourceAttr("postgresql_grant.test", "id", fmt.Sprintf("%s_postgres_test_schema_routine", role)),
+							resource.TestCheckResourceAttr("postgresql_grant.test", "id", fmt.Sprintf("%s_postgres_%s_routine", role, testSchema)),
 							resource.TestCheckResourceAttr("postgresql_grant.test", "privileges.#", "1"),
 							resource.TestCheckResourceAttr("postgresql_grant.test", "privileges.0", "EXECUTE"),
 							resource.TestCheckResourceAttr("postgresql_grant.test", "with_grant_option", "false"),
-							testCheckFunctionExecutable(t, "test_role", "test_schema.test_function"),
-							testCheckProcedureExecutable(t, "test_role", "test_schema.test_procedure"),
+							testCheckFunctionExecutable(t, testRole, testSchema+".test_function"),
+							testCheckProcedureExecutable(t, testRole, testSchema+".test_procedure"),
 						),
 					},
 				},
@@ -1118,18 +1316,21 @@ resource postgresql_grant "test" {
 }
 
 func TestAccPostgresqlGrantDatabase(t *testing.T) {
+	roleName := testUniqueName("test_grant_role")
+	dbName := testUniqueName("test_grant_db")
+
 	// create a TF config with placeholder for privileges
 	// it will be filled in each step.
 	config := fmt.Sprintf(`
 resource "postgresql_role" "test" {
-	name     = "test_grant_role"
+	name     = "%s"
 	password = "%s"
 	login    = true
 }
 
 resource "postgresql_database" "test_db" {
 	depends_on = [postgresql_role.test]
-	name = "test_grant_db"
+	name = "%s"
 }
 
 resource "postgresql_grant" "test" {
@@ -1138,7 +1339,7 @@ resource "postgresql_grant" "test" {
 	object_type = "database"
 	privileges  = %%s
 }
-`, testRolePassword)
+`, roleName, testRolePassword, dbName)
 
 	resource.Test(t, resource.TestCase{
 		PreCheck: func() {
@@ -1151,10 +1352,10 @@ resource "postgresql_grant" "test" {
 			{
 				Config: fmt.Sprintf(config, `["CONNECT"]`),
 				Check: resource.ComposeTestCheckFunc(
-					resource.TestCheckResourceAttr("postgresql_grant.test", "id", "test_grant_role_test_grant_db_database"),
+					resource.TestCheckResourceAttr("postgresql_grant.test", "id", fmt.Sprintf("%s_%s_database", roleName, dbName)),
 					resource.TestCheckResourceAttr("postgresql_grant.test", "privileges.#", "1"),
 					resource.TestCheckResourceAttr("postgresql_grant.test", "with_grant_option", "false"),
-					testCheckDatabasesPrivileges(t, false),
+					testCheckDatabasesPrivileges(t, roleName, dbName, false),
 				),
 			},
 			// Can create but not grant
@@ -1162,7 +1363,7 @@ resource "postgresql_grant" "test" {
 				Config: fmt.Sprintf(config, `["CONNECT", "CREATE"]`),
 				Check: resource.ComposeTestCheckFunc(
 					resource.TestCheckResourceAttr("postgresql_grant.test", "privileges.#", "2"),
-					testCheckDatabasesPrivileges(t, true),
+					testCheckDatabasesPrivileges(t, roleName, dbName, true),
 				),
 			},
 			// Revoke
@@ -1170,7 +1371,7 @@ resource "postgresql_grant" "test" {
 				Config: fmt.Sprintf(config, "[]"),
 				Check: resource.ComposeTestCheckFunc(
 					resource.TestCheckResourceAttr("postgresql_grant.test", "privileges.#", "0"),
-					testCheckDatabasesPrivileges(t, false),
+					testCheckDatabasesPrivileges(t, roleName, dbName, false),
 				),
 			},
 		},
@@ -1255,18 +1456,21 @@ func TestAccPostgresqlImplicitGrants(t *testing.T) {
 }
 
 func TestAccPostgresqlGrantSchema(t *testing.T) {
+	roleName := testUniqueName("test_grant_role")
+	schemaName := testUniqueName("test_schema")
+
 	// create a TF config with placeholder for privileges
 	// it will be filled in each step.
 	config := fmt.Sprintf(`
 resource "postgresql_role" "test" {
-	name     = "test_grant_role"
+	name     = "%s"
 	password = "%s"
 	login    = true
 }
 
 resource "postgresql_schema" "test_schema" {
 	depends_on   = [postgresql_role.test]
-	name         = "test_schema"
+	name         = "%s"
 	drop_cascade = true
 }
 
@@ -1277,7 +1481,7 @@ resource "postgresql_grant" "test" {
 	object_type = "schema"
 	privileges  = %%s
 }
-`, testRolePassword)
+`, roleName, testRolePassword, schemaName)
 
 	resource.Test(t, resource.TestCase{
 		PreCheck: func() {
@@ -1289,17 +1493,17 @@ resource "postgresql_grant" "test" {
 			{
 				Config: fmt.Sprintf(config, `["USAGE"]`),
 				Check: resource.ComposeTestCheckFunc(
-					resource.TestCheckResourceAttr("postgresql_grant.test", "id", "test_grant_role_postgres_test_schema_schema"),
+					resource.TestCheckResourceAttr("postgresql_grant.test", "id", fmt.Sprintf("%s_postgres_%s_schema", roleName, schemaName)),
 					resource.TestCheckResourceAttr("postgresql_grant.test", "privileges.#", "1"),
 					resource.TestCheckResourceAttr("postgresql_grant.test", "with_grant_option", "false"),
-					testCheckSchemaPrivileges(t, true, false),
+					testCheckSchemaPrivileges(t, roleName, schemaName, true, false),
 				),
 			},
 			{
 				Config: fmt.Sprintf(config, `["USAGE", "CREATE"]`),
 				Check: resource.ComposeTestCheckFunc(
 					resource.TestCheckResourceAttr("postgresql_grant.test", "privileges.#", "2"),
-					testCheckSchemaPrivileges(t, true, true),
+					testCheckSchemaPrivileges(t, roleName, schemaName, true, true),
 				),
 			},
 			{
@@ -1307,7 +1511,7 @@ resource "postgresql_grant" "test" {
 				Config: fmt.Sprintf(config, `[]`),
 				Check: resource.ComposeTestCheckFunc(
 					resource.TestCheckResourceAttr("postgresql_grant.test", "privileges.#", "0"),
-					testCheckSchemaPrivileges(t, false, false),
+					testCheckSchemaPrivileges(t, roleName, schemaName, false, false),
 				),
 			},
 		},
@@ -1321,19 +1525,23 @@ func TestAccPostgresqlGrantForeignDataWrapper(t *testing.T) {
 	config := getTestConfig(t)
 	dsn := config.connStr("postgres")
 
+	roleName := testUniqueName("test_role")
+	fdwName := testUniqueName("test_fdw")
+	srvName := testUniqueName("test_srv")
+
 	// Create a test foreign data wrapper
-	dbExecute(t, dsn, "CREATE FOREIGN DATA WRAPPER test_fdw")
+	dbExecute(t, dsn, fmt.Sprintf("CREATE FOREIGN DATA WRAPPER %s", fdwName))
 
 	defer func() {
 		// Cleanup
-		dbExecute(t, dsn, "DROP FOREIGN DATA WRAPPER test_fdw CASCADE")
+		dbExecute(t, dsn, fmt.Sprintf("DROP FOREIGN DATA WRAPPER %s CASCADE", fdwName))
 	}()
 
 	// create a TF config with placeholder for privileges
 	// it will be filled in each step.
 	tfConfig := fmt.Sprintf(`
 resource "postgresql_role" "test" {
-	name     = "test_role"
+	name     = "%s"
 	password = "%s"
 	login    = true
 }
@@ -1343,11 +1551,11 @@ resource "postgresql_grant" "test" {
 	database             = "postgres"
 	role                 = postgresql_role.test.name
 	object_type          = "foreign_data_wrapper"
-	objects              = ["test_fdw"]
+	objects              = ["%s"]
 	privileges           = %%s
 	with_grant_option    = %%s
 }
-`, testRolePassword)
+`, roleName, testRolePassword, fdwName)
 
 	resource.Test(t, resource.TestCase{
 		PreCheck: func() {
@@ -1360,10 +1568,10 @@ resource "postgresql_grant" "test" {
 			{
 				Config: fmt.Sprintf(tfConfig, `["USAGE"]`, `true`),
 				Check: resource.ComposeTestCheckFunc(
-					resource.TestCheckResourceAttr("postgresql_grant.test", "id", "test_role_postgres_foreign_data_wrapper_test_fdw"),
+					resource.TestCheckResourceAttr("postgresql_grant.test", "id", fmt.Sprintf("%s_postgres_foreign_data_wrapper_%s", roleName, fdwName)),
 					resource.TestCheckResourceAttr("postgresql_grant.test", "privileges.#", "1"),
 					resource.TestCheckResourceAttr("postgresql_grant.test", "with_grant_option", "true"),
-					testCheckForeignDataWrapperPrivileges(t, true),
+					testCheckForeignDataWrapperPrivileges(t, roleName, fdwName, srvName, true),
 				),
 			},
 			// Revoke all privileges
@@ -1371,7 +1579,7 @@ resource "postgresql_grant" "test" {
 				Config: fmt.Sprintf(tfConfig, `[]`, `false`),
 				Check: resource.ComposeTestCheckFunc(
 					resource.TestCheckResourceAttr("postgresql_grant.test", "privileges.#", "0"),
-					testCheckForeignDataWrapperPrivileges(t, false),
+					testCheckForeignDataWrapperPrivileges(t, roleName, fdwName, srvName, false),
 				),
 			},
 		},
@@ -1385,20 +1593,25 @@ func TestAccPostgresqlGrantForeignServer(t *testing.T) {
 	config := getTestConfig(t)
 	dsn := config.connStr("postgres")
 
+	roleName := testUniqueName("test_role")
+	fdwName := testUniqueName("test_fdw")
+	srvName := testUniqueName("test_srv")
+	tableName := testUniqueName("test_tbl")
+
 	// Create a test foreign data wrapper
-	dbExecute(t, dsn, "CREATE FOREIGN DATA WRAPPER test_fdw")
-	dbExecute(t, dsn, "CREATE SERVER test_srv FOREIGN DATA WRAPPER test_fdw")
+	dbExecute(t, dsn, fmt.Sprintf("CREATE FOREIGN DATA WRAPPER %s", fdwName))
+	dbExecute(t, dsn, fmt.Sprintf("CREATE SERVER %s FOREIGN DATA WRAPPER %s", srvName, fdwName))
 
 	defer func() {
 		// Cleanup
-		dbExecute(t, dsn, "DROP FOREIGN DATA WRAPPER test_fdw CASCADE")
+		dbExecute(t, dsn, fmt.Sprintf("DROP FOREIGN DATA WRAPPER %s CASCADE", fdwName))
 	}()
 
 	// create a TF config with placeholder for privileges
 	// it will be filled in each step.
 	tfConfig := fmt.Sprintf(`
 resource "postgresql_role" "test" {
-	name     = "test_role"
+	name     = "%s"
 	password = "%s"
 	login    = true
 }
@@ -1417,11 +1630,11 @@ resource "postgresql_grant" "test" {
 	database          = "postgres"
 	role              = postgresql_role.test.name
 	object_type       = "foreign_server"
-	objects           = ["test_srv"]
+	objects           = ["%s"]
 	privileges        = %%s
 	with_grant_option = %%s
 }
-`, testRolePassword)
+`, roleName, testRolePassword, srvName)
 
 	resource.Test(t, resource.TestCase{
 		PreCheck: func() {
@@ -1434,10 +1647,10 @@ resource "postgresql_grant" "test" {
 			{
 				Config: fmt.Sprintf(tfConfig, `["USAGE"]`, `false`),
 				Check: resource.ComposeTestCheckFunc(
-					resource.TestCheckResourceAttr("postgresql_grant.test", "id", "test_role_postgres_foreign_server_test_srv"),
+					resource.TestCheckResourceAttr("postgresql_grant.test", "id", fmt.Sprintf("%s_postgres_foreign_server_%s", roleName, srvName)),
 					resource.TestCheckResourceAttr("postgresql_grant.test", "privileges.#", "1"),
 					resource.TestCheckResourceAttr("postgresql_grant.test", "with_grant_option", "false"),
-					testCheckForeignServerPrivileges(t, true),
+					testCheckForeignServerPrivileges(t, roleName, srvName, tableName, true),
 				),
 			},
 			// Revoke all privileges
@@ -1445,7 +1658,7 @@ resource "postgresql_grant" "test" {
 				Config: fmt.Sprintf(tfConfig, `[]`, `false`),
 				Check: resource.ComposeTestCheckFunc(
 					resource.TestCheckResourceAttr("postgresql_grant.test", "privileges.#", "0"),
-					testCheckForeignServerPrivileges(t, false),
+					testCheckForeignServerPrivileges(t, roleName, srvName, tableName, false),
 				),
 			},
 		},
@@ -1518,9 +1731,9 @@ func TestAccPostgresqlGrantOwnerPG15(t *testing.T) {
 	})
 }
 
-func testCheckDatabasesPrivileges(t *testing.T, canCreate bool) func(*terraform.State) error {
+func testCheckDatabasesPrivileges(t *testing.T, role, dbName string, canCreate bool) func(*terraform.State) error {
 	return func(*terraform.State) error {
-		db := connectAsTestRole(t, "test_grant_role", "test_grant_db")
+		db := connectAsTestRole(t, role, dbName)
 		defer closeDB(t, db)
 
 		if err := testHasGrantForQuery(db, "CREATE SCHEMA plop", canCreate); err != nil {
@@ -1566,45 +1779,26 @@ func testCheckProcedureExecutable(t *testing.T, role, procedure string) func(*te
 	}
 }
 
-func testCheckSchemaPrivileges(t *testing.T, usage, create bool) func(*terraform.State) error {
+func testCheckSchemaPrivileges(t *testing.T, role, schema string, usage, create bool) func(*terraform.State) error {
 	return func(*terraform.State) error {
 		config := getTestConfig(t)
 		dsn := config.connStr("postgres")
 
 		// Create a table in the schema to check if user has usage privilege
-		dbExecute(t, dsn, "CREATE TABLE IF NOT EXISTS test_schema.test_usage (id serial)")
+		dbExecute(t, dsn, fmt.Sprintf("CREATE TABLE IF NOT EXISTS %s.test_usage (id serial)", schema))
 		defer func() {
-			dbExecute(t, dsn, "DROP TABLE IF EXISTS test_schema.test_create")
+			dbExecute(t, dsn, fmt.Sprintf("DROP TABLE IF EXISTS %s.test_create", schema))
 		}()
-		dbExecute(t, dsn, "GRANT SELECT ON test_schema.test_usage TO test_grant_role")
+		dbExecute(t, dsn, fmt.Sprintf("GRANT SELECT ON %s.test_usage TO %s", schema, role))
 
-		db := connectAsTestRole(t, "test_grant_role", "postgres")
+		db := connectAsTestRole(t, role, "postgres")
 		defer closeDB(t, db)
 
-		if err := testHasGrantForQuery(db, "SELECT 1 FROM test_schema.test_usage", usage); err != nil {
+		if err := testHasGrantForQuery(db, fmt.Sprintf("SELECT 1 FROM %s.test_usage", schema), usage); err != nil {
 			return err
 		}
 
-		if err := testHasGrantForQuery(db, "CREATE TABLE test_schema.test_create (id serial)", create); err != nil {
-			return err
-		}
-
-		return nil
-	}
-}
-
-func testCheckForeignDataWrapperPrivileges(t *testing.T, usage bool) func(*terraform.State) error {
-	return func(*terraform.State) error {
-		config := getTestConfig(t)
-		dsn := config.connStr("postgres")
-
-		defer func() {
-			dbExecute(t, dsn, "DROP SERVER IF EXISTS test_srv")
-		}()
-		db := connectAsTestRole(t, "test_role", "postgres")
-		defer closeDB(t, db)
-
-		if err := testHasGrantForQuery(db, "CREATE SERVER test_srv FOREIGN DATA WRAPPER test_fdw", usage); err != nil {
+		if err := testHasGrantForQuery(db, fmt.Sprintf("CREATE TABLE %s.test_create (id serial)", schema), create); err != nil {
 			return err
 		}
 
@@ -1612,18 +1806,37 @@ func testCheckForeignDataWrapperPrivileges(t *testing.T, usage bool) func(*terra
 	}
 }
 
-func testCheckForeignServerPrivileges(t *testing.T, usage bool) func(*terraform.State) error {
+func testCheckForeignDataWrapperPrivileges(t *testing.T, role, fdw, srv string, usage bool) func(*terraform.State) error {
 	return func(*terraform.State) error {
 		config := getTestConfig(t)
 		dsn := config.connStr("postgres")
 
 		defer func() {
-			dbExecute(t, dsn, "DROP FOREIGN TABLE IF EXISTS test_tbl")
+			dbExecute(t, dsn, fmt.Sprintf("DROP SERVER IF EXISTS %s", srv))
 		}()
-		db := connectAsTestRole(t, "test_role", "postgres")
+		db := connectAsTestRole(t, role, "postgres")
 		defer closeDB(t, db)
 
-		if err := testHasGrantForQuery(db, "CREATE FOREIGN TABLE test_tbl() SERVER test_srv", usage); err != nil {
+		if err := testHasGrantForQuery(db, fmt.Sprintf("CREATE SERVER %s FOREIGN DATA WRAPPER %s", srv, fdw), usage); err != nil {
+			return err
+		}
+
+		return nil
+	}
+}
+
+func testCheckForeignServerPrivileges(t *testing.T, role, srv, table string, usage bool) func(*terraform.State) error {
+	return func(*terraform.State) error {
+		config := getTestConfig(t)
+		dsn := config.connStr("postgres")
+
+		defer func() {
+			dbExecute(t, dsn, fmt.Sprintf("DROP FOREIGN TABLE IF EXISTS %s", table))
+		}()
+		db := connectAsTestRole(t, role, "postgres")
+		defer closeDB(t, db)
+
+		if err := testHasGrantForQuery(db, fmt.Sprintf("CREATE FOREIGN TABLE %s() SERVER %s", table, srv), usage); err != nil {
 			return err
 		}
 

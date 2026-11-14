@@ -141,7 +141,7 @@ func resourcePostgreSQLSchemaCreate(db *DBConnection, d *schema.ResourceData) er
 
 	}
 
-	if err := withRolesGranted(txn, rolesToGrant, func() error {
+	if err := withRolesGranted(db, txn, rolesToGrant, func() error {
 		return createSchema(db, txn, d)
 	}); err != nil {
 		return err
@@ -249,7 +249,7 @@ func resourcePostgreSQLSchemaDelete(db *DBConnection, d *schema.ResourceData) er
 
 	owner := d.Get("owner").(string)
 
-	if err = withRolesGranted(txn, []string{owner}, func() error {
+	if err = withRolesGranted(db, txn, []string{owner}, func() error {
 		dropMode := "RESTRICT"
 		if d.Get(schemaDropCascade).(bool) {
 			dropMode = "CASCADE"
@@ -284,7 +284,7 @@ func resourcePostgreSQLSchemaReadImpl(db *DBConnection, d *schema.ResourceData) 
 		return err
 	}
 
-	txn, err := startTransaction(db.client, database)
+	dbc, err := initConnection(db.client, database)
 	if err != nil {
 		if isDatabaseDoesNotExistError(err) {
 			log.Printf("[WARN] PostgreSQL database (%s) not found, removing schema (%s) from state", database, schemaName)
@@ -293,14 +293,17 @@ func resourcePostgreSQLSchemaReadImpl(db *DBConnection, d *schema.ResourceData) 
 		}
 		return err
 	}
-	defer deferredRollback(txn)
 
 	var schemaOwner string
 	var schemaACLs []string
-	err = txn.QueryRow("SELECT pg_catalog.pg_get_userbyid(n.nspowner), COALESCE(n.nspacl, '{}'::aclitem[])::TEXT[] FROM pg_catalog.pg_namespace n WHERE n.nspname=$1", schemaName).Scan(&schemaOwner, pq.Array(&schemaACLs))
+	err = dbc.QueryRow("SELECT pg_catalog.pg_get_userbyid(n.nspowner), COALESCE(n.nspacl, '{}'::aclitem[])::TEXT[] FROM pg_catalog.pg_namespace n WHERE n.nspname=$1", schemaName).Scan(&schemaOwner, pq.Array(&schemaACLs))
 	switch {
 	case err == sql.ErrNoRows:
 		log.Printf("[WARN] PostgreSQL schema (%s) not found in database %s", schemaName, database)
+		d.SetId("")
+		return nil
+	case isDatabaseDoesNotExistError(err):
+		log.Printf("[WARN] PostgreSQL database (%s) not found, removing schema (%s) from state", database, schemaName)
 		d.SetId("")
 		return nil
 	case err != nil:
@@ -355,7 +358,7 @@ func resourcePostgreSQLSchemaUpdate(db *DBConnection, d *schema.ResourceData) er
 		return err
 	}
 
-	if err := setSchemaPolicy(txn, d); err != nil {
+	if err := setSchemaPolicy(db, txn, d); err != nil {
 		return err
 	}
 
@@ -407,7 +410,7 @@ func setSchemaOwner(txn *sql.Tx, d *schema.ResourceData) error {
 	return nil
 }
 
-func setSchemaPolicy(txn *sql.Tx, d *schema.ResourceData) error {
+func setSchemaPolicy(db *DBConnection, txn *sql.Tx, d *schema.ResourceData) error {
 	if !d.HasChange(schemaPolicyAttr) {
 		return nil
 	}
@@ -472,7 +475,7 @@ func setSchemaPolicy(txn *sql.Tx, d *schema.ResourceData) error {
 		rolesToGrant = append(rolesToGrant, owner)
 	}
 
-	return withRolesGranted(txn, rolesToGrant, func() error {
+	return withRolesGranted(db, txn, rolesToGrant, func() error {
 		for _, query := range queries {
 			if _, err := txn.Exec(query); err != nil {
 				return fmt.Errorf("error updating schema DCL: %w", err)

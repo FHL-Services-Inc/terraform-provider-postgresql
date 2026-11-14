@@ -2,32 +2,37 @@ package postgresql
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
 
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/resource"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/terraform"
+	"github.com/lib/pq"
 )
 
 func TestAccPostgresqlSecurityLabel_Basic(t *testing.T) {
+	roleName := testUniqueName("security_label_test_role")
+
 	resource.Test(t, resource.TestCase{
 		PreCheck: func() {
 			testAccPreCheck(t)
 			testCheckCompatibleVersion(t, featureSecurityLabel)
 			testSuperuserPreCheck(t)
+			testSecurityLabelProviderPreCheck(t, "dummy")
 		},
 		Providers:    testAccProviders,
 		CheckDestroy: testAccCheckPostgresqlSecurityLabelDestroy,
 		Steps: []resource.TestStep{
 			{
-				Config: testAccPostgresqlSecurityLabelConfig,
+				Config: testAccPostgresqlSecurityLabelConfig(roleName),
 				Check: resource.ComposeTestCheckFunc(
 					testAccCheckPostgresqlSecurityLabelExists("postgresql_security_label.test_label"),
 					resource.TestCheckResourceAttr(
 						"postgresql_security_label.test_label", "object_type", "role"),
 					resource.TestCheckResourceAttr(
-						"postgresql_security_label.test_label", "object_name", "security_label_test_role"),
+						"postgresql_security_label.test_label", "object_name", roleName),
 					resource.TestCheckResourceAttr(
 						"postgresql_security_label.test_label", "label_provider", "dummy"),
 					resource.TestCheckResourceAttr(
@@ -39,23 +44,28 @@ func TestAccPostgresqlSecurityLabel_Basic(t *testing.T) {
 }
 
 func TestAccPostgresqlSecurityLabel_Update(t *testing.T) {
+	roleName := testUniqueName("security_label_test_role")
+	// The hyphen checks that the role name is quoted.
+	roleName2 := testUniqueName("security_label_test-role2")
+
 	resource.Test(t, resource.TestCase{
 		PreCheck: func() {
 			testAccPreCheck(t)
 			testCheckCompatibleVersion(t, featureSecurityLabel)
 			testSuperuserPreCheck(t)
+			testSecurityLabelProviderPreCheck(t, "dummy")
 		},
 		Providers:    testAccProviders,
 		CheckDestroy: testAccCheckPostgresqlSecurityLabelDestroy,
 		Steps: []resource.TestStep{
 			{
-				Config: testAccPostgresqlSecurityLabelConfig,
+				Config: testAccPostgresqlSecurityLabelConfig(roleName),
 				Check: resource.ComposeTestCheckFunc(
 					testAccCheckPostgresqlSecurityLabelExists("postgresql_security_label.test_label"),
 					resource.TestCheckResourceAttr(
 						"postgresql_security_label.test_label", "object_type", "role"),
 					resource.TestCheckResourceAttr(
-						"postgresql_security_label.test_label", "object_name", "security_label_test_role"),
+						"postgresql_security_label.test_label", "object_name", roleName),
 					resource.TestCheckResourceAttr(
 						"postgresql_security_label.test_label", "label_provider", "dummy"),
 					resource.TestCheckResourceAttr(
@@ -63,7 +73,7 @@ func TestAccPostgresqlSecurityLabel_Update(t *testing.T) {
 				),
 			},
 			{
-				Config: testAccPostgresqlSecurityLabelChanges2,
+				Config: testAccPostgresqlSecurityLabelChanges2(roleName),
 				Check: resource.ComposeTestCheckFunc(
 					testAccCheckPostgresqlSecurityLabelExists("postgresql_security_label.test_label"),
 					resource.TestCheckResourceAttr(
@@ -71,15 +81,52 @@ func TestAccPostgresqlSecurityLabel_Update(t *testing.T) {
 				),
 			},
 			{
-				Config: testAccPostgresqlSecurityLabelChanges3,
+				Config: testAccPostgresqlSecurityLabelChanges3(roleName2),
 				Check: resource.ComposeTestCheckFunc(
 					testAccCheckPostgresqlSecurityLabelExists("postgresql_security_label.test_label"),
 					resource.TestCheckResourceAttr(
-						"postgresql_security_label.test_label", "object_name", "security_label_test-role2"),
+						"postgresql_security_label.test_label", "object_name", roleName2),
 				),
 			},
 		},
 	})
+}
+
+// testSecurityLabelProviderPreCheck skips the test unless the label provider
+// is loaded on the server. The tests use the dummy_seclabel module, which the
+// image built from tests/build preloads but a stock postgres image doesn't
+// ship. The probe sets no label on the current role (IS NULL) in a transaction
+// that is rolled back, and fails with invalid_parameter_value (22023) when the
+// provider isn't loaded.
+func testSecurityLabelProviderPreCheck(t *testing.T, provider string) {
+	client := testAccProvider.Meta().(*Client)
+	db, err := client.Connect()
+	if err != nil {
+		t.Fatalf("could not connect to database: %v", err)
+	}
+
+	txn, err := db.Begin()
+	if err != nil {
+		t.Fatalf("could not start transaction: %v", err)
+	}
+	defer deferredRollback(txn)
+
+	var role string
+	if err := txn.QueryRow("SELECT current_user").Scan(&role); err != nil {
+		t.Fatalf("could not read current user: %v", err)
+	}
+
+	_, err = txn.Exec(fmt.Sprintf(
+		"SECURITY LABEL FOR %s ON ROLE %s IS NULL", pq.QuoteIdentifier(provider), pq.QuoteIdentifier(role),
+	))
+	var pqErr *pq.Error
+	switch {
+	case err == nil:
+	case errors.As(err, &pqErr) && pqErr.Code == "22023":
+		t.Skipf("Skip test: %s; run against an image built from tests/build", pqErr.Message)
+	default:
+		t.Fatalf("could not check security label provider %q: %v", provider, err)
+	}
 }
 
 func checkSecurityLabelExists(txn *sql.Tx, objectType string, objectName string, provider string) (bool, error) {
@@ -171,9 +218,10 @@ func testAccCheckPostgresqlSecurityLabelExists(n string) resource.TestCheckFunc 
 	}
 }
 
-var testAccPostgresqlSecurityLabelConfig = `
+func testAccPostgresqlSecurityLabelConfig(roleName string) string {
+	return fmt.Sprintf(`
 resource "postgresql_role" "test_role" {
-  name            = "security_label_test_role"
+  name            = "%s"
   login           = true
   create_database = true
 }
@@ -183,11 +231,13 @@ resource "postgresql_security_label" "test_label" {
   label_provider = "dummy"
   label          = "secret"
 }
-`
+`, roleName)
+}
 
-var testAccPostgresqlSecurityLabelChanges2 = `
+func testAccPostgresqlSecurityLabelChanges2(roleName string) string {
+	return fmt.Sprintf(`
 resource "postgresql_role" "test_role" {
-  name            = "security_label_test_role"
+  name            = "%s"
   login           = true
   create_database = true
 }
@@ -197,11 +247,13 @@ resource "postgresql_security_label" "test_label" {
   label_provider = "dummy"
   label          = "top secret"
 }
-`
+`, roleName)
+}
 
-var testAccPostgresqlSecurityLabelChanges3 = `
+func testAccPostgresqlSecurityLabelChanges3(roleName string) string {
+	return fmt.Sprintf(`
 resource "postgresql_role" "test_role" {
-  name            = "security_label_test-role2"
+  name            = "%s"
   login           = true
   create_database = true
 }
@@ -211,4 +263,5 @@ resource "postgresql_security_label" "test_label" {
   label_provider = "dummy"
   label          = "top secret"
 }
-`
+`, roleName)
+}

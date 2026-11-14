@@ -63,3 +63,33 @@ resource "postgresql_default_privileges" "revoke_public" {
   privileges  = []
 }
 ```
+
+## Import
+
+`postgresql_default_privileges` can be imported using the resource ID,
+`<role>_<database>_<schema>_<owner>_<object_type>`, where `<schema>` is
+`noschema` for default privileges that are not limited to a schema. Use
+`public` as the role for default privileges granted to `PUBLIC`.
+
+As names may contain `_` themselves, the provider resolves the ID against the
+roles, databases and schemas that exist on the server; the import fails if no
+split of the ID matches, or if more than one does. `privileges` and
+`with_grant_option` are read from the server.
+
+```hcl
+import {
+  to = postgresql_default_privileges.grant_table_privileges
+  id = "current_role_example_db_public_owner_role_table"
+}
+
+import {
+  to = postgresql_default_privileges.revoke_public
+  id = "public_example_db_noschema_object_owner_function"
+}
+```
+
+or, with the CLI:
+
+```
+$ terraform import postgresql_default_privileges.grant_table_privileges current_role_example_db_public_owner_role_table
+```

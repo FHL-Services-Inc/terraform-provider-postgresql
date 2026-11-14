@@ -37,6 +37,9 @@ func resourcePostgreSQLGrantRole() *schema.Resource {
 		Create: PGResourceFunc(resourcePostgreSQLGrantRoleCreate),
 		Read:   PGResourceFunc(resourcePostgreSQLGrantRoleRead),
 		Delete: PGResourceFunc(resourcePostgreSQLGrantRoleDelete),
+		Importer: &schema.ResourceImporter{
+			StateContext: resourcePostgreSQLGrantRoleImport,
+		},
 
 		Schema: map[string]*schema.Schema{
 			"role": {
@@ -87,13 +90,15 @@ func resourcePostgreSQLGrantRoleCreate(db *DBConnection, d *schema.ResourceData)
 	}
 	defer deferredRollback(txn)
 
-	// Revoke the granted roles before granting them again.
-	if err = revokeRole(txn, d); err != nil {
+	if err = lockGrantRoleMember(db, txn, d); err != nil {
 		return err
 	}
 
-	if err = grantRole(txn, d); err != nil {
-		return err
+	// Revoke the granted roles before granting them again, in one round-trip:
+	// both statements are plain strings with quoted identifiers (no bind
+	// parameters), which lib/pq sends together over the simple query protocol.
+	if _, err = txn.Exec(createRevokeRoleQuery(d) + ";\n" + createGrantRoleQuery(d)); err != nil {
+		return fmt.Errorf("could not execute revoke/grant query: %w", err)
 	}
 
 	if err = txn.Commit(); err != nil {
@@ -119,6 +124,10 @@ func resourcePostgreSQLGrantRoleDelete(db *DBConnection, d *schema.ResourceData)
 	}
 	defer deferredRollback(txn)
 
+	if err = lockGrantRoleMember(db, txn, d); err != nil {
+		return err
+	}
+
 	if err = revokeRole(txn, d); err != nil {
 		return err
 	}
@@ -128,6 +137,16 @@ func resourcePostgreSQLGrantRoleDelete(db *DBConnection, d *schema.ResourceData)
 	}
 
 	return nil
+}
+
+// lockGrantRoleMember takes the advisory lock of the member role (the role
+// receiving grant_role), the same key postgresql_role takes in pgLockRole
+// before rewriting that role's memberships, so a grant/revoke here and a
+// roles update of the same member never interleave within one apply.
+// pgLockRole runs on txn and locks the role before its members, in the same
+// order as every other caller.
+func lockGrantRoleMember(db *DBConnection, txn *sql.Tx, d *schema.ResourceData) error {
+	return pgLockRole(db, txn, d.Get("role").(string))
 }
 
 func readGrantRole(db QueryAble, d *schema.ResourceData) error {
@@ -186,14 +205,6 @@ func createRevokeRoleQuery(d *schema.ResourceData) string {
 		pq.QuoteIdentifier(grantRole),
 		pq.QuoteIdentifier(role),
 	)
-}
-
-func grantRole(txn *sql.Tx, d *schema.ResourceData) error {
-	query := createGrantRoleQuery(d)
-	if _, err := txn.Exec(query); err != nil {
-		return fmt.Errorf("could not execute grant query: %w", err)
-	}
-	return nil
 }
 
 func revokeRole(txn *sql.Tx, d *schema.ResourceData) error {

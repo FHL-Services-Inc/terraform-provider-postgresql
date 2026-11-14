@@ -1,7 +1,9 @@
 package postgresql
 
 import (
+	"context"
 	"database/sql"
+	"database/sql/driver"
 	"errors"
 	"fmt"
 	"log"
@@ -48,37 +50,15 @@ type QueryAble interface {
 	QueryRow(query string, args ...any) *sql.Row
 }
 
-// pqQuoteLiteral returns a string literal safe for inclusion in a PostgreSQL
-// query as a parameter.  The resulting string still needs to be wrapped in
-// single quotes in SQL (i.e. fmt.Sprintf(`'%s'`, pqQuoteLiteral("str"))).  See
-// quote_literal_internal() in postgresql/backend/utils/adt/quote.c:77.
-func pqQuoteLiteral(in string) string {
-	in = strings.ReplaceAll(in, `\`, `\\`)
-	in = strings.ReplaceAll(in, `'`, `''`)
-	return in
-}
-
-func isMemberOfRole(db QueryAble, role, member string) (bool, error) {
+func isMemberOfRole(db QueryAble, setOption bool, role, member string) (bool, error) {
 	var _rez int
-	setOption := true
-
-	err := db.QueryRow(
-		"SELECT 1 FROM information_schema.columns WHERE table_name='pg_auth_members' AND column_name = 'set_option'",
-	).Scan(&_rez)
-
-	switch {
-	case err == sql.ErrNoRows:
-		setOption = false
-	case err != nil:
-		return false, fmt.Errorf("could not read setOption column: %w", err)
-	}
 
 	query := "SELECT 1 FROM pg_auth_members WHERE pg_get_userbyid(roleid) = $1 AND pg_get_userbyid(member) = $2"
 	if setOption {
 		query += " AND set_option"
 	}
 
-	err = db.QueryRow(query, role, member).Scan(&_rez)
+	err := db.QueryRow(query, role, member).Scan(&_rez)
 	switch {
 	case err == sql.ErrNoRows:
 		return false, nil
@@ -92,12 +72,12 @@ func isMemberOfRole(db QueryAble, role, member string) (bool, error) {
 // grantRoleMembership grants the role *role* to the user *member*.
 // It returns false if the grant is not needed because the user is already
 // a member of this role.
-func grantRoleMembership(db QueryAble, role, member string) (bool, error) {
+func grantRoleMembership(db QueryAble, setOption bool, role, member string) (bool, error) {
 	if member == role {
 		return false, nil
 	}
 
-	isMember, err := isMemberOfRole(db, role, member)
+	isMember, err := isMemberOfRole(db, setOption, role, member)
 	if err != nil {
 		return false, err
 	}
@@ -118,12 +98,12 @@ func grantRoleMembership(db QueryAble, role, member string) (bool, error) {
 
 // revokeRoleMembership revokes the role *role* from the user *member*.
 // It returns false if the revoke is not needed because the user is not a member of this role.
-func revokeRoleMembership(db QueryAble, role, member string) (bool, error) {
+func revokeRoleMembership(db QueryAble, setOption bool, role, member string) (bool, error) {
 	if member == role {
 		return false, nil
 	}
 
-	isMember, err := isMemberOfRole(db, role, member)
+	isMember, err := isMemberOfRole(db, setOption, role, member)
 	if err != nil {
 		return false, err
 	}
@@ -143,20 +123,44 @@ func revokeRoleMembership(db QueryAble, role, member string) (bool, error) {
 // withRolesGranted temporarily grants, if needed, the roles specified to connected user
 // (i.e.: the admin configure in the provider) and revoke them as soon as the
 // callback func has finished.
-func withRolesGranted(txn *sql.Tx, roles []string, fn func() error) error {
+func withRolesGranted(db *DBConnection, txn *sql.Tx, roles []string, fn func() error) error {
 	// No roles asked, execute the function directly
 	if len(roles) == 0 {
 		return fn()
 	}
 
-	currentUser, err := getCurrentUser(txn)
+	setOption := db.featureSupported(featureAuthMembersSetOption)
+
+	currentUser, err := db.currentUser(txn)
 	if err != nil {
 		return err
 	}
 
-	superuser, err := isSuperuser(txn, currentUser)
+	// The rolsuper of the login role is memoized per pool; when it is not
+	// known yet, fetch it together with the requested roles.
+	superuser, known := db.cachedSuperuser()
+	if known && superuser {
+		log.Printf("withRolesGranted: current user %s is superuser, no need to grant roles", currentUser)
+		return fn()
+	}
+
+	// Fetch rolsuper for the requested roles (and the current user if needed)
+	// in a single round-trip instead of one query per role.
+	lookup := roles
+	if !known {
+		lookup = append([]string{currentUser}, roles...)
+	}
+	superusers, err := getRolesSuperuser(txn, lookup)
 	if err != nil {
 		return err
+	}
+
+	if !known {
+		superuser, err = lookupSuperuser(superusers, currentUser)
+		if err != nil {
+			return err
+		}
+		db.storeSuperuser(superuser)
 	}
 	if superuser {
 		log.Printf("withRolesGranted: current user %s is superuser, no need to grant roles", currentUser)
@@ -169,7 +173,7 @@ func withRolesGranted(txn *sql.Tx, roles []string, fn func() error) error {
 	for _, role := range roles {
 		// We need to check if the role we want to grant is a superuser
 		// in this case Postgres disallows to grant it to a current user which is not superuser.
-		superuser, err := isSuperuser(txn, role)
+		superuser, err := lookupSuperuser(superusers, role)
 		if err != nil {
 			return err
 		}
@@ -194,7 +198,7 @@ func withRolesGranted(txn *sql.Tx, roles []string, fn func() error) error {
 		//  - GRANT postgres TO foo
 
 		// Check the opposite relation and revoke currentUser from role if needed
-		revoked, err := revokeRoleMembership(txn, currentUser, role)
+		revoked, err := revokeRoleMembership(txn, setOption, currentUser, role)
 		if err != nil {
 			return err
 		}
@@ -203,7 +207,7 @@ func withRolesGranted(txn *sql.Tx, roles []string, fn func() error) error {
 		}
 
 		// Grant the role to currentUser if needed
-		roleGranted, err := grantRoleMembership(txn, role, currentUser)
+		roleGranted, err := grantRoleMembership(txn, setOption, role, currentUser)
 		if err != nil {
 			return err
 		}
@@ -219,7 +223,7 @@ func withRolesGranted(txn *sql.Tx, roles []string, fn func() error) error {
 
 	// Revoke the temporary granted roles.
 	for _, role := range grantedRoles {
-		if _, err := revokeRoleMembership(txn, role, currentUser); err != nil {
+		if _, err := revokeRoleMembership(txn, setOption, role, currentUser); err != nil {
 			return err
 		}
 	}
@@ -234,7 +238,7 @@ func withRolesGranted(txn *sql.Tx, roles []string, fn func() error) error {
 		if !exists {
 			continue
 		}
-		if _, err := grantRoleMembership(txn, currentUser, role); err != nil {
+		if _, err := grantRoleMembership(txn, setOption, currentUser, role); err != nil {
 			return err
 		}
 	}
@@ -422,28 +426,13 @@ func startTransaction(client *Client, database string) (*sql.Tx, error) {
 	return txn, nil
 }
 
-func dbExists(db QueryAble, dbname string) (bool, error) {
-	err := db.QueryRow("SELECT datname FROM pg_database WHERE datname=$1", dbname).Scan(&dbname)
-	switch {
-	case err == sql.ErrNoRows:
-		return false, nil
-	case err != nil:
-		return false, fmt.Errorf("could not check if database exists: %w", err)
-	}
-
-	return true, nil
-}
-
 func roleExists(txn *sql.Tx, rolname string) (bool, error) {
-	err := txn.QueryRow("SELECT 1 FROM pg_roles WHERE rolname=$1", rolname).Scan(&rolname)
-	switch {
-	case err == sql.ErrNoRows:
-		return false, nil
-	case err != nil:
+	_, exists, err := roleOIDAndExists(txn, rolname)
+	if err != nil {
 		return false, fmt.Errorf("could not check if role exists: %w", err)
 	}
 
-	return true, nil
+	return exists, nil
 }
 
 func schemaExists(txn *sql.Tx, schemaname string) (bool, error) {
@@ -538,23 +527,99 @@ SELECT rolname
 	return owner, nil
 }
 
-// getTablesOwner retrieves all the owners for all the tables in the specified schema.
-func getTablesOwner(db QueryAble, schemaName string) ([]string, error) {
-	rows, err := db.Query(
-		"SELECT DISTINCT tableowner FROM pg_tables WHERE schemaname = $1",
-		schemaName,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("error while looking for owners of tables in schema '%s': %w", schemaName, err)
+// ownerRelkinds lists the pg_class.relkind values a GRANT of the given
+// object_type can touch. ON TABLE (and ON ALL TABLES IN SCHEMA) also covers
+// views, materialized views and foreign tables; column grants are on tables.
+var ownerRelkinds = map[string][]string{
+	"table":    {"r", "p", "v", "m", "f"},
+	"column":   {"r", "p", "v", "m", "f"},
+	"sequence": {"S"},
+}
+
+// ownerProkinds lists the pg_proc.prokind values a GRANT of the given
+// object_type can touch (ALL FUNCTIONS covers aggregates and window functions
+// but not procedures; ALL ROUTINES covers everything).
+var ownerProkinds = map[string][]string{
+	"function":  {"f", "a", "w"},
+	"procedure": {"p"},
+	"routine":   {"f", "a", "w", "p"},
+}
+
+// buildObjectsOwnersQuery returns the query listing the distinct owners of the
+// objects of objectType in schemaName. When objects is not empty only those
+// objects are considered; function-like objects may carry an argument
+// signature, which is stripped since owners are matched by name.
+func buildObjectsOwnersQuery(schemaName, objectType string, objects []string) (string, []any) {
+	var query string
+	var nameColumn string
+	var kinds []string
+
+	if relkinds, ok := ownerRelkinds[objectType]; ok {
+		kinds = relkinds
+		nameColumn = "pg_class.relname"
+		query = `
+SELECT DISTINCT pg_roles.rolname
+FROM pg_class
+JOIN pg_namespace ON pg_namespace.oid = pg_class.relnamespace
+JOIN pg_roles ON pg_roles.oid = pg_class.relowner
+WHERE pg_namespace.nspname = $1 AND pg_class.relkind = ANY($2)`
+	} else {
+		kinds = ownerProkinds[objectType]
+		nameColumn = "pg_proc.proname"
+		query = `
+SELECT DISTINCT pg_roles.rolname
+FROM pg_proc
+JOIN pg_namespace ON pg_namespace.oid = pg_proc.pronamespace
+JOIN pg_roles ON pg_roles.oid = pg_proc.proowner
+WHERE pg_namespace.nspname = $1 AND pg_proc.prokind = ANY($2)`
 	}
+	args := []any{schemaName, pq.Array(kinds)}
+
+	if len(objects) > 0 {
+		names := make([]string, 0, len(objects))
+		for _, object := range objects {
+			if i := strings.Index(object, "("); i >= 0 {
+				object = strings.TrimSpace(object[:i])
+			}
+			names = append(names, object)
+		}
+		query += " AND " + nameColumn + " = ANY($3)"
+		args = append(args, pq.Array(names))
+	}
+
+	return query, args
+}
+
+// getObjectsOwners retrieves the owners of the objects of objectType in the
+// specified schema (only the listed objects when objects is not empty).
+func getObjectsOwners(db QueryAble, schemaName, objectType string, objects []string) ([]string, error) {
+	if _, ok := ownerRelkinds[objectType]; !ok {
+		if _, ok := ownerProkinds[objectType]; !ok {
+			return nil, fmt.Errorf("cannot look up owners for object type %q", objectType)
+		}
+	}
+
+	query, args := buildObjectsOwnersQuery(schemaName, objectType, objects)
+	rows, err := db.Query(query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("error while looking for owners of %ss in schema '%s': %w", objectType, schemaName, err)
+	}
+	defer func() {
+		if err := rows.Close(); err != nil {
+			log.Printf("[WARN] could not close rows while looking for owners in schema '%s': %v", schemaName, err)
+		}
+	}()
 
 	var owners []string
 	for rows.Next() {
 		var owner string
 		if err := rows.Scan(&owner); err != nil {
-			return nil, fmt.Errorf("could not scan tables owner: %w", err)
+			return nil, fmt.Errorf("could not scan %s owner: %w", objectType, err)
 		}
 		owners = append(owners, owner)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error while looking for owners of %ss in schema '%s': %w", objectType, schemaName, err)
 	}
 
 	return owners, nil
@@ -576,61 +641,300 @@ func resolveOwners(db QueryAble, owners []string) ([]string, error) {
 	return resolvedOwners, nil
 }
 
-func isSuperuser(db QueryAble, role string) (bool, error) {
-	var superuser bool
+// getRolesSuperuser returns the rolsuper attribute of the given roles, fetched
+// with a single query. Roles that do not exist are absent from the result.
+func getRolesSuperuser(db QueryAble, roles []string) (map[string]bool, error) {
+	rows, err := db.Query("SELECT rolname, rolsuper FROM pg_roles WHERE rolname = ANY($1)", pq.Array(roles))
+	if err != nil {
+		return nil, fmt.Errorf("could not check if roles %v are superuser: %w", roles, err)
+	}
+	defer func() {
+		if err := rows.Close(); err != nil {
+			log.Printf("error closing rows: %v", err)
+		}
+	}()
 
-	if err := db.QueryRow("SELECT rolsuper FROM pg_roles WHERE rolname = $1", role).Scan(&superuser); err != nil {
-		return false, fmt.Errorf("could not check if role %s is superuser: %w", role, err)
+	superusers := make(map[string]bool, len(roles))
+	for rows.Next() {
+		var rolname string
+		var superuser bool
+		if err := rows.Scan(&rolname, &superuser); err != nil {
+			return nil, fmt.Errorf("could not scan superuser attribute: %w", err)
+		}
+		superusers[rolname] = superuser
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("could not check if roles %v are superuser: %w", roles, err)
 	}
 
+	return superusers, nil
+}
+
+// lookupSuperuser reads a role from the result of getRolesSuperuser.
+// A missing role yields the same error a per-role rolsuper lookup returned.
+func lookupSuperuser(superusers map[string]bool, role string) (bool, error) {
+	superuser, ok := superusers[role]
+	if !ok {
+		return false, fmt.Errorf("could not check if role %s is superuser: %w", role, sql.ErrNoRows)
+	}
 	return superuser, nil
 }
 
 const publicRole = "public"
 
-func getRoleOID(db QueryAble, role string) (uint32, error) {
-	if role == publicRole {
-		return 0, nil
-	}
-
+// roleOIDAndExists looks up a role in pg_roles with a single query and returns
+// its OID and whether it exists. A missing role is not an error (0, false, nil).
+// The pseudo-role "public" is not special-cased: it has no pg_roles row, so it
+// is reported as not existing.
+func roleOIDAndExists(db QueryAble, role string) (uint32, bool, error) {
 	var oid uint32
-	if err := db.QueryRow("SELECT oid FROM pg_roles WHERE rolname = $1", role).Scan(&oid); err != nil {
-		return 0, fmt.Errorf("could not find oid for role %s: %w", role, err)
+	err := db.QueryRow("SELECT oid FROM pg_roles WHERE rolname = $1", role).Scan(&oid)
+	switch {
+	case err == sql.ErrNoRows:
+		return 0, false, nil
+	case err != nil:
+		return 0, false, err
 	}
-	return oid, nil
+	return oid, true, nil
 }
 
 // Lock a role and all his members to avoid concurrent updates on some resources
-func pgLockRole(txn *sql.Tx, role string) error {
-	// Disable statement timeout for this connection otherwise the lock could fail
-	if _, err := txn.Exec("SET statement_timeout = 0"); err != nil {
-		return fmt.Errorf("could not disable statement_timeout: %w", err)
+func pgLockRole(db *DBConnection, txn *sql.Tx, role string) error {
+	literal := pq.QuoteLiteral(role)
+	return execAdvisoryLock(db, txn, "role", role,
+		fmt.Sprintf("could not get advisory lock for role %s", role),
+		"SELECT pg_advisory_xact_lock(oid::bigint) FROM pg_roles WHERE rolname = "+literal,
+		// Members are locked in OID order so that concurrent transactions
+		// touching overlapping member sets acquire them in the same order.
+		"SELECT pg_advisory_xact_lock(member::bigint) FROM pg_auth_members JOIN pg_roles ON roleid = pg_roles.oid WHERE rolname = "+literal+" ORDER BY member",
+	)
+}
+
+// singleConn runs queries on one connection pinned from a pool, so a caller
+// holding session state on it (advisory locks) never needs a second connection.
+type singleConn struct {
+	ctx  context.Context
+	conn *sql.Conn
+}
+
+func (c *singleConn) Exec(query string, args ...any) (sql.Result, error) {
+	return c.conn.ExecContext(c.ctx, query, args...)
+}
+
+func (c *singleConn) Query(query string, args ...any) (*sql.Rows, error) {
+	return c.conn.QueryContext(c.ctx, query, args...)
+}
+
+func (c *singleConn) QueryRow(query string, args ...any) *sql.Row {
+	return c.conn.QueryRowContext(c.ctx, query, args...)
+}
+
+func (c *singleConn) Begin() (*sql.Tx, error) {
+	return c.conn.BeginTx(c.ctx, nil)
+}
+
+// lockRoleConn takes a single connection from db and acquires on it the
+// advisory locks pgLockRole takes on role and its members. Everything that has
+// to run under the lock must use the returned connection; release (to be
+// deferred) unlocks and gives the connection back.
+//
+// pgLockRole needs a transaction, so a caller that also runs statements outside
+// of it (CREATE/DROP DATABASE cannot run in a transaction block) would need a
+// second connection from the same pool while the first one is pinned by the
+// lock transaction, and waits forever once the pool is exhausted
+// (max_connections). Here the locks are session-level ones on the same keys:
+// session and transaction-level advisory locks on the same key conflict with
+// each other, so this still serializes with pgLockRole callers.
+//
+// If the session cannot be cleaned up, the connection is discarded instead of
+// going back to the pool.
+func lockRoleConn(db *DBConnection, role string) (*singleConn, func(), error) {
+	ctx := context.Background()
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		return nil, nil, fmt.Errorf("could not get a database connection: %w", err)
 	}
-	if _, err := txn.Exec("SELECT pg_advisory_xact_lock(oid::bigint) FROM pg_roles WHERE rolname = $1", role); err != nil {
-		return fmt.Errorf("could not get advisory lock for role %s: %w", role, err)
+	c := &singleConn{ctx: ctx, conn: conn}
+
+	if err := pgLockRoleSession(c, role, db.client.config.AdvisoryLockTimeout); err != nil {
+		// The session may hold part of the locks or still have
+		// statement_timeout disabled.
+		discardConn(conn)
+		return nil, nil, err
 	}
 
-	if _, err := txn.Exec(
-		"SELECT pg_advisory_xact_lock(member::bigint) FROM pg_auth_members JOIN pg_roles ON roleid = pg_roles.oid WHERE rolname = $1",
-		role,
-	); err != nil {
-		return fmt.Errorf("could not get advisory lock for members of role %s: %w", role, err)
+	release := func() {
+		if _, err := c.Exec("SELECT pg_advisory_unlock_all()"); err != nil {
+			log.Printf("[ERR] could not release advisory locks for role %s, discarding the connection: %v", role, err)
+			discardConn(conn)
+			return
+		}
+		if err := conn.Close(); err != nil {
+			log.Printf("[ERR] could not release database connection: %v", err)
+		}
+	}
+	return c, release, nil
+}
+
+// pgLockRoleSession is the session-level counterpart of pgLockRole: same lock
+// keys (the role OID and the OIDs of its members), held until released with
+// pg_advisory_unlock_all. statement_timeout is disabled only while waiting for
+// the locks.
+//
+// When timeoutMs (the provider's advisory_lock_timeout) is > 0, lock_timeout is
+// set to it only while waiting for the locks, like withAdvisoryLockTimeout does
+// for pgLockRole. These are session settings (there is no transaction to scope
+// SET LOCAL to), so the previous lock_timeout is restored explicitly. On error
+// the caller discards the connection, so nothing is restored then.
+func pgLockRoleSession(conn QueryAble, role string, timeoutMs int) error {
+	// Disable statement timeout for this connection otherwise the lock could fail
+	if _, err := conn.Exec("SET statement_timeout = 0"); err != nil {
+		return fmt.Errorf("could not disable statement_timeout: %w", err)
+	}
+
+	var previousLockTimeout string
+	if timeoutMs > 0 {
+		if err := conn.QueryRow("SELECT current_setting('lock_timeout')").Scan(&previousLockTimeout); err != nil {
+			return fmt.Errorf("could not read lock_timeout: %w", err)
+		}
+		// timeoutMs is an int validated >= 0 by the provider schema, SET does
+		// not accept bind parameters.
+		if _, err := conn.Exec(fmt.Sprintf("SET lock_timeout = %d", timeoutMs)); err != nil {
+			return fmt.Errorf("could not set lock_timeout: %w", err)
+		}
+	}
+
+	acquire := func() error {
+		if _, err := conn.Exec("SELECT pg_advisory_lock(oid::bigint) FROM pg_roles WHERE rolname = $1", role); err != nil {
+			return fmt.Errorf("could not get advisory lock for role %s: %w", role, err)
+		}
+
+		// Members are locked in OID order, as in pgLockRole, so that
+		// concurrent sessions touching overlapping member sets acquire them in
+		// the same order.
+		if _, err := conn.Exec(
+			"SELECT pg_advisory_lock(member::bigint) FROM pg_auth_members JOIN pg_roles ON roleid = pg_roles.oid WHERE rolname = $1 ORDER BY member",
+			role,
+		); err != nil {
+			return fmt.Errorf("could not get advisory lock for members of role %s: %w", role, err)
+		}
+		return nil
+	}
+	if err := acquire(); err != nil {
+		if timeoutMs > 0 && isLockTimeoutError(err) {
+			return fmt.Errorf(
+				"timed out after %dms waiting for advisory lock on role %q: another Terraform run or session holds it; "+
+					"retry, serialize the applies, or raise the provider advisory_lock_timeout (0 waits indefinitely): %w",
+				timeoutMs, role, err,
+			)
+		}
+		return err
+	}
+
+	if timeoutMs > 0 {
+		if _, err := conn.Exec("SELECT set_config('lock_timeout', $1, false)", previousLockTimeout); err != nil {
+			return fmt.Errorf("could not restore lock_timeout: %w", err)
+		}
+	}
+	if _, err := conn.Exec("RESET statement_timeout"); err != nil {
+		return fmt.Errorf("could not restore statement_timeout: %w", err)
 	}
 
 	return nil
 }
 
-// Lock a database and all his members to avoid concurrent updates on some resources
-func pgLockDatabase(txn *sql.Tx, database string) error {
-	// Disable statement timeout for this connection otherwise the lock could fail
-	if _, err := txn.Exec("SET statement_timeout = 0"); err != nil {
-		return fmt.Errorf("could not disable statement_timeout: %w", err)
+// discardConn closes the underlying connection of conn instead of returning
+// it to the pool (which is all sql.Conn.Close does), for sessions left in an
+// unknown state.
+func discardConn(conn *sql.Conn) {
+	_ = conn.Raw(func(any) error { return driver.ErrBadConn })
+}
+
+// revokeRoleMembershipDeferred revokes a membership granted for the duration
+// of an operation, to be deferred. A failure is logged and does not fail the
+// operation.
+func revokeRoleMembershipDeferred(db QueryAble, setOption bool, role, member string) {
+	if _, err := revokeRoleMembership(db, setOption, role, member); err != nil {
+		log.Printf("[ERR] could not revoke role %s from %s: %v", role, member, err)
 	}
-	if _, err := txn.Exec("SELECT pg_advisory_xact_lock(oid::bigint) FROM pg_database WHERE datname = $1", database); err != nil {
-		return fmt.Errorf("could not get advisory lock for database %s: %w", database, err)
+}
+
+// Lock a database and all his members to avoid concurrent updates on some resources
+func pgLockDatabase(db *DBConnection, txn *sql.Tx, database string) error {
+	return execAdvisoryLock(db, txn, "database", database,
+		fmt.Sprintf("could not get advisory lock for database %s", database),
+		"SELECT pg_advisory_xact_lock(oid::bigint) FROM pg_database WHERE datname = "+pq.QuoteLiteral(database),
+	)
+}
+
+// savedLockTimeoutSetting is a custom (placeholder) setting used to carry the
+// caller's lock_timeout across the advisory lock statements, so it can be
+// restored without a round-trip to read it first.
+const savedLockTimeoutSetting = "terraform_provider_postgresql.saved_lock_timeout"
+
+// execAdvisoryLock takes the transaction-scoped advisory locks of lockStmts
+// with statement_timeout disabled for the rest of the transaction.
+//
+// When the provider's advisory_lock_timeout is > 0, lock_timeout is set to that
+// value only while the locks are acquired and the previous value (whatever it
+// was in this transaction, session or role) is restored afterwards, so the
+// statements executed later in the transaction keep their usual lock waits.
+// A lock wait that exceeds the limit is reported as a clear error naming the
+// contended object. With the default of 0 the wait is unbounded, as before.
+//
+// All settings use SET LOCAL / set_config(..., true) so they never outlive
+// the transaction on a pooled connection.
+//
+// Everything is sent as a single multi-statement string, which lib/pq runs
+// over the simple query protocol in one round-trip. That protocol takes no
+// bind parameters, so callers must pass statements with names already quoted
+// as literals (pq.QuoteLiteral). If a statement fails, PostgreSQL skips the
+// rest and the error of the failing statement is returned; the transaction is
+// aborted either way, so nothing needs to be restored.
+func execAdvisoryLock(db *DBConnection, txn *sql.Tx, kind, name, errPrefix string, lockStmts ...string) error {
+	timeoutMs := db.client.config.AdvisoryLockTimeout
+
+	// Disable statement timeout for this transaction otherwise the lock could fail
+	stmts := []string{"SET LOCAL statement_timeout = 0"}
+	if timeoutMs > 0 {
+		stmts = append(stmts,
+			fmt.Sprintf("SELECT set_config('%s', current_setting('lock_timeout'), true)", savedLockTimeoutSetting),
+			// timeoutMs is an int validated >= 0 by the provider schema.
+			fmt.Sprintf("SET LOCAL lock_timeout = %d", timeoutMs),
+		)
+	}
+	stmts = append(stmts, lockStmts...)
+	if timeoutMs > 0 {
+		stmts = append(stmts,
+			fmt.Sprintf("SELECT set_config('lock_timeout', current_setting('%s'), true)", savedLockTimeoutSetting),
+		)
 	}
 
+	if _, err := txn.Exec(strings.Join(stmts, ";\n")); err != nil {
+		if timeoutMs > 0 && isLockTimeoutError(err) {
+			return fmt.Errorf(
+				"timed out after %dms waiting for advisory lock on %s %q: another Terraform run or session holds it; "+
+					"retry, serialize the applies, or raise the provider advisory_lock_timeout (0 waits indefinitely): %w",
+				timeoutMs, kind, name, err,
+			)
+		}
+		return fmt.Errorf("%s: %w", errPrefix, err)
+	}
 	return nil
+}
+
+// isLockTimeoutError reports whether err is PostgreSQL's lock_not_available
+// (SQLSTATE 55P03), which is what lock_timeout raises. The message check is a
+// fallback for drivers that do not expose a *pq.Error in the chain.
+func isLockTimeoutError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var pqErr *pq.Error
+	if errors.As(err, &pqErr) {
+		return pqErr.Code == "55P03"
+	}
+	return strings.Contains(err.Error(), "canceling statement due to lock timeout")
 }
 
 func arrayDifference(a, b []any) (diff []any) {

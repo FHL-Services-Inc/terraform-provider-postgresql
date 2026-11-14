@@ -157,7 +157,7 @@ func setPubOwner(txn *sql.Tx, d *schema.ResourceData) error {
 	n := nraw.(string)
 	pubName := d.Get(pubNameAttr).(string)
 
-	sql := fmt.Sprintf("ALTER PUBLICATION %s OWNER TO %s", pubName, n)
+	sql := fmt.Sprintf("ALTER PUBLICATION %s OWNER TO %s", pq.QuoteIdentifier(pubName), pq.QuoteIdentifier(n))
 	if _, err := txn.Exec(sql); err != nil {
 		return fmt.Errorf("error updating publication owner: %w", err)
 	}
@@ -182,12 +182,12 @@ func setPubTables(txn *sql.Tx, d *schema.ResourceData) error {
 	added := arrayDifference(newList, oldList)
 
 	for _, p := range added {
-		query := fmt.Sprintf("ALTER PUBLICATION %s ADD TABLE %s", pubName, quoteTableName(p.(string)))
+		query := fmt.Sprintf("ALTER PUBLICATION %s ADD TABLE %s", pq.QuoteIdentifier(pubName), quoteTableName(p.(string)))
 		queries = append(queries, query)
 	}
 
 	for _, p := range dropped {
-		query := fmt.Sprintf("ALTER PUBLICATION %s DROP TABLE %s", pubName, quoteTableName(p.(string)))
+		query := fmt.Sprintf("ALTER PUBLICATION %s DROP TABLE %s", pq.QuoteIdentifier(pubName), quoteTableName(p.(string)))
 		queries = append(queries, query)
 	}
 
@@ -207,7 +207,7 @@ func setPubParams(txn *sql.Tx, d *schema.ResourceData, pubViaRootEnabled bool) e
 		return fmt.Errorf("error getting publication parameters: %w", err)
 	}
 	if publicationParametersString != "" {
-		sql := fmt.Sprintf(paramAlterTemplate, pubName, publicationParametersString)
+		sql := fmt.Sprintf(paramAlterTemplate, pq.QuoteIdentifier(pubName), publicationParametersString)
 		if _, err := txn.Exec(sql); err != nil {
 			return fmt.Errorf("error updating publication parameters: %w", err)
 		}
@@ -239,7 +239,7 @@ func resourcePostgreSQLPublicationCreate(db *DBConnection, d *schema.ResourceDat
 	}
 	defer deferredRollback(txn)
 
-	sql := fmt.Sprintf("CREATE PUBLICATION %s %s %s", name, tables, publicationParameters)
+	sql := fmt.Sprintf("CREATE PUBLICATION %s %s %s", pq.QuoteIdentifier(name), tables, publicationParameters)
 
 	if _, err := txn.Exec(sql); err != nil {
 		return fmt.Errorf("error creating Publication: %w", err)
@@ -274,17 +274,18 @@ func resourcePostgreSQLPublicationReadImpl(db *DBConnection, d *schema.ResourceD
 		return fmt.Errorf("could not get publication name: %w", err)
 	}
 
-	txn, err := startTransaction(db.client, database)
+	// Both SELECTs run directly on the database connection: under READ
+	// COMMITTED a read-only transaction gives them no common snapshot and
+	// only costs BEGIN/ROLLBACK round-trips.
+	dbc, err := initConnection(db.client, database)
 	if err != nil {
 		if isDatabaseDoesNotExistError(err) {
 			log.Printf("[WARN] PostgreSQL database (%s) not found, removing publication (%s) from state", database, PublicationName)
 			d.SetId("")
 			return nil
 		}
-		// startTransaction already provides context; avoid double-wrapping.
 		return err
 	}
-	defer deferredRollback(txn)
 
 	var tables []string
 	var publishParams []string
@@ -309,11 +310,15 @@ func resourcePostgreSQLPublicationReadImpl(db *DBConnection, d *schema.ResourceD
 	}
 
 	query := fmt.Sprintf("SELECT %s FROM pg_catalog.pg_publication as p join pg_catalog.pg_roles as r on p.pubowner = r.oid WHERE pubname = $1", strings.Join(columns, ", "))
-	err = txn.QueryRow(query, pqQuoteLiteral(PublicationName)).Scan(values...)
+	err = dbc.QueryRow(query, PublicationName).Scan(values...)
 
 	switch {
 	case err == sql.ErrNoRows:
 		log.Printf("[WARN] PostgreSQL Publication (%s) not found for database %s", PublicationName, database)
+		d.SetId("")
+		return nil
+	case isDatabaseDoesNotExistError(err):
+		log.Printf("[WARN] PostgreSQL database (%s) not found, removing publication (%s) from state", database, PublicationName)
 		d.SetId("")
 		return nil
 	case err != nil:
@@ -324,7 +329,7 @@ func resourcePostgreSQLPublicationReadImpl(db *DBConnection, d *schema.ResourceD
 		`FROM pg_catalog.pg_publication_tables ` +
 		`WHERE pubname = $1`
 
-	rows, err := txn.Query(query, pqQuoteLiteral(PublicationName))
+	rows, err := dbc.Query(query, PublicationName)
 	if err != nil {
 		return fmt.Errorf("could not get publication tables: %w", err)
 	}
