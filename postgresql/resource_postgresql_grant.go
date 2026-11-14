@@ -5,7 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"regexp"
 	"strings"
+	"unicode"
 
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/validation"
@@ -569,6 +571,113 @@ func isFunctionSignature(entry string) bool {
 	return strings.Contains(entry, "(")
 }
 
+// multiWordArgType matches the SQL standard type names made of several words
+// (and their typmods / array suffixes). Their first word must not be taken for
+// an argument name when reducing a signature to its types.
+var multiWordArgType = regexp.MustCompile(`(?i)^(` +
+	`double\s+precision` +
+	`|(character|char|nchar|national\s+(character|char)|bit)\s+varying(\s*\(\s*\d+\s*\))?` +
+	`|national\s+(character|char)(\s*\(\s*\d+\s*\))?` +
+	`|(timestamp|time)(\s*\(\s*\d+\s*\))?(\s+(with|without)\s+time\s+zone)?` +
+	`|interval(\s*\(\s*\d+\s*\))?(\s+(year|month|day|hour|minute|second)(\s+to\s+(month|hour|minute|second))?)?(\s*\(\s*\d+\s*\))?` +
+	`)(\s*\[\s*\d*\s*\])*$`)
+
+// splitSQLTopLevel splits s on the separator runes found outside of
+// parentheses, brackets, double-quoted identifiers and single-quoted literals.
+// Empty parts are dropped when skipEmpty is set.
+func splitSQLTopLevel(s string, isSep func(rune) bool, skipEmpty bool) []string {
+	var parts []string
+	var cur strings.Builder
+	depth := 0
+	var quote rune
+	flush := func() {
+		part := strings.TrimSpace(cur.String())
+		if part != "" || !skipEmpty {
+			parts = append(parts, part)
+		}
+		cur.Reset()
+	}
+	for _, r := range s {
+		switch {
+		case quote != 0:
+			if r == quote {
+				quote = 0
+			}
+		case r == '"' || r == '\'':
+			quote = r
+		case r == '(' || r == '[':
+			depth++
+		case r == ')' || r == ']':
+			depth--
+		case depth == 0 && isSep(r):
+			flush()
+			continue
+		}
+		cur.WriteRune(r)
+	}
+	flush()
+	return parts
+}
+
+// functionArgType reduces one argument of a GRANT signature,
+// "[argmode] [argname] argtype [DEFAULT expr]", to its type. ok is false for
+// an OUT argument, which is not part of the signature.
+func functionArgType(arg string) (argType string, ok bool) {
+	tokens := splitSQLTopLevel(arg, unicode.IsSpace, true)
+
+	// Drop a default value ("DEFAULT expr" or "= expr").
+	for i, tok := range tokens {
+		if strings.EqualFold(tok, "default") || strings.HasPrefix(tok, "=") {
+			tokens = tokens[:i]
+			break
+		}
+		if before, _, found := strings.Cut(tok, "="); found && !strings.ContainsAny(before, "\"'") {
+			tokens = append(tokens[:i:i], before)
+			break
+		}
+	}
+
+	if len(tokens) > 1 {
+		switch strings.ToUpper(tokens[0]) {
+		case "OUT":
+			return "", false
+		case "IN", "INOUT", "VARIADIC":
+			tokens = tokens[1:]
+		}
+	}
+
+	// "name type": the first token is an argument name unless the tokens
+	// form a multi-word type name or the second one only continues the type
+	// ("integer []", "numeric (10,2)").
+	if len(tokens) > 1 && !multiWordArgType.MatchString(strings.Join(tokens, " ")) &&
+		!strings.HasPrefix(tokens[1], "[") && !strings.HasPrefix(tokens[1], "(") {
+		tokens = tokens[1:]
+	}
+	return strings.Join(tokens, " "), true
+}
+
+// functionLookupSignature reduces a function/procedure/routine objects entry
+// to the form to_regprocedure accepts: GRANT takes argument modes, names (and
+// ignores OUT arguments), to_regprocedure only a list of types. "f(IN x
+// integer, OUT y text)" becomes "f(integer)"; the types are kept as written.
+// An entry without a complete argument list is returned unchanged.
+func functionLookupSignature(entry string) string {
+	name, rest, found := strings.Cut(entry, "(")
+	if !found || !strings.HasSuffix(strings.TrimSpace(rest), ")") {
+		return entry
+	}
+	rest = strings.TrimSpace(rest)
+	args := rest[:len(rest)-1]
+
+	var types []string
+	for _, arg := range splitSQLTopLevel(args, func(r rune) bool { return r == ',' }, true) {
+		if argType, ok := functionArgType(arg); ok {
+			types = append(types, argType)
+		}
+	}
+	return name + "(" + strings.Join(types, ", ") + ")"
+}
+
 // hasFunctionSignature reports whether any objects entry carries an argument
 // list.
 func hasFunctionSignature(objects *schema.Set) bool {
@@ -593,8 +702,10 @@ func hasFunctionSignature(objects *schema.Set) bool {
 //   - bare entries ("f") select every overload of that name in the schema
 //     ("proname = ANY($3)", served by the pg_proc name index);
 //   - entries with an argument list ("f(integer)") are resolved with
-//     to_regprocedure on exactly the text the GRANT uses ("schema"."f"(integer)),
-//     so any spelling PostgreSQL accepts for the types selects the same overload,
+//     to_regprocedure on the text the GRANT uses ("schema"."f"(integer)), once
+//     reduced to the argument types (functionLookupSignature drops argument
+//     modes, names and OUT arguments, which GRANT accepts and to_regprocedure
+//     does not), so any spelling PostgreSQL accepts selects the same overload,
 //     and an entry that resolves to nothing (dropped routine) yields no row, like
 //     a missing bare name. resolveSignatures=false leaves them out of the query
 //     (they are then not compared).
@@ -634,7 +745,7 @@ func buildReadFunctionRolePrivilegesQuery(
 				bare = append(bare, entry)
 			} else if resolveSignatures {
 				sigEntries = append(sigEntries, entry)
-				signatures = append(signatures, pq.QuoteIdentifier(schemaName)+"."+quoteIdentifyIdent(entry))
+				signatures = append(signatures, pq.QuoteIdentifier(schemaName)+"."+quoteIdentifyIdent(functionLookupSignature(entry)))
 			}
 		}
 
@@ -704,10 +815,10 @@ func fetchGrantReadRows(db *DBConnection, d *schema.ResourceData, query string, 
 }
 
 // isFunctionSignatureError reports whether the function Read failed because
-// to_regprocedure could not parse one of the signature entries.
-// to_regprocedure only accepts a list of type names: an entry with argument
-// names or modes ("f(x integer)", "f(IN integer)"), which GRANT accepts, is a
-// syntax error for it, and before PostgreSQL 16 so is an unknown type name.
+// to_regprocedure could not parse one of the signature entries: before
+// PostgreSQL 16 an unknown type name raises instead of returning NULL, and so
+// does, on every version, an argument list functionLookupSignature could not
+// reduce to plain types.
 func isFunctionSignatureError(err error) bool {
 	var pqErr *pq.Error
 	if !errors.As(err, &pqErr) {
