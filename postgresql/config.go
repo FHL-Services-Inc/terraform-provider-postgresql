@@ -303,6 +303,27 @@ func (c *Config) connStr(database string) string {
 	return connStr
 }
 
+// registryKey returns the dbRegistry key of the pool for database: the DSN,
+// prefixed with how connections authenticate. The DSN alone isn't enough
+// since with auth tokens it carries no password, so a token-auth provider
+// and a passwordless one (pgpass, trust) for the same server and user would
+// otherwise share a pool.
+func (c *Config) registryKey(database string) string {
+	return c.authKind() + " " + c.connStr(database)
+}
+
+// authKind describes how connections authenticate, for registryKey.
+func (c *Config) authKind() string {
+	switch {
+	case c.AuthTokens != nil:
+		return "token:" + c.AuthTokens.name
+	case c.Password != "":
+		return "password"
+	default:
+		return "none"
+	}
+}
+
 func (c *Config) getDatabaseUsername() string {
 	if c.DatabaseUsername != "" {
 		return c.DatabaseUsername
@@ -316,9 +337,10 @@ func (c *Config) getDatabaseUsername() string {
 func (c *Client) Connect() (*DBConnection, error) {
 	ctx := context.Background()
 	dsn := c.config.connStr(c.databaseName)
+	key := c.config.registryKey(c.databaseName)
 
 	dbRegistryLock.Lock()
-	conn, found := dbRegistry[dsn]
+	conn, found := dbRegistry[key]
 	dbRegistryLock.Unlock()
 	if found {
 		return conn, nil
@@ -352,13 +374,13 @@ func (c *Client) Connect() (*DBConnection, error) {
 
 	dbRegistryLock.Lock()
 	defer dbRegistryLock.Unlock()
-	if existing, found := dbRegistry[dsn]; found {
+	if existing, found := dbRegistry[key]; found {
 		// Another goroutine won the race and already published a connection
 		// for this DSN; keep that one and discard ours.
 		_ = db.Close()
 		return existing, nil
 	}
-	dbRegistry[dsn] = conn
+	dbRegistry[key] = conn
 	return conn, nil
 }
 
@@ -385,20 +407,20 @@ func (c *Config) configurePool(db *sql.DB) {
 // gets a fresh pool. Pools created with max_idle_connections = 0 retain no
 // idle connections and are left untouched.
 //
-// The entry is looked up by DSN, which only matches because every Client is
-// created from the same provider Config (see NewClient) and connStr is
-// deterministic. It returns true if a pool was found and evicted.
+// The entry is looked up by registryKey, which only matches because every
+// Client is created from the same provider Config (see NewClient) and
+// registryKey is deterministic. It returns true if a pool was found and evicted.
 // It must not be called while holding dbRegistryLock.
 func (c *Config) evictDBConnection(database string) bool {
-	dsn := c.connStr(database)
+	key := c.registryKey(database)
 
 	dbRegistryLock.Lock()
-	conn, found := dbRegistry[dsn]
+	conn, found := dbRegistry[key]
 	if !found || conn.client.config.MaxIdleConns == 0 {
 		dbRegistryLock.Unlock()
 		return false
 	}
-	delete(dbRegistry, dsn)
+	delete(dbRegistry, key)
 	dbRegistryLock.Unlock()
 
 	if err := conn.Close(); err != nil {

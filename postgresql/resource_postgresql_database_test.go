@@ -628,10 +628,10 @@ resource "postgresql_schema" "schema" {
 func testAccCheckDBConnectionRegistered(dbName string, want bool) resource.TestCheckFunc {
 	return func(s *terraform.State) error {
 		client := testAccProvider.Meta().(*Client)
-		dsn := client.config.connStr(dbName)
+		key := client.config.registryKey(dbName)
 
 		dbRegistryLock.Lock()
-		_, found := dbRegistry[dsn]
+		_, found := dbRegistry[key]
 		dbRegistryLock.Unlock()
 
 		if found != want {
