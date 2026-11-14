@@ -320,6 +320,10 @@ resource "postgresql_grant" "public_table" {
 	schema      = "test_schema"
 	object_type = "table"
 	privileges  = ["INSERT"]
+
+	# Both table grants rewrite the same relacl rows; concurrent GRANT/REVOKE
+	# on them fails with "tuple concurrently updated".
+	depends_on = [postgresql_grant.table]
 }
 
 resource "postgresql_grant" "schema" {
