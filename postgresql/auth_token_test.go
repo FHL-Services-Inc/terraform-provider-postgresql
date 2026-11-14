@@ -326,9 +326,10 @@ func TestTokenAuthConnectorFetchesTokenPerConnect(t *testing.T) {
 	if strings.Join(passwords, ",") != strings.Join(want, ",") {
 		t.Errorf("passwords used = %v, want %v", passwords, want)
 	}
-	// The parsed config must not be mutated by a connect.
-	if c.cfg.Password != "" {
-		t.Errorf("base config password = %q, want empty", c.cfg.Password)
+	// A connect sets the token on a clone, never on the parsed config (which
+	// may hold PGPASSWORD from the environment; it is always overridden).
+	if strings.HasPrefix(c.cfg.Password, "token-") {
+		t.Errorf("base config password = %q, a token leaked into the shared config", c.cfg.Password)
 	}
 }
 
