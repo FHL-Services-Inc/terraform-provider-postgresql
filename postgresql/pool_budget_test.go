@@ -152,7 +152,7 @@ func (r *fakeRows) Next(dest []driver.Value) error {
 // newBudgetTestPool opens a pool on fake connections that draws from budget b.
 func newBudgetTestPool(t *testing.T, inner driver.Connector, b *endpointBudget, maxIdle int, wait time.Duration) *sql.DB {
 	t.Helper()
-	db := openBudgetedDB(inner, b, maxIdle, wait)
+	db := openBudgetedDB(inner, b, b.size, maxIdle, wait)
 	db.SetMaxIdleConns(maxIdle)
 	if maxIdle > 0 {
 		db.SetConnMaxIdleTime(time.Minute)
@@ -507,5 +507,150 @@ func TestAccEndpointBudgetWrapsPQConnection(t *testing.T) {
 		return nil
 	}); err != nil {
 		t.Fatalf("Raw(): %v", err)
+	}
+}
+
+// hammer runs n workers that take a connection of db, hold it for hold and
+// give it back, until stop is closed. Errors are reported on t.
+func hammer(t *testing.T, db *sql.DB, n int, hold time.Duration, stop <-chan struct{}) *sync.WaitGroup {
+	t.Helper()
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				conn, err := db.Conn(context.Background())
+				if err != nil {
+					t.Errorf("Conn(): %v", err)
+					return
+				}
+				time.Sleep(hold)
+				_ = conn.Close()
+			}
+		}()
+	}
+	return &wg
+}
+
+// TestEndpointBudgetQueuesInOwnPool checks that, with the budget full, a pool
+// that already holds a connection waits for it instead of taking a slot from
+// another busy pool: no connection is closed and reopened.
+func TestEndpointBudgetQueuesInOwnPool(t *testing.T) {
+	b := newEndpointBudget("test-own-pool", 2)
+	inner := &countingConnector{}
+	hot := newBudgetTestPool(t, inner, b, 2, 5*time.Second)
+	warm := newBudgetTestPool(t, inner, b, 2, 5*time.Second)
+	if err := hot.Ping(); err != nil {
+		t.Fatalf("Ping(): %v", err)
+	}
+	if err := warm.Ping(); err != nil {
+		t.Fatalf("Ping(): %v", err)
+	}
+
+	stop := make(chan struct{})
+	hotWorkers := hammer(t, hot, 8, 2*time.Millisecond, stop)
+	// Used often enough that its connection is never idle for long.
+	warmWorkers := hammer(t, warm, 1, 5*time.Millisecond, stop)
+	time.Sleep(300 * time.Millisecond)
+	close(stop)
+	hotWorkers.Wait()
+	warmWorkers.Wait()
+
+	if got := inner.dials.Load(); got != 2 {
+		t.Errorf("dials = %d, want 2 (queries should wait for their own pool's connection)", got)
+	}
+	if got := inner.maxOpen.Load(); got > 2 {
+		t.Errorf("peak open connections = %d, want <= 2", got)
+	}
+}
+
+// TestEndpointBudgetMovesColdIdleConnectionToBusyPool checks that a pool
+// waiting in its own queue still gets the slot of a connection that sits idle
+// in another pool.
+func TestEndpointBudgetMovesColdIdleConnectionToBusyPool(t *testing.T) {
+	b := newEndpointBudget("test-cold-idle", 2)
+	// One fake connector per pool, so each pool's open connections can be
+	// counted (sql.DBStats.InUse also counts dials in progress).
+	hotConns, coldConns := &countingConnector{}, &countingConnector{}
+	hot := newBudgetTestPool(t, hotConns, b, 2, 5*time.Second)
+	cold := newBudgetTestPool(t, coldConns, b, 2, 5*time.Second)
+	if err := hot.Ping(); err != nil {
+		t.Fatalf("Ping(): %v", err)
+	}
+	if err := cold.Ping(); err != nil {
+		t.Fatalf("Ping(): %v", err)
+	}
+
+	stop := make(chan struct{})
+	workers := hammer(t, hot, 4, 2*time.Millisecond, stop)
+	defer func() {
+		close(stop)
+		workers.Wait()
+	}()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for hotConns.open.Load() < 2 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if got := hotConns.open.Load(); got != 2 {
+		t.Errorf("busy pool connections = %d, want 2 (idle connection of the other pool not moved)", got)
+	}
+	if got := coldConns.open.Load(); got != 0 {
+		t.Errorf("idle pool connections = %d, want 0", got)
+	}
+}
+
+// TestEndpointBudgetStressNoErrors runs many short queries over several pools
+// sharing a small budget: none may fail (in particular not with
+// driver.ErrBadConn, which the budget uses to send a query back to its pool's
+// queue) and the budget must hold.
+func TestEndpointBudgetStressNoErrors(t *testing.T) {
+	const budget = 3
+	b := newEndpointBudget("test-stress", budget)
+	inner := &countingConnector{dialDelay: time.Millisecond}
+	var pools []*sql.DB
+	for _, idle := range []int{2, 2, 1, 0} {
+		pools = append(pools, newBudgetTestPool(t, inner, b, idle, 5*time.Second))
+	}
+
+	stop := make(chan struct{})
+	var groups []*sync.WaitGroup
+	for i, db := range pools {
+		groups = append(groups, hammer(t, db, 5+5*i, time.Duration(i+1)*time.Millisecond, stop))
+	}
+	var queries sync.WaitGroup
+	for i := 0; i < 20; i++ {
+		queries.Add(1)
+		go func(db *sql.DB) {
+			defer queries.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				var x int
+				if err := db.QueryRow("SELECT $1", 1).Scan(&x); err != nil {
+					t.Errorf("QueryRow(): %v", err)
+					return
+				}
+			}
+		}(pools[i%len(pools)])
+	}
+	time.Sleep(time.Second)
+	close(stop)
+	for _, g := range groups {
+		g.Wait()
+	}
+	queries.Wait()
+
+	if got := inner.maxOpen.Load(); got > budget {
+		t.Errorf("peak open connections = %d, want <= %d", got, budget)
 	}
 }

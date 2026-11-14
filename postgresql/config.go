@@ -429,7 +429,7 @@ func (c *Config) openPostgres(dsn string) (*sql.DB, error) {
 		return sql.OpenDB(connector), nil
 	}
 	budget := getEndpointBudget(c.endpointKey(), c.MaxTotalConns)
-	return openBudgetedDB(connector, budget, c.MaxIdleConns, c.budgetWait()), nil
+	return openBudgetedDB(connector, budget, c.effectiveMaxConns(), c.MaxIdleConns, c.budgetWait()), nil
 }
 
 // budgetWait is how long a dial waits for a free slot of the endpoint budget:
