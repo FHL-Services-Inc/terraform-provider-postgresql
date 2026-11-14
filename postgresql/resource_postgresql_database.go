@@ -521,6 +521,19 @@ func setAlterOwnership(db *DBConnection, d *schema.ResourceData) error {
 		defer revokeRoleMembershipDeferred(conn, currentOwner, currentUser)
 	}
 
+	// REASSIGN OWNED also needs the privileges of the new owner, and since
+	// PostgreSQL 16 the right to SET ROLE to it. The membership a CREATEROLE
+	// role gets in the roles it creates has neither by default
+	// (createrole_self_grant), isMemberOfRole does not count it, and the
+	// explicit GRANT gets SET (and INHERIT) by default.
+	newOwnerGranted, err := grantRoleMembership(conn, newOwner, currentUser)
+	if err != nil {
+		return err
+	}
+	if newOwnerGranted {
+		defer revokeRoleMembershipDeferred(conn, newOwner, currentUser)
+	}
+
 	lockTxn, err := conn.Begin()
 	if err != nil {
 		return fmt.Errorf("could not start transaction: %w", err)
