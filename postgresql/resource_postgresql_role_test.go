@@ -634,14 +634,15 @@ func TestAccPostgresqlRole_PasswordWithBackslashAndQuote(t *testing.T) {
 		createPassword = `pa'ss\word`
 		updatePassword = `n\\ew'pa''ss\`
 	)
+	roleName := testUniqueName("quoted_pwd_role")
 	config := func(password string) string {
 		return fmt.Sprintf(`
 resource "postgresql_role" "quoted_pwd_role" {
-  name     = "quoted_pwd_role"
+  name     = %q
   login    = true
   password = %q
 }
-`, password)
+`, roleName, password)
 	}
 
 	resource.Test(t, resource.TestCase{
@@ -655,14 +656,14 @@ resource "postgresql_role" "quoted_pwd_role" {
 				Config: config(createPassword),
 				Check: resource.ComposeTestCheckFunc(
 					resource.TestCheckResourceAttr("postgresql_role.quoted_pwd_role", "password", createPassword),
-					testAccCheckRoleCanLogin(t, "quoted_pwd_role", createPassword),
+					testAccCheckRoleCanLogin(t, roleName, createPassword),
 				),
 			},
 			{
 				Config: config(updatePassword),
 				Check: resource.ComposeTestCheckFunc(
 					resource.TestCheckResourceAttr("postgresql_role.quoted_pwd_role", "password", updatePassword),
-					testAccCheckRoleCanLogin(t, "quoted_pwd_role", updatePassword),
+					testAccCheckRoleCanLogin(t, roleName, updatePassword),
 				),
 			},
 		},

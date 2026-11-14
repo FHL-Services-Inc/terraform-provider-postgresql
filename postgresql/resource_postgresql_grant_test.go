@@ -1474,10 +1474,10 @@ resource "postgresql_grant" "test" {
 func TestAccPostgresqlGrantDatabaseNotOwned(t *testing.T) {
 	skipIfNotAcc(t)
 
-	const (
-		dbName    = "test_grant_db_not_owned"
-		ownerRole = "test_grant_db_owner"
-		roRole    = "test_grant_db_owner_ro"
+	var (
+		dbName    = testUniqueName("test_grant_db_not_owned")
+		ownerRole = testUniqueName("test_grant_db_owner")
+		roRole    = testUniqueName("test_grant_db_owner_ro")
 	)
 
 	config := getTestConfig(t)

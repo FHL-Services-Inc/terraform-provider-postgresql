@@ -430,8 +430,9 @@ func TestAccPostgresqlDefaultPrivileges_ReverseMembershipManyDatabases(t *testin
 	}
 
 	const databases = 3
-	const owner = "tf_tests_dp_reverse_owner"
-	const reader = "tf_tests_dp_reverse_reader"
+	owner := testUniqueName("tf_tests_dp_reverse_owner")
+	reader := testUniqueName("tf_tests_dp_reverse_reader")
+	dbSuffix := testUniqueName("dp_reverse")
 
 	config := getTestConfig(t)
 	dsn := config.connStr("postgres")
@@ -446,7 +447,7 @@ func TestAccPostgresqlDefaultPrivileges_ReverseMembershipManyDatabases(t *testin
 
 	dbNames := make([]string, databases)
 	for i := range databases {
-		dbNames[i], _ = getTestDBNames(fmt.Sprintf("dp_reverse_%d", i))
+		dbNames[i], _ = getTestDBNames(fmt.Sprintf("%s_%d", dbSuffix, i))
 		dbExecute(t, dsn, fmt.Sprintf("CREATE DATABASE %s", dbNames[i]))
 		defer dbExecute(t, dsn, fmt.Sprintf("DROP DATABASE %s", dbNames[i]))
 	}

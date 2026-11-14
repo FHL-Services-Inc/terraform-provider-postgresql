@@ -119,6 +119,9 @@ func testUserMappingMaskedPreCheck(t *testing.T) {
 // pg_user_mappings hides the options, so Read must neither fail nor report a
 // permanent diff on options (each step's follow-up plan must be empty).
 func TestAccPostgresqlUserMapping_NonSuperuser(t *testing.T) {
+	serverName := testUniqueName("tf_tests_um_masked_srv")
+	roleName := testUniqueName("tf_tests_um_masked_role")
+
 	resource.Test(t, resource.TestCase{
 		PreCheck: func() {
 			testAccPreCheck(t)
@@ -129,7 +132,7 @@ func TestAccPostgresqlUserMapping_NonSuperuser(t *testing.T) {
 		CheckDestroy: testAccCheckPostgresqlUserMappingDestroy,
 		Steps: []resource.TestStep{
 			{
-				Config: fmt.Sprintf(testAccPostgresqlUserMappingNonSuperuserConfig, "pass"),
+				Config: testAccPostgresqlUserMappingNonSuperuserConfig(serverName, roleName, "pass"),
 				Check: resource.ComposeTestCheckFunc(
 					testAccCheckPostgresqlUserMappingExists("postgresql_user_mapping.masked"),
 					resource.TestCheckResourceAttr("postgresql_user_mapping.masked", "options.%", "2"),
@@ -137,7 +140,7 @@ func TestAccPostgresqlUserMapping_NonSuperuser(t *testing.T) {
 				),
 			},
 			{
-				Config: fmt.Sprintf(testAccPostgresqlUserMappingNonSuperuserConfig, "passUpdated"),
+				Config: testAccPostgresqlUserMappingNonSuperuserConfig(serverName, roleName, "passUpdated"),
 				Check: resource.ComposeTestCheckFunc(
 					testAccCheckPostgresqlUserMappingExists("postgresql_user_mapping.masked"),
 					resource.TestCheckResourceAttr("postgresql_user_mapping.masked", "options.password", "passUpdated"),
@@ -147,9 +150,10 @@ func TestAccPostgresqlUserMapping_NonSuperuser(t *testing.T) {
 	})
 }
 
-var testAccPostgresqlUserMappingNonSuperuserConfig = `
+func testAccPostgresqlUserMappingNonSuperuserConfig(serverName, roleName, password string) string {
+	return fmt.Sprintf(`
 resource "postgresql_server" "masked" {
-  server_name = "tf_tests_um_masked_srv"
+  server_name = "%s"
   fdw_name    = "postgres_fdw"
   options = {
     host   = "foo"
@@ -158,7 +162,7 @@ resource "postgresql_server" "masked" {
 }
 
 resource "postgresql_role" "masked" {
-  name = "tf_tests_um_masked_role"
+  name = "%s"
 }
 
 resource "postgresql_user_mapping" "masked" {
@@ -169,7 +173,8 @@ resource "postgresql_user_mapping" "masked" {
     password = "%s"
   }
 }
-`
+`, serverName, roleName, password)
+}
 
 func checkUserMappingExists(txn *sql.Tx, username string, serverName string) (bool, error) {
 	var _rez bool

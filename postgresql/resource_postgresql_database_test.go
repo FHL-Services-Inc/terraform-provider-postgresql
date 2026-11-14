@@ -362,20 +362,22 @@ resource postgresql_database "test_db" {
 func TestAccPostgresqlDatabase_AlterObjectOwnershipOwnerChange(t *testing.T) {
 	skipIfNotAcc(t)
 
-	const databaseSuffix = "reassign_owner_change"
+	databaseSuffix := testUniqueName("reassign_owner_change")
 	const tableName = "reassign_owner_change_table"
 	databaseName, _ := getTestDBNames(databaseSuffix)
+	oldOwner := testUniqueName("tf_tests_reassign_old")
+	newOwner := testUniqueName("tf_tests_reassign_new")
 
 	config := getTestConfig(t)
 
 	dbConfig := func(owner string) string {
 		return fmt.Sprintf(`
 resource "postgresql_role" "old" {
-  name = "tf_tests_reassign_old"
+  name = %q
 }
 
 resource "postgresql_role" "new" {
-  name = "tf_tests_reassign_new"
+  name = %q
 }
 
 resource "postgresql_database" "db" {
@@ -383,7 +385,7 @@ resource "postgresql_database" "db" {
   owner                  = postgresql_role.%s.name
   alter_object_ownership = true
 }
-`, databaseName, owner)
+`, oldOwner, newOwner, databaseName, owner)
 	}
 
 	resource.Test(t, resource.TestCase{
@@ -395,17 +397,17 @@ resource "postgresql_database" "db" {
 				Config: dbConfig("old"),
 				Check: func(*terraform.State) error {
 					// The table has to exist before the owner change.
-					_ = createTestTables(t, databaseSuffix, []string{tableName}, "tf_tests_reassign_old")
+					_ = createTestTables(t, databaseSuffix, []string{tableName}, oldOwner)
 					return nil
 				},
 			},
 			{
 				Config: dbConfig("new"),
 				Check: resource.ComposeTestCheckFunc(
-					resource.TestCheckResourceAttr("postgresql_database.db", "owner", "tf_tests_reassign_new"),
-					checkTableOwnership(t, config.connStr(databaseName), "tf_tests_reassign_new", tableName),
-					checkUserMembership(t, config.Username, "tf_tests_reassign_old", false),
-					checkUserMembership(t, config.Username, "tf_tests_reassign_new", false),
+					resource.TestCheckResourceAttr("postgresql_database.db", "owner", newOwner),
+					checkTableOwnership(t, config.connStr(databaseName), newOwner, tableName),
+					checkUserMembership(t, config.Username, oldOwner, false),
+					checkUserMembership(t, config.Username, newOwner, false),
 				),
 			},
 		},
@@ -426,38 +428,41 @@ func TestAccPostgresqlDatabase_AlterObjectOwnershipManyDatabases(t *testing.T) {
 
 	const databases = 6
 	const tableName = "multi_owner_table"
-	suffix := func(i int) string { return fmt.Sprintf("multi_owner_%d", i) }
+	suffixBase := testUniqueName("multi_owner")
+	suffix := func(i int) string { return fmt.Sprintf("%s_%d", suffixBase, i) }
+	oldOwner := testUniqueName("tf_tests_multi_owner_old")
+	newOwner := testUniqueName("tf_tests_multi_owner_new")
 
 	config := getTestConfig(t)
 
 	dbConfig := func(owner string) string {
 		return fmt.Sprintf(`
 resource "postgresql_role" "old" {
-  name = "tf_tests_multi_owner_old"
+  name = %q
 }
 
 resource "postgresql_role" "new" {
-  name = "tf_tests_multi_owner_new"
+  name = %q
 }
 
 resource "postgresql_database" "db" {
   count                  = %d
-  name                   = "%s_multi_owner_${count.index}"
+  name                   = "%s_%s_${count.index}"
   owner                  = postgresql_role.%s.name
   alter_object_ownership = true
 }
-`, databases, dbNamePrefix, owner)
+`, oldOwner, newOwner, databases, dbNamePrefix, suffixBase, owner)
 	}
 
 	newOwnerChecks := []resource.TestCheckFunc{
-		checkUserMembership(t, config.Username, "tf_tests_multi_owner_old", false),
-		checkUserMembership(t, config.Username, "tf_tests_multi_owner_new", false),
+		checkUserMembership(t, config.Username, oldOwner, false),
+		checkUserMembership(t, config.Username, newOwner, false),
 	}
 	for i := range databases {
 		dbName, _ := getTestDBNames(suffix(i))
 		newOwnerChecks = append(newOwnerChecks,
-			resource.TestCheckResourceAttr(fmt.Sprintf("postgresql_database.db.%d", i), "owner", "tf_tests_multi_owner_new"),
-			checkTableOwnership(t, config.connStr(dbName), "tf_tests_multi_owner_new", tableName),
+			resource.TestCheckResourceAttr(fmt.Sprintf("postgresql_database.db.%d", i), "owner", newOwner),
+			checkTableOwnership(t, config.connStr(dbName), newOwner, tableName),
 		)
 	}
 
@@ -470,7 +475,7 @@ resource "postgresql_database" "db" {
 				Config: dbConfig("old"),
 				Check: func(*terraform.State) error {
 					for i := range databases {
-						_ = createTestTables(t, suffix(i), []string{tableName}, "tf_tests_multi_owner_old")
+						_ = createTestTables(t, suffix(i), []string{tableName}, oldOwner)
 					}
 					return nil
 				},
@@ -740,27 +745,31 @@ func TestAccPostgresqlDatabase_OwnerMaxConnectionsOne(t *testing.T) {
 	// dbRegistry is process-wide and keyed by DSN, so a pool opened by an
 	// earlier test (with the default max_connections) would be reused here.
 	// A connect_timeout unique to this test gives the provider its own pools.
-	const providerConfig = `
+	owner1 := testUniqueName("tf_tests_single_conn_owner1")
+	owner2 := testUniqueName("tf_tests_single_conn_owner2")
+	dbName := testUniqueName("tf_tests_single_conn_db")
+
+	providerConfig := fmt.Sprintf(`
 provider "postgresql" {
   max_connections = 1
   connect_timeout = 178
 }
 
 resource "postgresql_role" "owner1" {
-  name = "tf_tests_single_conn_owner1"
+  name = %q
 }
 
 resource "postgresql_role" "owner2" {
-  name = "tf_tests_single_conn_owner2"
+  name = %q
 }
-`
+`, owner1, owner2)
 	dbConfig := func(owner string) string {
 		return providerConfig + fmt.Sprintf(`
 resource "postgresql_database" "db" {
-  name  = "tf_tests_single_conn_db"
+  name  = %q
   owner = postgresql_role.%s.name
 }
-`, owner)
+`, dbName, owner)
 	}
 
 	resource.Test(t, resource.TestCase{
@@ -772,16 +781,16 @@ resource "postgresql_database" "db" {
 				Config: dbConfig("owner1"),
 				Check: resource.ComposeTestCheckFunc(
 					testAccCheckPostgresqlDatabaseExists("postgresql_database.db"),
-					resource.TestCheckResourceAttr("postgresql_database.db", "owner", "tf_tests_single_conn_owner1"),
-					checkUserMembership(t, config.Username, "tf_tests_single_conn_owner1", false),
+					resource.TestCheckResourceAttr("postgresql_database.db", "owner", owner1),
+					checkUserMembership(t, config.Username, owner1, false),
 				),
 			},
 			{
 				Config: dbConfig("owner2"),
 				Check: resource.ComposeTestCheckFunc(
 					testAccCheckPostgresqlDatabaseExists("postgresql_database.db"),
-					resource.TestCheckResourceAttr("postgresql_database.db", "owner", "tf_tests_single_conn_owner2"),
-					checkUserMembership(t, config.Username, "tf_tests_single_conn_owner2", false),
+					resource.TestCheckResourceAttr("postgresql_database.db", "owner", owner2),
+					checkUserMembership(t, config.Username, owner2, false),
 				),
 			},
 			{
@@ -789,8 +798,8 @@ resource "postgresql_database" "db" {
 				// check still has something to look at.
 				Config: providerConfig,
 				Check: resource.ComposeTestCheckFunc(
-					testAccCheckDatabaseGone("tf_tests_single_conn_db"),
-					checkUserMembership(t, config.Username, "tf_tests_single_conn_owner2", false),
+					testAccCheckDatabaseGone(dbName),
+					checkUserMembership(t, config.Username, owner2, false),
 				),
 			},
 		},
@@ -803,28 +812,32 @@ resource "postgresql_database" "db" {
 func TestAccPostgresqlDatabase_AlterObjectOwnershipMaxConnectionsOne(t *testing.T) {
 	skipIfNotAcc(t)
 
-	const providerConfig = `
+	owner1 := testUniqueName("tf_tests_single_conn_reassign1")
+	owner2 := testUniqueName("tf_tests_single_conn_reassign2")
+	dbName := testUniqueName("tf_tests_single_conn_reassign_db")
+
+	providerConfig := fmt.Sprintf(`
 provider "postgresql" {
   max_connections = 1
   connect_timeout = 177
 }
 
 resource "postgresql_role" "owner1" {
-  name = "tf_tests_single_conn_reassign1"
+  name = %q
 }
 
 resource "postgresql_role" "owner2" {
-  name = "tf_tests_single_conn_reassign2"
+  name = %q
 }
-`
+`, owner1, owner2)
 	dbConfig := func(owner string) string {
 		return providerConfig + fmt.Sprintf(`
 resource "postgresql_database" "db" {
-  name                   = "tf_tests_single_conn_reassign_db"
+  name                   = %q
   owner                  = postgresql_role.%s.name
   alter_object_ownership = true
 }
-`, owner)
+`, dbName, owner)
 	}
 
 	resource.Test(t, resource.TestCase{
@@ -843,7 +856,7 @@ resource "postgresql_database" "db" {
 				Config: dbConfig("owner2"),
 				Check: resource.ComposeTestCheckFunc(
 					testAccCheckPostgresqlDatabaseExists("postgresql_database.db"),
-					resource.TestCheckResourceAttr("postgresql_database.db", "owner", "tf_tests_single_conn_reassign2"),
+					resource.TestCheckResourceAttr("postgresql_database.db", "owner", owner2),
 				),
 			},
 		},
@@ -859,27 +872,31 @@ func TestAccPostgresqlDatabase_OwnerMaxConnectionsTwo(t *testing.T) {
 
 	config := getTestConfig(t)
 
-	const providerConfig = `
+	owner := testUniqueName("tf_tests_two_conns_owner")
+	dbA := testUniqueName("tf_tests_two_conns_db_a")
+	dbB := testUniqueName("tf_tests_two_conns_db_b")
+
+	providerConfig := fmt.Sprintf(`
 provider "postgresql" {
   max_connections = 2
   connect_timeout = 176
 }
 
 resource "postgresql_role" "owner" {
-  name = "tf_tests_two_conns_owner"
+  name = %q
 }
-`
-	dbConfig := providerConfig + `
+`, owner)
+	dbConfig := providerConfig + fmt.Sprintf(`
 resource "postgresql_database" "a" {
-  name  = "tf_tests_two_conns_db_a"
+  name  = %q
   owner = postgresql_role.owner.name
 }
 
 resource "postgresql_database" "b" {
-  name  = "tf_tests_two_conns_db_b"
+  name  = %q
   owner = postgresql_role.owner.name
 }
-`
+`, dbA, dbB)
 
 	resource.Test(t, resource.TestCase{
 		PreCheck:          func() { testAccPreCheck(t) },
@@ -891,15 +908,15 @@ resource "postgresql_database" "b" {
 				Check: resource.ComposeTestCheckFunc(
 					testAccCheckPostgresqlDatabaseExists("postgresql_database.a"),
 					testAccCheckPostgresqlDatabaseExists("postgresql_database.b"),
-					checkUserMembership(t, config.Username, "tf_tests_two_conns_owner", false),
+					checkUserMembership(t, config.Username, owner, false),
 				),
 			},
 			{
 				Config: providerConfig,
 				Check: resource.ComposeTestCheckFunc(
-					testAccCheckDatabaseGone("tf_tests_two_conns_db_a"),
-					testAccCheckDatabaseGone("tf_tests_two_conns_db_b"),
-					checkUserMembership(t, config.Username, "tf_tests_two_conns_owner", false),
+					testAccCheckDatabaseGone(dbA),
+					testAccCheckDatabaseGone(dbB),
+					checkUserMembership(t, config.Username, owner, false),
 				),
 			},
 		},
@@ -930,22 +947,26 @@ func TestAccPostgresqlDatabase_OwnerChange(t *testing.T) {
 
 	config := getTestConfig(t)
 
-	const rolesConfig = `
+	owner1 := testUniqueName("tf_tests_owner_change_owner1")
+	owner2 := testUniqueName("tf_tests_owner_change_owner2")
+	dbName := testUniqueName("tf_tests_owner_change_db")
+
+	rolesConfig := fmt.Sprintf(`
 resource "postgresql_role" "owner1" {
-  name = "tf_tests_owner_change_owner1"
+  name = %q
 }
 
 resource "postgresql_role" "owner2" {
-  name = "tf_tests_owner_change_owner2"
+  name = %q
 }
-`
+`, owner1, owner2)
 	dbConfig := func(owner string) string {
 		return rolesConfig + fmt.Sprintf(`
 resource "postgresql_database" "db" {
-  name  = "tf_tests_owner_change_db"
+  name  = %q
   owner = postgresql_role.%s.name
 }
-`, owner)
+`, dbName, owner)
 	}
 
 	resource.Test(t, resource.TestCase{
@@ -957,16 +978,16 @@ resource "postgresql_database" "db" {
 				Config: dbConfig("owner1"),
 				Check: resource.ComposeTestCheckFunc(
 					testAccCheckPostgresqlDatabaseExists("postgresql_database.db"),
-					resource.TestCheckResourceAttr("postgresql_database.db", "owner", "tf_tests_owner_change_owner1"),
+					resource.TestCheckResourceAttr("postgresql_database.db", "owner", owner1),
 				),
 			},
 			{
 				Config: dbConfig("owner2"),
 				Check: resource.ComposeTestCheckFunc(
 					testAccCheckPostgresqlDatabaseExists("postgresql_database.db"),
-					resource.TestCheckResourceAttr("postgresql_database.db", "owner", "tf_tests_owner_change_owner2"),
-					checkUserMembership(t, config.Username, "tf_tests_owner_change_owner1", false),
-					checkUserMembership(t, config.Username, "tf_tests_owner_change_owner2", false),
+					resource.TestCheckResourceAttr("postgresql_database.db", "owner", owner2),
+					checkUserMembership(t, config.Username, owner1, false),
+					checkUserMembership(t, config.Username, owner2, false),
 				),
 			},
 			{
@@ -974,9 +995,9 @@ resource "postgresql_database" "db" {
 				// provider is not a member of.
 				Config: dbConfig("owner1"),
 				Check: resource.ComposeTestCheckFunc(
-					resource.TestCheckResourceAttr("postgresql_database.db", "owner", "tf_tests_owner_change_owner1"),
-					checkUserMembership(t, config.Username, "tf_tests_owner_change_owner1", false),
-					checkUserMembership(t, config.Username, "tf_tests_owner_change_owner2", false),
+					resource.TestCheckResourceAttr("postgresql_database.db", "owner", owner1),
+					checkUserMembership(t, config.Username, owner1, false),
+					checkUserMembership(t, config.Username, owner2, false),
 				),
 			},
 		},
