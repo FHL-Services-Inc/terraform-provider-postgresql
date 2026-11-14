@@ -255,7 +255,11 @@ func TestAccPostgresqlRole_RolesChangeKeepsGrantRole(t *testing.T) {
 	dsn := config.connStr("postgres")
 	member := prefix + "_member"
 
-	tfConfig := func(roles string, withGrant bool) string {
+	tfConfig := func(roles string, withGrant, ignoreRoles bool) string {
+		lifecycle := ""
+		if ignoreRoles {
+			lifecycle = "lifecycle {\n    ignore_changes = [roles]\n  }"
+		}
 		cfg := fmt.Sprintf(`
 resource "postgresql_role" "a" {
   name = "%[1]s_a"
@@ -269,8 +273,9 @@ resource "postgresql_role" "d" {
 resource "postgresql_role" "member" {
   name  = "%[1]s_member"
   roles = [%[2]s]
+  %[3]s
 }
-`, prefix, roles)
+`, prefix, roles, lifecycle)
 		if withGrant {
 			// by name, so that it runs concurrently with the role update
 			cfg += fmt.Sprintf(`
@@ -292,10 +297,10 @@ resource "postgresql_grant_role" "d" {
 		Providers: testAccProviders,
 		Steps: []resource.TestStep{
 			{
-				Config: tfConfig("postgresql_role.a.name", false),
+				Config: tfConfig("postgresql_role.a.name", false, false),
 			},
 			{
-				Config:             tfConfig("postgresql_role.b.name", true),
+				Config:             tfConfig("postgresql_role.b.name", true, false),
 				ExpectNonEmptyPlan: true,
 				Check: resource.ComposeTestCheckFunc(
 					checkMembership(t, dsn, member, prefix+"_a", false, false),
@@ -304,8 +309,12 @@ resource "postgresql_grant_role" "d" {
 				),
 			},
 			{
-				// remove the grant_role before the roles are destroyed
-				Config:             tfConfig("postgresql_role.b.name", false),
+				// Remove the grant_role before the roles are destroyed. roles
+				// is ignored here: otherwise the role update (roles now
+				// reports d) and the grant_role delete would both revoke d
+				// concurrently, which is the unsupported "same membership
+				// managed by both resources" setup.
+				Config:             tfConfig("postgresql_role.b.name", false, true),
 				ExpectNonEmptyPlan: false,
 			},
 		},
