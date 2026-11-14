@@ -273,6 +273,12 @@ func resourcePostgreSQLDatabaseDelete(db *DBConnection, d *schema.ResourceData) 
 		return err
 	}
 
+	// Close our own pooled connections to the database (only kept with
+	// max_idle_connections > 0) before terminating the remaining ones.
+	if db.client.config.evictDBConnection(dbName) {
+		log.Printf("[DEBUG] evicted pooled connections to database %q before dropping it", dbName)
+	}
+
 	// Terminate all active connections and block new one
 	if err := terminateBConnections(db, conn, dbName); err != nil {
 		return err

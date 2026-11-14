@@ -176,6 +176,17 @@ The following arguments are supported:
   seconds, across all connection retries. The default is `5`.
 * `max_connections` - (Optional) Set the maximum number of open connections to
   the database. The default is `20`.  Zero means unlimited open connections.
+* `max_idle_connections` - (Optional) Maximum number of idle connections kept
+  open for reuse, per database the provider connects to. The default is `0`:
+  every connection is closed once it is returned, so each query opens a new
+  connection. Setting it above zero avoids a new connection (TCP, TLS and
+  authentication handshake) for most queries, which noticeably speeds up plans
+  and applies with many resources. Idle connections are closed after 5 minutes,
+  and the provider closes its own connections to a database before dropping it
+  with `postgresql_database`. While Terraform runs, a plain `DROP DATABASE`
+  issued outside of the provider can fail with "database is being accessed by
+  other users" because of these idle connections. The value is capped to
+  `max_connections` when the latter is non-zero.
 * `conn_max_lifetime_seconds` - (Optional) Maximum lifetime of a connection,
   in seconds. The default is `0`.  Zero means unlimited.
 * `advisory_lock_timeout` - (Optional) Maximum wait, in milliseconds, for the
