@@ -50,16 +50,6 @@ type QueryAble interface {
 	QueryRow(query string, args ...any) *sql.Row
 }
 
-// pqQuoteLiteral returns a string literal safe for inclusion in a PostgreSQL
-// query as a parameter.  The resulting string still needs to be wrapped in
-// single quotes in SQL (i.e. fmt.Sprintf(`'%s'`, pqQuoteLiteral("str"))).  See
-// quote_literal_internal() in postgresql/backend/utils/adt/quote.c:77.
-func pqQuoteLiteral(in string) string {
-	in = strings.ReplaceAll(in, `\`, `\\`)
-	in = strings.ReplaceAll(in, `'`, `''`)
-	return in
-}
-
 func isMemberOfRole(db QueryAble, role, member string) (bool, error) {
 	var _rez int
 	setOption := true
