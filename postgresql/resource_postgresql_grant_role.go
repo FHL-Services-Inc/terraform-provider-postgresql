@@ -17,6 +17,15 @@ const (
 	// the member/roleid OIDs so the filter can use the rolname index, instead
 	// of calling pg_get_userbyid() on every row of pg_auth_members in WHERE
 	// (which forces a sequential function scan on large installations).
+	//
+	// Since PostgreSQL 16 the grantor is part of a membership's identity, so
+	// the same (member, role) pair can have several rows, one per grantor,
+	// each with its own admin_option. For example, a role created by a
+	// CREATEROLE non-superuser is granted to its creator automatically
+	// (WITH ADMIN, grantor = bootstrap superuser). The row granted by
+	// current_user is the one this resource creates and revokes, so it is
+	// preferred; any other row is a fallback, ordered by grantor OID so the
+	// pick is stable. Before 16 there is at most one row per pair.
 	getGrantRoleQuery = `
 SELECT
   ur.rolname as role,
@@ -28,7 +37,11 @@ FROM
   JOIN pg_roles gr ON gr.oid = m.roleid
 WHERE
   ur.rolname = $1 AND
-  gr.rolname = $2;
+  gr.rolname = $2
+ORDER BY
+  (m.grantor = (SELECT oid FROM pg_roles WHERE rolname = current_user)) DESC,
+  m.grantor
+LIMIT 1;
 `
 )
 
