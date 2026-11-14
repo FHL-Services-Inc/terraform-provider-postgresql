@@ -609,6 +609,7 @@ func readRolePrivileges(db *DBConnection, d *schema.ResourceData) error {
 	}
 	defer closeGrantReadRows(rows)
 
+	var objectPrivileges []*schema.Set
 	checked := false
 	for rows.Next() {
 		var roleExists, schemaExists bool
@@ -643,15 +644,12 @@ func readRolePrivileges(db *DBConnection, d *schema.ResourceData) error {
 
 		privilegesSet := pgArrayToSet(privileges)
 		if !resourcePrivilegesEqual(privilegesSet, db, d) {
-			// If any object doesn't have the same privileges as saved in the state,
-			// we return its privileges to force an update.
 			log.Printf(
 				"[DEBUG] %s %s has not the expected privileges %v for role %s",
 				strings.ToTitle(objectType), objName.String, privileges, d.Get("role"),
 			)
-			d.Set("privileges", privilegesSet)
-			break
 		}
+		objectPrivileges = append(objectPrivileges, privilegesSet)
 	}
 	if err := rows.Err(); err != nil {
 		return err
@@ -660,7 +658,79 @@ func readRolePrivileges(db *DBConnection, d *schema.ResourceData) error {
 		return fmt.Errorf("could not read privileges: query returned no row")
 	}
 
+	// If any object doesn't have the same privileges as saved in the state,
+	// store a value that forces an update.
+	drifted, drift := grantReadDriftPrivileges(
+		objectPrivileges, d.Get("privileges").(*schema.Set),
+		func(granted, _ *schema.Set) bool { return resourcePrivilegesEqual(granted, db, d) },
+	)
+	if drift {
+		d.Set("privileges", drifted)
+	}
+
 	return nil
+}
+
+// partialPrivilegeSuffix marks, in the privileges the Read stores on drift, a
+// privilege that only some of the objects covered by the grant hold.
+const partialPrivilegeSuffix = " (on some objects only)"
+
+// grantReadDriftPrivileges decides what the Read stores in privileges for a
+// grant covering several objects, given each object's privileges and the
+// privileges currently stored (wanted). It returns drift=false when every
+// object matches (equal).
+//
+// Otherwise the stored value must differ from the wanted privileges and stay
+// the same on the next refresh, which compares against it. Storing the
+// privileges of the first object that differs does neither reliably: with one
+// table missing a privilege and another one matching, the next refresh finds
+// the matching table different from the stored value and stores the wanted
+// privileges back, so the drift vanishes from the plan. Instead:
+//   - when all objects hold the same privileges, those are stored;
+//   - otherwise the privileges all objects hold are stored as they are, and
+//     every privilege only some objects hold is stored with
+//     partialPrivilegeSuffix ("INSERT (on some objects only)").
+//
+// No object can hold a marked privilege, so a marked value never matches on
+// the next refresh and is recomputed identically, and no configuration can
+// equal it, so missing and extra privileges both stay visible until applied.
+// The plan shows the marked privileges going away; the REVOKE of the update
+// (which revokes the stored privileges, see createRevokeQuery) removes them
+// from every object.
+func grantReadDriftPrivileges(
+	objects []*schema.Set, wanted *schema.Set, equal func(granted, wanted *schema.Set) bool,
+) (*schema.Set, bool) {
+	drift := false
+	for _, o := range objects {
+		if !equal(o, wanted) {
+			drift = true
+			break
+		}
+	}
+	if !drift {
+		return nil, false
+	}
+
+	common, all := objects[0], objects[0]
+	for _, o := range objects[1:] {
+		common = common.Intersection(o)
+		all = all.Union(o)
+	}
+	stored := schema.NewSet(schema.HashString, common.List())
+	for _, p := range all.Difference(common).List() {
+		stored.Add(p.(string) + partialPrivilegeSuffix)
+	}
+	return stored, true
+}
+
+// privilegeNames returns the privileges of a stored privileges set without
+// the partialPrivilegeSuffix markers the Read may have added.
+func privilegeNames(privileges *schema.Set) *schema.Set {
+	names := schema.NewSet(schema.HashString, nil)
+	for _, p := range privileges.List() {
+		names.Add(strings.TrimSuffix(p.(string), partialPrivilegeSuffix))
+	}
+	return names
 }
 
 func createGrantQuery(d *schema.ResourceData, privileges []string) string {
@@ -782,7 +852,9 @@ func createRevokeQuery(getter ResourceSchemeGetter) string {
 		}
 	case "TABLE", "SEQUENCE", "FUNCTION", "PROCEDURE", "ROUTINE":
 		objects := getter("objects").(*schema.Set)
-		privileges := getter("privileges").(*schema.Set)
+		// The stored privileges may carry drift markers (see
+		// grantReadDriftPrivileges).
+		privileges := privilegeNames(getter("privileges").(*schema.Set))
 		if objects.Len() > 0 {
 			if privileges.Len() > 0 {
 				// Revoking specific privileges instead of all privileges
