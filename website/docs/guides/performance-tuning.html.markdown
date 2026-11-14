@@ -82,7 +82,7 @@ the plan time at 10 ms round-trip time from 30.2 s to 17.9 s.
   connections for the resources in progress. Measured peaks of concurrent
   provider connections (`-parallelism=10`):
 
-  | databases (plus the provider's `database`) | default | `max_idle_connections = 2` | `= 5` | `= 10` |
+  | databases with resources (pools: one more) | default | `max_idle_connections = 2` | `= 5` | `= 10` |
   |---|---:|---:|---:|---:|
   | 1 | 10 | 12 | 15 | 20 |
   | 4 | 10 | 16–18 | 26–29 | 34–39 |
