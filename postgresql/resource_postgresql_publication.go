@@ -310,7 +310,7 @@ func resourcePostgreSQLPublicationReadImpl(db *DBConnection, d *schema.ResourceD
 	}
 
 	query := fmt.Sprintf("SELECT %s FROM pg_catalog.pg_publication as p join pg_catalog.pg_roles as r on p.pubowner = r.oid WHERE pubname = $1", strings.Join(columns, ", "))
-	err = dbc.QueryRow(query, pqQuoteLiteral(PublicationName)).Scan(values...)
+	err = dbc.QueryRow(query, PublicationName).Scan(values...)
 
 	switch {
 	case err == sql.ErrNoRows:
@@ -329,7 +329,7 @@ func resourcePostgreSQLPublicationReadImpl(db *DBConnection, d *schema.ResourceD
 		`FROM pg_catalog.pg_publication_tables ` +
 		`WHERE pubname = $1`
 
-	rows, err := dbc.Query(query, pqQuoteLiteral(PublicationName))
+	rows, err := dbc.Query(query, PublicationName)
 	if err != nil {
 		return fmt.Errorf("could not get publication tables: %w", err)
 	}

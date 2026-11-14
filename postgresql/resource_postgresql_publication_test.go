@@ -8,6 +8,7 @@ import (
 
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/resource"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/terraform"
+	"github.com/lib/pq"
 )
 
 func testAccCheckPostgresqlPublicationDestroy(s *terraform.State) error {
@@ -814,6 +815,68 @@ resource "postgresql_publication" "test" {
 			{
 				Config:      testAccPostgresqlPublicationDuplicateKeys,
 				ExpectError: regexp.MustCompile("'insert' is duplicated for attribute `tables`")},
+		},
+	})
+}
+
+// A publication whose name contains a single quote and a backslash must be
+// found by Read: import works and the next plan shows no drift. The
+// publication is created out of band because CREATE PUBLICATION does not
+// quote the name yet (#122).
+func TestAccPostgresqlPublication_QuotedName(t *testing.T) {
+	skipIfNotAcc(t)
+
+	dbSuffix, teardown := setupTestDatabase(t, true, true)
+	defer teardown()
+
+	dbName, _ := getTestDBNames(dbSuffix)
+	const pubName = `we'ird\name`
+	dbConfig := getTestConfig(t)
+
+	config := fmt.Sprintf(`
+resource "postgresql_publication" "quoted" {
+	name     = %q
+	database = %q
+}
+`, pubName, dbName)
+
+	resource.Test(t, resource.TestCase{
+		PreCheck: func() {
+			testAccPreCheck(t)
+			testCheckCompatibleVersion(t, featurePublication)
+			testSuperuserPreCheck(t)
+		},
+		Providers:    testAccProviders,
+		CheckDestroy: testAccCheckPostgresqlPublicationDestroy,
+		Steps: []resource.TestStep{
+			{
+				PreConfig: func() {
+					dbExecute(t, dbConfig.connStr(dbName),
+						fmt.Sprintf("CREATE PUBLICATION %s", pq.QuoteIdentifier(pubName)))
+				},
+				Config:             config,
+				ResourceName:       "postgresql_publication.quoted",
+				ImportState:        true,
+				ImportStateId:      dbName + "." + pubName,
+				ImportStatePersist: true,
+				ImportStateCheck: func(states []*terraform.InstanceState) error {
+					if len(states) != 1 {
+						return fmt.Errorf("expected 1 imported state, got %d", len(states))
+					}
+					attrs := states[0].Attributes
+					if attrs[pubNameAttr] != pubName {
+						return fmt.Errorf("imported name = %q, want %q", attrs[pubNameAttr], pubName)
+					}
+					if attrs[pubDatabaseAttr] != dbName {
+						return fmt.Errorf("imported database = %q, want %q", attrs[pubDatabaseAttr], dbName)
+					}
+					return nil
+				},
+			},
+			{
+				Config:   config,
+				PlanOnly: true,
+			},
 		},
 	})
 }

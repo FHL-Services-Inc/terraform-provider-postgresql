@@ -607,3 +607,94 @@ resource "postgresql_role" "switch_role" {
 		},
 	})
 }
+
+// Passwords containing backslashes and single quotes must be stored exactly as
+// configured, both on CREATE ROLE and on ALTER ROLE ... PASSWORD.
+func TestAccPostgresqlRole_PasswordWithBackslashAndQuote(t *testing.T) {
+	const (
+		createPassword = `pa'ss\word`
+		updatePassword = `n\\ew'pa''ss\`
+	)
+	config := func(password string) string {
+		return fmt.Sprintf(`
+resource "postgresql_role" "quoted_pwd_role" {
+  name     = "quoted_pwd_role"
+  login    = true
+  password = %q
+}
+`, password)
+	}
+
+	resource.Test(t, resource.TestCase{
+		PreCheck: func() {
+			testAccPreCheck(t)
+		},
+		Providers:    testAccProviders,
+		CheckDestroy: testAccCheckPostgresqlRoleDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config: config(createPassword),
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr("postgresql_role.quoted_pwd_role", "password", createPassword),
+					testAccCheckRoleCanLogin(t, "quoted_pwd_role", createPassword),
+				),
+			},
+			{
+				Config: config(updatePassword),
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr("postgresql_role.quoted_pwd_role", "password", updatePassword),
+					testAccCheckRoleCanLogin(t, "quoted_pwd_role", updatePassword),
+				),
+			},
+		},
+	})
+}
+
+func TestRolePasswordClause(t *testing.T) {
+	cases := map[string]string{
+		"simple":     "PASSWORD 'simple'",
+		`it's`:       "PASSWORD 'it''s'",
+		`pa'ss\word`: `PASSWORD  E'pa''ss\\word'`,
+		`trailing\`:  `PASSWORD  E'trailing\\'`,
+		`\\double\\`: `PASSWORD  E'\\\\double\\\\'`,
+	}
+	for in, want := range cases {
+		if got := rolePasswordClause(in); got != want {
+			t.Errorf("rolePasswordClause(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// The literal built for a password must evaluate back to the configured value
+// whatever standard_conforming_strings is set to on the server.
+func TestAccRolePasswordClauseStandardConformingStrings(t *testing.T) {
+	skipIfNotAcc(t)
+
+	config := getTestConfig(t)
+	db, err := sql.Open("postgres", config.connStr("postgres"))
+	if err != nil {
+		t.Fatalf("could not open connection: %v", err)
+	}
+	defer closeDB(t, db)
+	conn, err := db.Conn(t.Context())
+	if err != nil {
+		t.Fatalf("could not get connection: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	for _, scs := range []string{"on", "off"} {
+		if _, err := conn.ExecContext(t.Context(), "SET standard_conforming_strings = "+scs); err != nil {
+			t.Fatalf("could not set standard_conforming_strings = %s: %v", scs, err)
+		}
+		for _, password := range []string{"simple", `it's`, `pa'ss\word`, `trailing\`, `\\double\\`} {
+			literal := strings.TrimPrefix(rolePasswordClause(password), "PASSWORD ")
+			var got string
+			if err := conn.QueryRowContext(t.Context(), "SELECT "+literal).Scan(&got); err != nil {
+				t.Fatalf("standard_conforming_strings = %s: SELECT %s: %v", scs, literal, err)
+			}
+			if got != password {
+				t.Errorf("standard_conforming_strings = %s: literal %s evaluates to %q, want %q", scs, literal, got, password)
+			}
+		}
+	}
+}
