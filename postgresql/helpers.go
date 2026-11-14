@@ -1,7 +1,9 @@
 package postgresql
 
 import (
+	"context"
 	"database/sql"
+	"database/sql/driver"
 	"errors"
 	"fmt"
 	"log"
@@ -594,6 +596,115 @@ func pgLockRole(txn *sql.Tx, role string) error {
 	}
 
 	return nil
+}
+
+// singleConn runs queries on one connection pinned from a pool, so a caller
+// holding session state on it (advisory locks) never needs a second connection.
+type singleConn struct {
+	ctx  context.Context
+	conn *sql.Conn
+}
+
+func (c *singleConn) Exec(query string, args ...any) (sql.Result, error) {
+	return c.conn.ExecContext(c.ctx, query, args...)
+}
+
+func (c *singleConn) Query(query string, args ...any) (*sql.Rows, error) {
+	return c.conn.QueryContext(c.ctx, query, args...)
+}
+
+func (c *singleConn) QueryRow(query string, args ...any) *sql.Row {
+	return c.conn.QueryRowContext(c.ctx, query, args...)
+}
+
+func (c *singleConn) Begin() (*sql.Tx, error) {
+	return c.conn.BeginTx(c.ctx, nil)
+}
+
+// lockRoleConn takes a single connection from db and acquires on it the
+// advisory locks pgLockRole takes on role and its members. Everything that has
+// to run under the lock must use the returned connection; release (to be
+// deferred) unlocks and gives the connection back.
+//
+// pgLockRole needs a transaction, so a caller that also runs statements outside
+// of it (CREATE/DROP DATABASE cannot run in a transaction block) would need a
+// second connection from the same pool while the first one is pinned by the
+// lock transaction, and waits forever once the pool is exhausted
+// (max_connections). Here the locks are session-level ones on the same keys:
+// session and transaction-level advisory locks on the same key conflict with
+// each other, so this still serializes with pgLockRole callers.
+//
+// If the session cannot be cleaned up, the connection is discarded instead of
+// going back to the pool.
+func lockRoleConn(db *DBConnection, role string) (*singleConn, func(), error) {
+	ctx := context.Background()
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		return nil, nil, fmt.Errorf("could not get a database connection: %w", err)
+	}
+	c := &singleConn{ctx: ctx, conn: conn}
+
+	if err := pgLockRoleSession(c, role); err != nil {
+		// The session may hold part of the locks or still have
+		// statement_timeout disabled.
+		discardConn(conn)
+		return nil, nil, err
+	}
+
+	release := func() {
+		if _, err := c.Exec("SELECT pg_advisory_unlock_all()"); err != nil {
+			log.Printf("[ERR] could not release advisory locks for role %s, discarding the connection: %v", role, err)
+			discardConn(conn)
+			return
+		}
+		if err := conn.Close(); err != nil {
+			log.Printf("[ERR] could not release database connection: %v", err)
+		}
+	}
+	return c, release, nil
+}
+
+// pgLockRoleSession is the session-level counterpart of pgLockRole: same lock
+// keys (the role OID and the OIDs of its members), held until released with
+// pg_advisory_unlock_all. statement_timeout is disabled only while waiting for
+// the locks.
+func pgLockRoleSession(conn QueryAble, role string) error {
+	// Disable statement timeout for this connection otherwise the lock could fail
+	if _, err := conn.Exec("SET statement_timeout = 0"); err != nil {
+		return fmt.Errorf("could not disable statement_timeout: %w", err)
+	}
+	if _, err := conn.Exec("SELECT pg_advisory_lock(oid::bigint) FROM pg_roles WHERE rolname = $1", role); err != nil {
+		return fmt.Errorf("could not get advisory lock for role %s: %w", role, err)
+	}
+
+	if _, err := conn.Exec(
+		"SELECT pg_advisory_lock(member::bigint) FROM pg_auth_members JOIN pg_roles ON roleid = pg_roles.oid WHERE rolname = $1",
+		role,
+	); err != nil {
+		return fmt.Errorf("could not get advisory lock for members of role %s: %w", role, err)
+	}
+
+	if _, err := conn.Exec("RESET statement_timeout"); err != nil {
+		return fmt.Errorf("could not restore statement_timeout: %w", err)
+	}
+
+	return nil
+}
+
+// discardConn closes the underlying connection of conn instead of returning
+// it to the pool (which is all sql.Conn.Close does), for sessions left in an
+// unknown state.
+func discardConn(conn *sql.Conn) {
+	_ = conn.Raw(func(any) error { return driver.ErrBadConn })
+}
+
+// revokeRoleMembershipDeferred revokes a membership granted for the duration
+// of an operation, to be deferred. A failure is logged and does not fail the
+// operation.
+func revokeRoleMembershipDeferred(db QueryAble, role, member string) {
+	if _, err := revokeRoleMembership(db, role, member); err != nil {
+		log.Printf("[ERR] could not revoke role %s from %s: %v", role, member, err)
+	}
 }
 
 // Lock a database and all his members to avoid concurrent updates on some resources
