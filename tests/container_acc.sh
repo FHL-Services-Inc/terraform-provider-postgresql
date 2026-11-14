@@ -127,6 +127,10 @@ END
 $$;
 ALTER DATABASE postgres OWNER TO rds;
 ALTER SCHEMA public OWNER TO rds;
+-- Lets the non-superuser create foreign servers and user mappings
+-- (TestAccPostgresqlUserMapping_NonSuperuser), as on RDS.
+CREATE EXTENSION IF NOT EXISTS postgres_fdw;
+GRANT USAGE ON FOREIGN DATA WRAPPER postgres_fdw TO rds;
 EOS
     psql_exec template1 <<'EOS'
 ALTER SCHEMA public OWNER TO rds;

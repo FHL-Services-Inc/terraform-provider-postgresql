@@ -22,6 +22,9 @@ type stmtCountingDriver struct {
 	begins  int
 	queries []string
 	openErr error
+	// respond, when set, answers each query instead of the default empty
+	// result set.
+	respond func(query string) (driver.Rows, error)
 }
 
 func (d *stmtCountingDriver) reset(openErr error) {
@@ -30,6 +33,7 @@ func (d *stmtCountingDriver) reset(openErr error) {
 	d.begins = 0
 	d.queries = nil
 	d.openErr = openErr
+	d.respond = nil
 }
 
 func (d *stmtCountingDriver) counts() (int, []string) {
@@ -65,6 +69,9 @@ func (c *stmtCountingConn) QueryContext(_ context.Context, query string, _ []dri
 	c.driver.mu.Lock()
 	defer c.driver.mu.Unlock()
 	c.driver.queries = append(c.driver.queries, query)
+	if c.driver.respond != nil {
+		return c.driver.respond(query)
+	}
 	return emptyRows{}, nil
 }
 
