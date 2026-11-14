@@ -431,18 +431,6 @@ func startTransaction(client *Client, database string) (*sql.Tx, error) {
 	return txn, nil
 }
 
-func dbExists(db QueryAble, dbname string) (bool, error) {
-	err := db.QueryRow("SELECT datname FROM pg_database WHERE datname=$1", dbname).Scan(&dbname)
-	switch {
-	case err == sql.ErrNoRows:
-		return false, nil
-	case err != nil:
-		return false, fmt.Errorf("could not check if database exists: %w", err)
-	}
-
-	return true, nil
-}
-
 func roleExists(txn *sql.Tx, rolname string) (bool, error) {
 	_, exists, err := roleOIDAndExists(txn, rolname)
 	if err != nil {
