@@ -817,3 +817,56 @@ resource "postgresql_publication" "test" {
 		},
 	})
 }
+
+// A publication whose name contains a single quote and a backslash must be
+// created, owned by a similarly named role, read back after create (not
+// reported as gone) and produce no drift.
+func TestAccPostgresqlPublication_QuotedName(t *testing.T) {
+	skipIfNotAcc(t)
+
+	dbSuffix, teardown := setupTestDatabase(t, true, true)
+	defer teardown()
+
+	dbName, _ := getTestDBNames(dbSuffix)
+	const (
+		pubName   = `we'ird\name`
+		ownerName = `pub'owner\`
+	)
+
+	config := fmt.Sprintf(`
+resource "postgresql_role" "quoted_owner" {
+	name = %q
+}
+
+resource "postgresql_publication" "quoted" {
+	name     = %q
+	database = %q
+	owner    = postgresql_role.quoted_owner.name
+}
+`, ownerName, pubName, dbName)
+
+	resource.Test(t, resource.TestCase{
+		PreCheck: func() {
+			testAccPreCheck(t)
+			testCheckCompatibleVersion(t, featurePublication)
+			testSuperuserPreCheck(t)
+		},
+		Providers:    testAccProviders,
+		CheckDestroy: testAccCheckPostgresqlPublicationDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config: config,
+				Check: resource.ComposeTestCheckFunc(
+					testAccCheckPostgresqlPublicationExists("postgresql_publication.quoted"),
+					resource.TestCheckResourceAttr("postgresql_publication.quoted", "name", pubName),
+					resource.TestCheckResourceAttr("postgresql_publication.quoted", pubDatabaseAttr, dbName),
+					resource.TestCheckResourceAttr("postgresql_publication.quoted", pubOwnerAttr, ownerName),
+				),
+			},
+			{
+				Config:   config,
+				PlanOnly: true,
+			},
+		},
+	})
+}

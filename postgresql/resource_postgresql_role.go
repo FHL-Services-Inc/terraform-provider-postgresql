@@ -294,8 +294,7 @@ func resourcePostgreSQLRoleCreate(db *DBConnection, d *schema.ResourceData) erro
 				} else {
 					createOpts = append(createOpts, "UNENCRYPTED")
 				}
-				createOpts = append(createOpts,
-					fmt.Sprintf("%s '%s'", opt.sqlKey, pqQuoteLiteral(val)))
+				createOpts = append(createOpts, rolePasswordClause(val))
 			}
 
 		case roleValidUntilAttr:
@@ -304,7 +303,7 @@ func resourcePostgreSQLRoleCreate(db *DBConnection, d *schema.ResourceData) erro
 					fmt.Sprintf("%s 'infinity'", opt.sqlKey))
 			} else {
 				createOpts = append(createOpts,
-					fmt.Sprintf("%s '%s'", opt.sqlKey, pqQuoteLiteral(val)))
+					fmt.Sprintf("%s %s", opt.sqlKey, pq.QuoteLiteral(val)))
 			}
 
 		default:
@@ -791,12 +790,20 @@ func setRolePassword(txn *sql.Tx, d *schema.ResourceData) error {
 		return nil
 	}
 
-	sql := fmt.Sprintf("ALTER ROLE %s PASSWORD '%s'", pq.QuoteIdentifier(roleName), pqQuoteLiteral(password))
+	sql := fmt.Sprintf("ALTER ROLE %s %s", pq.QuoteIdentifier(roleName), rolePasswordClause(password))
 	if _, err := txn.Exec(sql); err != nil {
 		return fmt.Errorf("error updating role password: %w", err)
 	}
 
 	return nil
+}
+
+// rolePasswordClause returns the PASSWORD clause of CREATE/ALTER ROLE for a
+// clear-text password. pq.QuoteLiteral produces an escape string literal
+// (E'...') when the password contains a backslash, so the value is stored as
+// configured whatever standard_conforming_strings is set to.
+func rolePasswordClause(password string) string {
+	return "PASSWORD " + pq.QuoteLiteral(password)
 }
 
 func setRoleBypassRLS(db *DBConnection, txn *sql.Tx, d *schema.ResourceData) error {
@@ -964,7 +971,7 @@ func setRoleValidUntil(txn *sql.Tx, d *schema.ResourceData) error {
 	}
 
 	roleName := d.Get(roleNameAttr).(string)
-	sql := fmt.Sprintf("ALTER ROLE %s VALID UNTIL '%s'", pq.QuoteIdentifier(roleName), pqQuoteLiteral(validUntil))
+	sql := fmt.Sprintf("ALTER ROLE %s VALID UNTIL %s", pq.QuoteIdentifier(roleName), pq.QuoteLiteral(validUntil))
 	if _, err := txn.Exec(sql); err != nil {
 		return fmt.Errorf("error updating role VALID UNTIL: %w", err)
 	}
