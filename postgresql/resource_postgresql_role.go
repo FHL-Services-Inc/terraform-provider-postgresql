@@ -709,13 +709,18 @@ func resourcePostgreSQLRoleUpdate(db *DBConnection, d *schema.ResourceData) erro
 		return err
 	}
 
-	// applying roles: let's revoke all / grant the right ones
-	if err = revokeRoles(txn, d); err != nil {
-		return err
-	}
+	// applying roles: let's revoke all / grant the right ones.
+	// Only when roles changed: re-applying an unchanged list would also revoke
+	// memberships granted by postgresql_grant_role since the last refresh (or
+	// drop their ADMIN OPTION), e.g. when roles is in ignore_changes.
+	if d.HasChange(roleRolesAttr) {
+		if err = revokeRoles(txn, d); err != nil {
+			return err
+		}
 
-	if err = grantRoles(txn, d); err != nil {
-		return err
+		if err = grantRoles(txn, d); err != nil {
+			return err
+		}
 	}
 
 	if err = alterSearchPath(txn, d); err != nil {

@@ -24,7 +24,7 @@ resource "postgresql_grant_role" "grant_root" {
 }
 ```
 
-~> **Note:** If you use `postgresql_grant_role` for a role that you also manage with a `postgresql_role` resource, you need to ignore the changes of the `roles` attribute in the `postgresql_role` resource or they will fight over what your role grants should be. e.g.:
+~> **Note:** If you use `postgresql_grant_role` for a role that you also manage with a `postgresql_role` resource, you need to ignore the changes of the `roles` attribute in the `postgresql_role` resource or they will fight over what your role grants should be. `postgresql_role` only rewrites the memberships of the role when `roles` changes, and both resources lock the member role while changing its memberships, so they can be changed in the same apply. e.g.:
 ```hcl
 resource "postgresql_role" "bob" {
   name = "bob"

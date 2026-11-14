@@ -87,6 +87,10 @@ func resourcePostgreSQLGrantRoleCreate(db *DBConnection, d *schema.ResourceData)
 	}
 	defer deferredRollback(txn)
 
+	if err = lockGrantRoleMember(txn, d); err != nil {
+		return err
+	}
+
 	// Revoke the granted roles before granting them again.
 	if err = revokeRole(txn, d); err != nil {
 		return err
@@ -119,6 +123,10 @@ func resourcePostgreSQLGrantRoleDelete(db *DBConnection, d *schema.ResourceData)
 	}
 	defer deferredRollback(txn)
 
+	if err = lockGrantRoleMember(txn, d); err != nil {
+		return err
+	}
+
 	if err = revokeRole(txn, d); err != nil {
 		return err
 	}
@@ -128,6 +136,16 @@ func resourcePostgreSQLGrantRoleDelete(db *DBConnection, d *schema.ResourceData)
 	}
 
 	return nil
+}
+
+// lockGrantRoleMember takes the advisory lock of the member role (the role
+// receiving grant_role), the same key postgresql_role takes in pgLockRole
+// before rewriting that role's memberships, so a grant/revoke here and a
+// roles update of the same member never interleave within one apply.
+// pgLockRole runs on txn and locks the role before its members, in the same
+// order as every other caller.
+func lockGrantRoleMember(txn *sql.Tx, d *schema.ResourceData) error {
+	return pgLockRole(txn, d.Get("role").(string))
 }
 
 func readGrantRole(db QueryAble, d *schema.ResourceData) error {
