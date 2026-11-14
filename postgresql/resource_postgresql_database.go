@@ -180,7 +180,7 @@ func createDatabase(db *DBConnection, d *schema.ResourceData) error {
 	case ok && strings.ToUpper(v.(string)) == "DEFAULT":
 		fmt.Fprintf(b, " ENCODING DEFAULT")
 	case ok:
-		fmt.Fprintf(b, " ENCODING '%s' ", pqQuoteLiteral(v.(string)))
+		fmt.Fprintf(b, " ENCODING %s ", pq.QuoteLiteral(v.(string)))
 	case v.(string) == "":
 		fmt.Fprint(b, ` ENCODING 'UTF8'`)
 	}
@@ -191,7 +191,7 @@ func createDatabase(db *DBConnection, d *schema.ResourceData) error {
 	case ok && strings.ToUpper(v.(string)) == "DEFAULT":
 		fmt.Fprintf(b, " LC_COLLATE DEFAULT")
 	case ok:
-		fmt.Fprintf(b, " LC_COLLATE '%s' ", pqQuoteLiteral(v.(string)))
+		fmt.Fprintf(b, " LC_COLLATE %s ", pq.QuoteLiteral(v.(string)))
 	}
 
 	// Don't specify LC_CTYPE if user didn't specify it
@@ -200,7 +200,7 @@ func createDatabase(db *DBConnection, d *schema.ResourceData) error {
 	case ok && strings.ToUpper(v.(string)) == "DEFAULT":
 		fmt.Fprintf(b, " LC_CTYPE DEFAULT")
 	case ok:
-		fmt.Fprintf(b, " LC_CTYPE '%s' ", pqQuoteLiteral(v.(string)))
+		fmt.Fprintf(b, " LC_CTYPE %s ", pq.QuoteLiteral(v.(string)))
 	}
 
 	switch v, ok := d.GetOk(dbTablespaceAttr); {
@@ -612,7 +612,7 @@ func terminateBConnections(db *DBConnection, dbName string) error {
 	if db.featureSupported(featurePid) {
 		pid = "pid"
 	}
-	terminateSql = fmt.Sprintf("SELECT pg_terminate_backend(%s) FROM pg_stat_activity WHERE datname = '%s' AND %s <> pg_backend_pid()", pid, dbName, pid)
+	terminateSql = fmt.Sprintf("SELECT pg_terminate_backend(%s) FROM pg_stat_activity WHERE datname = %s AND %s <> pg_backend_pid()", pid, pq.QuoteLiteral(dbName), pid)
 	if _, err := db.Exec(terminateSql); err != nil {
 		return fmt.Errorf("error terminating database connections: %w", err)
 	}

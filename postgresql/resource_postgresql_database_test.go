@@ -556,3 +556,28 @@ resource "postgresql_database" "mydb_default_owner" {
 }
 
 `
+
+// A database whose name contains a single quote and a backslash must be
+// created and dropped (dropping terminates its connections by name).
+func TestAccPostgresqlDatabase_QuotedName(t *testing.T) {
+	const dbName = `tf_tests_we'ird\db`
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:     func() { testAccPreCheck(t) },
+		Providers:    testAccProviders,
+		CheckDestroy: testAccCheckPostgresqlDatabaseDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config: fmt.Sprintf(`
+resource "postgresql_database" "quoted" {
+  name = %q
+}
+`, dbName),
+				Check: resource.ComposeTestCheckFunc(
+					testAccCheckPostgresqlDatabaseExists("postgresql_database.quoted"),
+					resource.TestCheckResourceAttr("postgresql_database.quoted", "name", dbName),
+				),
+			},
+		},
+	})
+}
