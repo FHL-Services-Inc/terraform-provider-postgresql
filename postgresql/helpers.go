@@ -528,23 +528,99 @@ SELECT rolname
 	return owner, nil
 }
 
-// getTablesOwner retrieves all the owners for all the tables in the specified schema.
-func getTablesOwner(db QueryAble, schemaName string) ([]string, error) {
-	rows, err := db.Query(
-		"SELECT DISTINCT tableowner FROM pg_tables WHERE schemaname = $1",
-		schemaName,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("error while looking for owners of tables in schema '%s': %w", schemaName, err)
+// ownerRelkinds lists the pg_class.relkind values a GRANT of the given
+// object_type can touch. ON TABLE (and ON ALL TABLES IN SCHEMA) also covers
+// views, materialized views and foreign tables; column grants are on tables.
+var ownerRelkinds = map[string][]string{
+	"table":    {"r", "p", "v", "m", "f"},
+	"column":   {"r", "p", "v", "m", "f"},
+	"sequence": {"S"},
+}
+
+// ownerProkinds lists the pg_proc.prokind values a GRANT of the given
+// object_type can touch (ALL FUNCTIONS covers aggregates and window functions
+// but not procedures; ALL ROUTINES covers everything).
+var ownerProkinds = map[string][]string{
+	"function":  {"f", "a", "w"},
+	"procedure": {"p"},
+	"routine":   {"f", "a", "w", "p"},
+}
+
+// buildObjectsOwnersQuery returns the query listing the distinct owners of the
+// objects of objectType in schemaName. When objects is not empty only those
+// objects are considered; function-like objects may carry an argument
+// signature, which is stripped since owners are matched by name.
+func buildObjectsOwnersQuery(schemaName, objectType string, objects []string) (string, []any) {
+	var query string
+	var nameColumn string
+	var kinds []string
+
+	if relkinds, ok := ownerRelkinds[objectType]; ok {
+		kinds = relkinds
+		nameColumn = "pg_class.relname"
+		query = `
+SELECT DISTINCT pg_roles.rolname
+FROM pg_class
+JOIN pg_namespace ON pg_namespace.oid = pg_class.relnamespace
+JOIN pg_roles ON pg_roles.oid = pg_class.relowner
+WHERE pg_namespace.nspname = $1 AND pg_class.relkind = ANY($2)`
+	} else {
+		kinds = ownerProkinds[objectType]
+		nameColumn = "pg_proc.proname"
+		query = `
+SELECT DISTINCT pg_roles.rolname
+FROM pg_proc
+JOIN pg_namespace ON pg_namespace.oid = pg_proc.pronamespace
+JOIN pg_roles ON pg_roles.oid = pg_proc.proowner
+WHERE pg_namespace.nspname = $1 AND pg_proc.prokind = ANY($2)`
 	}
+	args := []any{schemaName, pq.Array(kinds)}
+
+	if len(objects) > 0 {
+		names := make([]string, 0, len(objects))
+		for _, object := range objects {
+			if i := strings.Index(object, "("); i >= 0 {
+				object = strings.TrimSpace(object[:i])
+			}
+			names = append(names, object)
+		}
+		query += " AND " + nameColumn + " = ANY($3)"
+		args = append(args, pq.Array(names))
+	}
+
+	return query, args
+}
+
+// getObjectsOwners retrieves the owners of the objects of objectType in the
+// specified schema (only the listed objects when objects is not empty).
+func getObjectsOwners(db QueryAble, schemaName, objectType string, objects []string) ([]string, error) {
+	if _, ok := ownerRelkinds[objectType]; !ok {
+		if _, ok := ownerProkinds[objectType]; !ok {
+			return nil, fmt.Errorf("cannot look up owners for object type %q", objectType)
+		}
+	}
+
+	query, args := buildObjectsOwnersQuery(schemaName, objectType, objects)
+	rows, err := db.Query(query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("error while looking for owners of %ss in schema '%s': %w", objectType, schemaName, err)
+	}
+	defer func() {
+		if err := rows.Close(); err != nil {
+			log.Printf("[WARN] could not close rows while looking for owners in schema '%s': %v", schemaName, err)
+		}
+	}()
 
 	var owners []string
 	for rows.Next() {
 		var owner string
 		if err := rows.Scan(&owner); err != nil {
-			return nil, fmt.Errorf("could not scan tables owner: %w", err)
+			return nil, fmt.Errorf("could not scan %s owner: %w", objectType, err)
 		}
 		owners = append(owners, owner)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error while looking for owners of %ss in schema '%s': %w", objectType, schemaName, err)
 	}
 
 	return owners, nil
