@@ -3,8 +3,11 @@ package postgresql
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
+	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/url"
 	"time"
@@ -146,14 +149,21 @@ func awsPostgresConfig(dsn string) (pq.Config, error) {
 // rdsTLSDialer is the dialer of gocloud's awspostgres, which keeps it
 // private: it sends the PostgreSQL SSLRequest itself and upgrades the
 // connection to TLS, verifying the server against the RDS CA bundle.
-// Like gocloud's, it dials directly (no proxy) and fetches the CA bundle on
-// each dial.
+// Like gocloud's, it dials directly (no proxy). Unlike gocloud's, the
+// provider's dialer takes the bundle from defaultRDSCertPool instead of
+// downloading it on each dial; if the server's CA isn't in the cached
+// bundle, the bundle is refetched and the dial retried once.
 type rdsTLSDialer struct {
 	certs rds.CertPoolProvider
 }
 
+// certPoolInvalidator is implemented by rdsCertPoolCache.
+type certPoolInvalidator interface {
+	invalidate(pool *x509.CertPool) bool
+}
+
 func newRDSTLSDialer() rdsTLSDialer {
-	return rdsTLSDialer{certs: new(rds.CertFetcher)}
+	return rdsTLSDialer{certs: defaultRDSCertPool}
 }
 
 func (d rdsTLSDialer) dial(ctx context.Context, network, address string) (net.Conn, error) {
@@ -161,10 +171,28 @@ func (d rdsTLSDialer) dial(ctx context.Context, network, address string) (net.Co
 	if err != nil {
 		return nil, fmt.Errorf("awspostgres: parse address: %w", err)
 	}
-	certPool, err := d.certs.RDSCertPool(ctx)
-	if err != nil {
-		return nil, err
+	for retried := false; ; retried = true {
+		certPool, err := d.certs.RDSCertPool(ctx)
+		if err != nil {
+			return nil, err
+		}
+		conn, err := dialRDSTLS(ctx, network, address, host, certPool)
+		if err == nil {
+			return conn, nil
+		}
+
+		var unknownAuthority x509.UnknownAuthorityError
+		invalidator, ok := d.certs.(certPoolInvalidator)
+		if retried || !ok || !errors.As(err, &unknownAuthority) || !invalidator.invalidate(certPool) {
+			return nil, err
+		}
+		log.Printf("[DEBUG] %s: server certificate signed by a CA unknown to the cached RDS CA bundle, refetching it", address)
 	}
+}
+
+// dialRDSTLS opens a TLS connection to a PostgreSQL server, verified against
+// certPool.
+func dialRDSTLS(ctx context.Context, network, address, host string, certPool *x509.CertPool) (net.Conn, error) {
 	conn, err := new(net.Dialer).DialContext(ctx, network, address)
 	if err != nil {
 		return nil, err
