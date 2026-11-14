@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"regexp"
+	"slices"
 	"strings"
 	"unicode"
 
@@ -1091,9 +1092,10 @@ func readRolePrivilegesFromSnapshot(snap *catalogSnapshot, db *DBConnection, d *
 		ns, ok := snap.namespaces[schemaName]
 		schemaExists = ok
 		// candidates are the routines of the schema (no prokind filter, as
-		// the direct Read) or its relations, filtered by relkind.
+		// the direct Read) or its relations, filtered by the relkinds the
+		// object type covers (ownerRelkinds, as the direct Read).
 		var candidates []catalogObject
-		var relkind string
+		var relkinds []string
 		if ok {
 			switch objectType {
 			case "function", "procedure", "routine":
@@ -1103,13 +1105,13 @@ func readRolePrivilegesFromSnapshot(snap *catalogSnapshot, db *DBConnection, d *
 				}
 			default:
 				candidates = snap.relations[ns.oid]
-				relkind = objectTypes[objectType]
+				relkinds = ownerRelkinds[objectType]
 			}
 		}
 
 		for i := 0; i < len(candidates); i++ {
 			object := candidates[i]
-			if relkind != "" && object.kind != relkind {
+			if relkinds != nil && !slices.Contains(relkinds, object.kind) {
 				continue
 			}
 			if objects.Len() > 0 && !objects.Contains(object.name) {

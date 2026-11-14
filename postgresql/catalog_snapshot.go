@@ -26,7 +26,8 @@ var catalogSnapshotMaxBytes = 64 << 20
 //	r: roles            (oid, 0, rolname, NULL, NULL)
 //	n: namespaces       (oid, 0, nspname, NULL, nspacl)
 //	c: relations        (0, relnamespace, relname, relkind, relacl) for the
-//	   relkinds the grant Read handles (tables and sequences)
+//	   relkinds the grant Read handles (ownerRelkinds: tables, partitioned
+//	   tables, views, materialized views, foreign tables and sequences)
 //	d: default ACLs     (defaclrole, defaclnamespace, NULL, defaclobjtype, defaclacl)
 //	D: this database    (0, 0, datname, NULL, datacl)
 //
@@ -35,7 +36,7 @@ var catalogSnapshotMaxBytes = 64 << 20
 // raw read on large catalogs.
 const catalogSnapshotQuery = `SELECT 'r', oid::bigint, 0::bigint, rolname::text, NULL::text, NULL::text FROM pg_catalog.pg_roles
 UNION ALL SELECT 'n', oid::bigint, 0::bigint, nspname::text, NULL, nspacl::text FROM pg_catalog.pg_namespace
-UNION ALL SELECT 'c', 0::bigint, relnamespace::bigint, relname::text, relkind::text, relacl::text FROM pg_catalog.pg_class WHERE relkind IN ('r', 'S')
+UNION ALL SELECT 'c', 0::bigint, relnamespace::bigint, relname::text, relkind::text, relacl::text FROM pg_catalog.pg_class WHERE relkind IN ('r', 'p', 'v', 'm', 'f', 'S')
 UNION ALL SELECT 'd', defaclrole::bigint, defaclnamespace::bigint, NULL, defaclobjtype::text, defaclacl::text FROM pg_catalog.pg_default_acl
 UNION ALL SELECT 'D', 0::bigint, 0::bigint, datname::text, NULL, datacl::text FROM pg_catalog.pg_database WHERE datname = current_database()
 `
@@ -77,7 +78,8 @@ type catalogSnapshot struct {
 
 	roles      map[string]uint32
 	namespaces map[string]catalogNamespace
-	// relations holds the tables and sequences of each namespace, by name.
+	// relations holds the relations of each namespace that a table or
+	// sequence grant covers (ownerRelkinds), by name.
 	relations  map[uint32][]catalogObject
 	defaultACL map[defaultACLKey]string
 	datACL     sql.NullString
