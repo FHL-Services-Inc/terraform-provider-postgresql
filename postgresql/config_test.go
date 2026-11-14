@@ -206,7 +206,7 @@ func TestConfigEvictDBConnection(t *testing.T) {
 		}
 		dsn := c.connStr(database)
 		dbRegistryLock.Lock()
-		dbRegistry[dsn] = &DBConnection{DB: db, client: c.NewClient(database)}
+		dbRegistry[dsn] = &DBConnection{DB: db, client: c.NewClient(database), pool: &dbPool{config: *c}}
 		dbRegistryLock.Unlock()
 		t.Cleanup(func() {
 			dbRegistryLock.Lock()

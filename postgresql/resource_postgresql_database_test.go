@@ -566,8 +566,9 @@ resource "postgresql_database" "mydb_default_owner" {
 func TestAccPostgresqlDatabase_DropWithIdleConnections(t *testing.T) {
 	const dbName = "tf_tests_idle_conns_db"
 
-	// dbRegistry is process-wide and keyed by DSN only, so a pool opened by
-	// an earlier test (with max_idle_connections = 0) would be reused here.
+	// dbRegistry is process-wide and keyed by DSN, and a pool keeps the pool
+	// settings of the configuration that opened it, so a pool opened by an
+	// earlier test (with max_idle_connections = 0) would be reused here.
 	// A connect_timeout unique to this test gives the provider its own DSN,
 	// hence its own pools.
 	providerOnly := `

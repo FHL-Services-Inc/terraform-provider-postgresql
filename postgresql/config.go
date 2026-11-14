@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode"
 
@@ -146,14 +147,109 @@ var (
 	}
 )
 
+// DBConnection is the connection handle the resources work with. The *sql.DB
+// pool and everything in pool are shared by every provider configuration that
+// connects with the same DSN (see Client.Connect); client and version belong
+// to the caller, so settings that are not part of the DSN (superuser,
+// database_username, expected_version, ...) are those of the configuration
+// that asked for the connection.
 type DBConnection struct {
 	*sql.DB
 
 	client *Client
 
-	// version is the version number of the database as determined by parsing the
-	// output of `SELECT VERSION()`.x
+	// version is the version number of the database: the caller's
+	// expected_version if set, otherwise the server version determined by
+	// parsing the output of `SELECT VERSION()`.
 	version semver.Version
+
+	pool *dbPool
+}
+
+// dbPool holds the state shared by all DBConnections for one DSN.
+type dbPool struct {
+	// config is the configuration of the client that opened the pool. The pool
+	// settings applied by configurePool (max_connections, max_idle_connections,
+	// conn_max_lifetime_seconds) come from it: they can't differ between
+	// callers of one *sql.DB, so the first configuration to connect to a DSN
+	// wins.
+	config Config
+
+	// serverVersion is the fingerprinted server version, nil until a caller
+	// without expected_version needed it.
+	serverVersion atomic.Pointer[semver.Version]
+
+	mu sync.Mutex
+	// poolSettingsWarned is set once a caller with different pool settings
+	// has been logged.
+	poolSettingsWarned bool
+}
+
+// forClient returns the view of the cached connection conn for client c: the
+// same pool, with c's configuration and version.
+func (conn *DBConnection) forClient(c *Client) (*DBConnection, error) {
+	if conn.client == c {
+		return conn, nil
+	}
+
+	version, err := conn.pool.versionFor(conn.DB, &c.config)
+	if err != nil {
+		return nil, err
+	}
+	conn.pool.warnPoolSettings(&c.config)
+
+	view := *conn
+	view.client = c
+	view.version = version
+	return &view, nil
+}
+
+// versionFor returns the version features are evaluated against for a client
+// with configuration c: its expected_version if set, otherwise the server
+// version, fingerprinted on first use.
+func (p *dbPool) versionFor(db *sql.DB, c *Config) (semver.Version, error) {
+	defaultVersion, _ := semver.Parse(defaultExpectedPostgreSQLVersion)
+	if !defaultVersion.Equals(c.ExpectedVersion) {
+		return c.ExpectedVersion, nil
+	}
+
+	if version := p.serverVersion.Load(); version != nil {
+		return *version, nil
+	}
+
+	// Fingerprinting happens once per pool: when it is opened, or later if it
+	// was opened by a configuration with expected_version set.
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if version := p.serverVersion.Load(); version != nil {
+		return *version, nil
+	}
+	version, err := fingerprintCapabilities(db)
+	if err != nil {
+		return semver.Version{}, fmt.Errorf("error detecting capabilities: %w", err)
+	}
+	p.serverVersion.Store(version)
+	return *version, nil
+}
+
+// warnPoolSettings logs, once per pool, that a configuration with pool
+// settings different from the ones the pool was opened with is using it.
+func (p *dbPool) warnPoolSettings(c *Config) {
+	if c.MaxConns == p.config.MaxConns &&
+		c.MaxIdleConns == p.config.MaxIdleConns &&
+		c.ConnMaxLifetimeSeconds == p.config.ConnMaxLifetimeSeconds {
+		return
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.poolSettingsWarned {
+		return
+	}
+	p.poolSettingsWarned = true
+	log.Printf("[WARN] a connection pool to %s:%d is shared by provider configurations with different pool settings; "+
+		"it keeps the ones it was opened with (max_connections=%d, max_idle_connections=%d, conn_max_lifetime_seconds=%d)",
+		p.config.Host, p.config.Port, p.config.MaxConns, p.config.MaxIdleConns, p.config.ConnMaxLifetimeSeconds)
 }
 
 // featureSupported returns true if a given feature is supported or not. This is
@@ -307,6 +403,11 @@ func (c *Config) getDatabaseUsername() string {
 // Connect returns a copy to an sql.Open()'ed database connection wrapped in a DBConnection struct.
 // Callers must return their database resources. Use of QueryRow() or Exec() is encouraged.
 // Query() must have their rows.Close()'ed.
+//
+// One pool is kept per DSN and shared by every Client connecting with it, also
+// across provider configurations (e.g. consecutive provider configurations in
+// one acceptance test binary). The returned DBConnection carries c, so
+// settings read per call are always the caller's; see DBConnection.
 func (c *Client) Connect() (*DBConnection, error) {
 	ctx := context.Background()
 	dsn := c.config.connStr(c.databaseName)
@@ -315,7 +416,7 @@ func (c *Client) Connect() (*DBConnection, error) {
 	conn, found := dbRegistry[dsn]
 	dbRegistryLock.Unlock()
 	if found {
-		return conn, nil
+		return conn.forClient(c)
 	}
 
 	// Dialing and retrying happen outside the lock so a slow/flaky connection
@@ -327,21 +428,18 @@ func (c *Client) Connect() (*DBConnection, error) {
 
 	c.config.configurePool(db)
 
-	defaultVersion, _ := semver.Parse(defaultExpectedPostgreSQLVersion)
-	version := &c.config.ExpectedVersion
-	if defaultVersion.Equals(c.config.ExpectedVersion) {
-		// Version hint not set by user, need to fingerprint
-		version, err = fingerprintCapabilities(db)
-		if err != nil {
-			_ = db.Close()
-			return nil, fmt.Errorf("error detecting capabilities: %w", err)
-		}
+	pool := &dbPool{config: c.config}
+	version, err := pool.versionFor(db, &c.config)
+	if err != nil {
+		_ = db.Close()
+		return nil, err
 	}
 
 	conn = &DBConnection{
-		db,
-		c,
-		*version,
+		DB:      db,
+		client:  c,
+		version: version,
+		pool:    pool,
 	}
 
 	dbRegistryLock.Lock()
@@ -350,7 +448,7 @@ func (c *Client) Connect() (*DBConnection, error) {
 		// Another goroutine won the race and already published a connection
 		// for this DSN; keep that one and discard ours.
 		_ = db.Close()
-		return existing, nil
+		return existing.forClient(c)
 	}
 	dbRegistry[dsn] = conn
 	return conn, nil
@@ -376,8 +474,8 @@ func (c *Config) configurePool(db *sql.DB) {
 // evictDBConnection removes the pooled connection to database from dbRegistry
 // and closes it, so no idle connection to a database that is about to be
 // dropped stays around, and a database later recreated under the same name
-// gets a fresh pool. Pools created with max_idle_connections = 0 retain no
-// idle connections and are left untouched.
+// gets a fresh pool. Pools opened by a configuration with
+// max_idle_connections = 0 retain no idle connections and are left untouched.
 //
 // The entry is looked up by DSN, which only matches because every Client is
 // created from the same provider Config (see NewClient) and connStr is
@@ -388,7 +486,7 @@ func (c *Config) evictDBConnection(database string) bool {
 
 	dbRegistryLock.Lock()
 	conn, found := dbRegistry[dsn]
-	if !found || conn.client.config.MaxIdleConns == 0 {
+	if !found || conn.pool.config.MaxIdleConns == 0 {
 		dbRegistryLock.Unlock()
 		return false
 	}

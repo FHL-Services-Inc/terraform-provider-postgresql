@@ -11,7 +11,9 @@ import (
 // Tests in this file run the provider with max_idle_connections > 0, where the
 // provider keeps idle connections to the databases it touched. Each test sets
 // a connect_timeout no other test uses: dbRegistry is process-wide and keyed by
-// DSN only, so a pool opened earlier with other settings would be reused.
+// DSN, and a pool keeps the pool settings (max_idle_connections) of the
+// configuration that opened it, so a pool opened earlier with
+// max_idle_connections = 0 would be reused as is.
 
 func idleProviderFactories() map[string]func() (*schema.Provider, error) {
 	return map[string]func() (*schema.Provider, error){
