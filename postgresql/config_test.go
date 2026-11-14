@@ -284,6 +284,20 @@ func TestConfigRegistryKeySeparatesAuthKinds(t *testing.T) {
 		keys[key] = name
 	}
 
+	// The impersonated service account changes the pool's identity.
+	gcp := Config{Scheme: "gcppostgres", Host: "project/region/instance", Port: 5432, Username: "app"}
+	gcpImpersonated := gcp
+	gcpImpersonated.GCPIAMImpersonateServiceAccount = "sa@project.iam.gserviceaccount.com"
+	gcpOther := gcp
+	gcpOther.GCPIAMImpersonateServiceAccount = "other@project.iam.gserviceaccount.com"
+	gcpKeys := map[string]bool{}
+	for _, c := range []Config{gcp, gcpImpersonated, gcpOther} {
+		gcpKeys[c.registryKey("postgres")] = true
+	}
+	if len(gcpKeys) != 3 {
+		t.Errorf("gcppostgres configs differing only in the impersonated service account share registry keys: %v", gcpKeys)
+	}
+
 	// Two Clients of the same provider (same token source) share a pool.
 	rdsIAM2 := rdsIAM
 	if rdsIAM.registryKey("postgres") != rdsIAM2.registryKey("postgres") {

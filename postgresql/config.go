@@ -304,12 +304,18 @@ func (c *Config) connStr(database string) string {
 }
 
 // registryKey returns the dbRegistry key of the pool for database: the DSN,
-// prefixed with how connections authenticate. The DSN alone isn't enough
-// since with auth tokens it carries no password, so a token-auth provider
-// and a passwordless one (pgpass, trust) for the same server and user would
-// otherwise share a pool.
+// prefixed with how connections authenticate. The DSN alone isn't enough:
+//   - with auth tokens it carries no password, so a token-auth provider and a
+//     passwordless one (pgpass, trust) for the same server and user would
+//     share a pool;
+//   - gcp_iam_impersonate_service_account changes the identity the Cloud SQL
+//     client certificates are issued for, but isn't part of the DSN.
 func (c *Config) registryKey(database string) string {
-	return c.authKind() + " " + c.connStr(database)
+	key := c.authKind()
+	if c.GCPIAMImpersonateServiceAccount != "" {
+		key += " impersonate=" + c.GCPIAMImpersonateServiceAccount
+	}
+	return key + " " + c.connStr(database)
 }
 
 // authKind describes how connections authenticate, for registryKey.
