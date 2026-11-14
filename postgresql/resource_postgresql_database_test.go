@@ -341,6 +341,66 @@ resource postgresql_database "test_db" {
 
 }
 
+// TestAccPostgresqlDatabase_AlterObjectOwnershipOwnerChange changes the owner
+// of a database holding a table owned by the previous owner, with
+// alter_object_ownership. REASSIGN OWNED needs the provider role to have the
+// privileges of both the old and the new owner (and, since PostgreSQL 16, to
+// be able to SET ROLE to the new one), so a non-superuser provider role has to
+// be granted both temporarily, and neither membership may be left behind.
+// Runs in both profiles; the rds profile is the one that needs the grants.
+func TestAccPostgresqlDatabase_AlterObjectOwnershipOwnerChange(t *testing.T) {
+	skipIfNotAcc(t)
+
+	const databaseSuffix = "reassign_owner_change"
+	const tableName = "reassign_owner_change_table"
+	databaseName, _ := getTestDBNames(databaseSuffix)
+
+	config := getTestConfig(t)
+
+	dbConfig := func(owner string) string {
+		return fmt.Sprintf(`
+resource "postgresql_role" "old" {
+  name = "tf_tests_reassign_old"
+}
+
+resource "postgresql_role" "new" {
+  name = "tf_tests_reassign_new"
+}
+
+resource "postgresql_database" "db" {
+  name                   = %q
+  owner                  = postgresql_role.%s.name
+  alter_object_ownership = true
+}
+`, databaseName, owner)
+	}
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:     func() { testAccPreCheck(t) },
+		Providers:    testAccProviders,
+		CheckDestroy: testAccCheckPostgresqlDatabaseDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config: dbConfig("old"),
+				Check: func(*terraform.State) error {
+					// The table has to exist before the owner change.
+					_ = createTestTables(t, databaseSuffix, []string{tableName}, "tf_tests_reassign_old")
+					return nil
+				},
+			},
+			{
+				Config: dbConfig("new"),
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr("postgresql_database.db", "owner", "tf_tests_reassign_new"),
+					checkTableOwnership(t, config.connStr(databaseName), "tf_tests_reassign_new", tableName),
+					checkUserMembership(t, config.Username, "tf_tests_reassign_old", false),
+					checkUserMembership(t, config.Username, "tf_tests_reassign_new", false),
+				),
+			},
+		},
+	})
+}
+
 func checkUserMembership(
 	t *testing.T, member, role string, shouldHaveRole bool,
 ) resource.TestCheckFunc {
