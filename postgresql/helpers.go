@@ -684,18 +684,29 @@ func pgLockRole(txn *sql.Tx, role string) error {
 	if _, err := txn.Exec("SET statement_timeout = 0"); err != nil {
 		return fmt.Errorf("could not disable statement_timeout: %w", err)
 	}
-	if _, err := txn.Exec("SELECT pg_advisory_xact_lock(oid::bigint) FROM pg_roles WHERE rolname = $1", role); err != nil {
-		return fmt.Errorf("could not get advisory lock for role %s: %w", role, err)
-	}
-
-	if _, err := txn.Exec(
-		"SELECT pg_advisory_xact_lock(member::bigint) FROM pg_auth_members JOIN pg_roles ON roleid = pg_roles.oid WHERE rolname = $1",
-		role,
-	); err != nil {
-		return fmt.Errorf("could not get advisory lock for members of role %s: %w", role, err)
+	if _, err := txn.Exec(roleLockQuery("pg_advisory_xact_lock"), role); err != nil {
+		return fmt.Errorf("could not get advisory locks for role %s and its members: %w", role, err)
 	}
 
 	return nil
+}
+
+// roleLockQuery returns the statement that takes lockFunc (pg_advisory_lock or
+// pg_advisory_xact_lock) on a role and on all of its members, in one statement
+// ordered by OID.
+//
+// The keys of two roles overlap as soon as they share a member, and since
+// PostgreSQL 16 a non-superuser with CREATEROLE is a member (ADMIN OPTION) of
+// every role it creates, so the provider's own login role is in almost every
+// set. Taking the role lock first and then the members in catalog order let
+// two transactions take shared keys in opposite orders ("deadlock detected").
+// One global order for all keys avoids that.
+func roleLockQuery(lockFunc string) string {
+	return fmt.Sprintf(`SELECT %s(oid::bigint) FROM (
+	SELECT oid FROM pg_roles WHERE rolname = $1
+	UNION
+	SELECT member FROM pg_auth_members JOIN pg_roles ON roleid = pg_roles.oid WHERE rolname = $1
+) AS keys ORDER BY oid`, lockFunc)
 }
 
 // singleConn runs queries on one connection pinned from a pool, so a caller
@@ -773,15 +784,8 @@ func pgLockRoleSession(conn QueryAble, role string) error {
 	if _, err := conn.Exec("SET statement_timeout = 0"); err != nil {
 		return fmt.Errorf("could not disable statement_timeout: %w", err)
 	}
-	if _, err := conn.Exec("SELECT pg_advisory_lock(oid::bigint) FROM pg_roles WHERE rolname = $1", role); err != nil {
-		return fmt.Errorf("could not get advisory lock for role %s: %w", role, err)
-	}
-
-	if _, err := conn.Exec(
-		"SELECT pg_advisory_lock(member::bigint) FROM pg_auth_members JOIN pg_roles ON roleid = pg_roles.oid WHERE rolname = $1",
-		role,
-	); err != nil {
-		return fmt.Errorf("could not get advisory lock for members of role %s: %w", role, err)
+	if _, err := conn.Exec(roleLockQuery("pg_advisory_lock"), role); err != nil {
+		return fmt.Errorf("could not get advisory locks for role %s and its members: %w", role, err)
 	}
 
 	if _, err := conn.Exec("RESET statement_timeout"); err != nil {
