@@ -326,13 +326,8 @@ func readImportedGrantOption(db *DBConnection, g grantImportID) (bool, error) {
 		return false, err
 	}
 
-	roleOID, err := getRoleOID(conn, g.role)
-	if err != nil {
-		return false, err
-	}
-
 	var query string
-	args := []any{roleOID}
+	args := []any{g.role}
 
 	switch g.objectType {
 	case "database":
@@ -371,12 +366,16 @@ func readImportedGrantOption(db *DBConnection, g grantImportID) (bool, error) {
 
 	var withGrantOption bool
 	if err := conn.QueryRow(
-		`SELECT coalesce(bool_and(a.is_grantable), false) `+query+` AND a.grantee = $1`, args...,
+		`SELECT coalesce(bool_and(a.is_grantable), false) `+query+` AND a.grantee = `+importGranteeOID, args...,
 	).Scan(&withGrantOption); err != nil {
 		return false, fmt.Errorf("could not read the grant option of %s: %w", g, err)
 	}
 	return withGrantOption, nil
 }
+
+// importGranteeOID is the ACL grantee OID of the role name bound to $1
+// (0 for PUBLIC).
+const importGranteeOID = `(CASE WHEN $1::text = 'public' THEN 0::oid ELSE (SELECT oid FROM pg_roles WHERE rolname = $1::text) END)`
 
 // functionImportBaseName strips an argument signature: "f(int, text)" -> "f".
 func functionImportBaseName(object string) string {
@@ -539,11 +538,6 @@ func readImportedDefaultPrivilegesGrantOption(db *DBConnection, p defaultPrivile
 		return false, err
 	}
 
-	roleOID, err := getRoleOID(conn, p.role)
-	if err != nil {
-		return false, err
-	}
-
 	var withGrantOption bool
 	if err := conn.QueryRow(`
 SELECT coalesce(bool_and(a.is_grantable), false)
@@ -551,9 +545,9 @@ FROM pg_default_acl d
 JOIN pg_roles o ON o.oid = d.defaclrole
 LEFT JOIN pg_namespace n ON n.oid = d.defaclnamespace,
 aclexplode(d.defaclacl) a
-WHERE a.grantee = $1 AND o.rolname = $2 AND d.defaclobjtype = $3
+WHERE a.grantee = `+importGranteeOID+` AND o.rolname = $2 AND d.defaclobjtype = $3
   AND CASE WHEN $4::text = '' THEN d.defaclnamespace = 0 ELSE n.nspname = $4::text END`,
-		roleOID, p.owner, objectTypes[p.objectType], p.schema,
+		p.role, p.owner, objectTypes[p.objectType], p.schema,
 	).Scan(&withGrantOption); err != nil {
 		return false, fmt.Errorf("could not read the grant option of default privileges %s: %w", p, err)
 	}
