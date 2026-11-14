@@ -401,6 +401,77 @@ resource "postgresql_database" "db" {
 	})
 }
 
+// TestAccPostgresqlDatabase_AlterObjectOwnershipManyDatabases changes the
+// owner of several databases at once with alter_object_ownership (#25). Each
+// owner change temporarily grants the provider role membership in the old and
+// the new owner; these memberships are cluster-wide, so the owner changes have
+// to serialize on a lock that is cluster-wide too (the role lock on the
+// maintenance database), not one taken in each target database. Without it a
+// non-superuser provider fails with "duplicate key value violates unique
+// constraint pg_auth_members_role_member_index" or "tuple concurrently
+// updated".
+func TestAccPostgresqlDatabase_AlterObjectOwnershipManyDatabases(t *testing.T) {
+	skipIfNotAcc(t)
+
+	const databases = 6
+	const tableName = "multi_owner_table"
+	suffix := func(i int) string { return fmt.Sprintf("multi_owner_%d", i) }
+
+	config := getTestConfig(t)
+
+	dbConfig := func(owner string) string {
+		return fmt.Sprintf(`
+resource "postgresql_role" "old" {
+  name = "tf_tests_multi_owner_old"
+}
+
+resource "postgresql_role" "new" {
+  name = "tf_tests_multi_owner_new"
+}
+
+resource "postgresql_database" "db" {
+  count                  = %d
+  name                   = "%s_multi_owner_${count.index}"
+  owner                  = postgresql_role.%s.name
+  alter_object_ownership = true
+}
+`, databases, dbNamePrefix, owner)
+	}
+
+	newOwnerChecks := []resource.TestCheckFunc{
+		checkUserMembership(t, config.Username, "tf_tests_multi_owner_old", false),
+		checkUserMembership(t, config.Username, "tf_tests_multi_owner_new", false),
+	}
+	for i := range databases {
+		dbName, _ := getTestDBNames(suffix(i))
+		newOwnerChecks = append(newOwnerChecks,
+			resource.TestCheckResourceAttr(fmt.Sprintf("postgresql_database.db.%d", i), "owner", "tf_tests_multi_owner_new"),
+			checkTableOwnership(t, config.connStr(dbName), "tf_tests_multi_owner_new", tableName),
+		)
+	}
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:     func() { testAccPreCheck(t) },
+		Providers:    testAccProviders,
+		CheckDestroy: testAccCheckPostgresqlDatabaseDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config: dbConfig("old"),
+				Check: func(*terraform.State) error {
+					for i := range databases {
+						_ = createTestTables(t, suffix(i), []string{tableName}, "tf_tests_multi_owner_old")
+					}
+					return nil
+				},
+			},
+			{
+				Config: dbConfig("new"),
+				Check:  resource.ComposeTestCheckFunc(newOwnerChecks...),
+			},
+		},
+	})
+}
+
 func checkUserMembership(
 	t *testing.T, member, role string, shouldHaveRole bool,
 ) resource.TestCheckFunc {

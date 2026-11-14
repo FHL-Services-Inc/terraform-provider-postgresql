@@ -176,7 +176,7 @@ func resourcePostgreSQLDefaultPrivilegesCreate(db *DBConnection, d *schema.Resou
 		return err
 	}
 
-	if err := txn.Commit(); err != nil {
+	if err := commitTxn(txn); err != nil {
 		return err
 	}
 
@@ -220,7 +220,7 @@ func resourcePostgreSQLDefaultPrivilegesDelete(db *DBConnection, d *schema.Resou
 		return err
 	}
 
-	if err := txn.Commit(); err != nil {
+	if err := commitTxn(txn); err != nil {
 		return err
 	}
 

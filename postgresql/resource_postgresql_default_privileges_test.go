@@ -2,7 +2,10 @@ package postgresql
 
 import (
 	"fmt"
+	"strings"
 	"testing"
+
+	"github.com/lib/pq"
 
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/resource"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/terraform"
@@ -394,6 +397,110 @@ resource "postgresql_default_privileges" "test" {
 						return nil
 					},
 				),
+			},
+		},
+	})
+}
+
+// TestAccPostgresqlDefaultPrivileges_ReverseMembershipManyDatabases manages
+// default privileges of the same owner in several databases at once, where
+// the owner is a member of the provider role (#25). For a non-superuser
+// provider, withRolesGranted then revokes that membership, grants the owner to
+// the provider role, and restores both afterwards, in each database's
+// transaction. The membership rows are cluster-wide while the owner lock is
+// per database, so without serializing them the transactions revoke the same
+// row at the same time: "tuple concurrently deleted" (PostgreSQL 15 and
+// older).
+//
+// The reverse membership is set up by the provider role itself, which a
+// non-superuser can only do up to PostgreSQL 15 (since 16 it needs ADMIN on
+// itself), so the rds profile skips this test on 16+.
+func TestAccPostgresqlDefaultPrivileges_ReverseMembershipManyDatabases(t *testing.T) {
+	skipIfNotAcc(t)
+	testAccPreCheck(t)
+
+	client := testAccProvider.Meta().(*Client)
+	db, err := client.Connect()
+	if err != nil {
+		t.Fatalf("could not connect: %v", err)
+	}
+	if !client.config.Superuser && db.featureSupported(featureCreateRoleSelfGrant) {
+		t.Skip("a non-superuser cannot grant its own role to another role since PostgreSQL 16")
+	}
+
+	const databases = 3
+	const owner = "tf_tests_dp_reverse_owner"
+	const reader = "tf_tests_dp_reverse_reader"
+
+	config := getTestConfig(t)
+	dsn := config.connStr("postgres")
+
+	dbExecute(t, dsn, fmt.Sprintf("CREATE ROLE %s", owner))
+	defer dbExecute(t, dsn, fmt.Sprintf("DROP ROLE %s", owner))
+	dbExecute(t, dsn, fmt.Sprintf("CREATE ROLE %s", reader))
+	defer dbExecute(t, dsn, fmt.Sprintf("DROP ROLE %s", reader))
+	// The owner is a member of the provider role: the reverse of the
+	// membership withRolesGranted needs.
+	dbExecute(t, dsn, fmt.Sprintf("GRANT %s TO %s", pq.QuoteIdentifier(config.Username), owner))
+
+	dbNames := make([]string, databases)
+	for i := range databases {
+		dbNames[i], _ = getTestDBNames(fmt.Sprintf("dp_reverse_%d", i))
+		dbExecute(t, dsn, fmt.Sprintf("CREATE DATABASE %s", dbNames[i]))
+		defer dbExecute(t, dsn, fmt.Sprintf("DROP DATABASE %s", dbNames[i]))
+	}
+
+	tfConfig := func(tablePrivileges, sequencePrivileges string) string {
+		return fmt.Sprintf(`
+locals {
+  databases = ["%s"]
+}
+
+resource "postgresql_default_privileges" "tables" {
+  count       = length(local.databases)
+  database    = local.databases[count.index]
+  owner       = %q
+  role        = %q
+  schema      = "public"
+  object_type = "table"
+  privileges  = %s
+}
+
+resource "postgresql_default_privileges" "sequences" {
+  count       = length(local.databases)
+  database    = local.databases[count.index]
+  owner       = %q
+  role        = %q
+  schema      = "public"
+  object_type = "sequence"
+  privileges  = %s
+}
+`, strings.Join(dbNames, `", "`), owner, reader, tablePrivileges, owner, reader, sequencePrivileges)
+	}
+
+	membershipChecks := resource.ComposeTestCheckFunc(
+		// The reverse membership is restored and the temporary one is gone.
+		checkUserMembership(t, owner, config.Username, true),
+		checkUserMembership(t, config.Username, owner, false),
+	)
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:  func() { testCheckCompatibleVersion(t, featurePrivileges) },
+		Providers: testAccProviders,
+		Steps: []resource.TestStep{
+			{
+				Config: tfConfig(`["SELECT"]`, `["SELECT"]`),
+				Check:  membershipChecks,
+			},
+			{
+				Config: tfConfig(`["INSERT", "SELECT"]`, `["SELECT", "USAGE"]`),
+				Check:  membershipChecks,
+			},
+			{
+				// Destroy the default privileges, keep the databases and
+				// roles for the membership check.
+				Config: `# empty`,
+				Check:  membershipChecks,
 			},
 		},
 	})

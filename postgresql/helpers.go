@@ -145,6 +145,10 @@ func revokeRoleMembership(db QueryAble, role, member string) (bool, error) {
 // withRolesGranted temporarily grants, if needed, the roles specified to connected user
 // (i.e.: the admin configure in the provider) and revoke them as soon as the
 // callback func has finished.
+//
+// For a non-superuser it takes the membership locks of roles (membershipLocks)
+// and keeps them until txn ends: the caller must commit txn with commitTxn and
+// defer deferredRollback(txn).
 func withRolesGranted(txn *sql.Tx, roles []string, fn func() error) error {
 	// No roles asked, execute the function directly
 	if len(roles) == 0 {
@@ -170,6 +174,13 @@ func withRolesGranted(txn *sql.Tx, roles []string, fn func() error) error {
 	if superuser {
 		log.Printf("withRolesGranted: current user %s is superuser, no need to grant roles", currentUser)
 		return fn()
+	}
+
+	// Membership rows are cluster-wide, the caller's advisory locks are not:
+	// serialize with other databases' transactions on the same roles until
+	// txn ends (see membershipLocks).
+	if !lockMembershipsForTxn(txn, roles) {
+		return fmt.Errorf("withRolesGranted: transaction already holds membership locks for other roles than %v", roles)
 	}
 
 	var grantedRoles []string
@@ -479,6 +490,9 @@ func getCurrentUser(db QueryAble) (string, error) {
 // deferredRollback can be used to rollback a transaction in a defer.
 // It will log an error if it fails
 func deferredRollback(txn *sql.Tx) {
+	// After the rollback: the membership locks protect the rows the
+	// transaction changed until it has ended.
+	defer releaseMembershipLocks(txn)
 	err := txn.Rollback()
 	switch {
 	case err == sql.ErrTxDone:

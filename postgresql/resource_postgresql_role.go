@@ -413,7 +413,7 @@ func resourcePostgreSQLRoleDelete(db *DBConnection, d *schema.ResourceData) erro
 		}
 	}
 
-	if err := txn.Commit(); err != nil {
+	if err := commitTxn(txn); err != nil {
 		return fmt.Errorf("error committing schema: %w", err)
 	}
 
