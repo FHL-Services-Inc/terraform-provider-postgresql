@@ -490,21 +490,34 @@ func setAlterOwnership(db *DBConnection, d *schema.ResourceData) error {
 
 	dbName := d.Get(dbNameAttr).(string)
 
-	// REASSIGN OWNED only affects the database it runs in, so the lock is
-	// taken on a connection to that database.
-	targetDB, err := initConnection(db.client, dbName)
-	if err != nil {
-		return err
-	}
-	conn, release, err := lockRoleConn(targetDB, currentUser)
+	// The memberships granted below are cluster-wide, so the lock is taken on
+	// the maintenance database like in the other database operations
+	// (createDatabase, setDBOwner, ...): an advisory lock only conflicts with
+	// locks taken in the same database, and taking it in dbName let owner
+	// changes of several databases grant and revoke the same membership at
+	// the same time (#25).
+	conn, release, err := lockRoleConn(db, currentUser)
 	if err != nil {
 		return err
 	}
 	defer release()
 
-	currentOwner, err := getDatabaseOwner(conn, dbName)
-	if err != nil {
-		return fmt.Errorf("error getting current database OWNER: %w", err)
+	// The previous owner comes from the state when the owner changes, not
+	// from pg_database: REASSIGN OWNED also reassigns shared objects, i.e.
+	// every database the previous owner owns. Once the owner change of
+	// another database in the same apply has run, pg_database already shows
+	// the new owner for this one too, while the objects inside it still
+	// belong to the previous owner.
+	var currentOwner string
+	if d.HasChange(dbOwnerAttr) {
+		oldOwner, _ := d.GetChange(dbOwnerAttr)
+		currentOwner = oldOwner.(string)
+	}
+	if currentOwner == "" {
+		currentOwner, err = getDatabaseOwner(conn, dbName)
+		if err != nil {
+			return fmt.Errorf("error getting current database OWNER: %w", err)
+		}
 	}
 
 	newOwner := d.Get(dbOwnerAttr).(string)
@@ -534,23 +547,40 @@ func setAlterOwnership(db *DBConnection, d *schema.ResourceData) error {
 		defer revokeRoleMembershipDeferred(conn, newOwner, currentUser)
 	}
 
-	lockTxn, err := conn.Begin()
+	// REASSIGN OWNED only affects the database it runs in, so it runs on a
+	// connection to dbName, while the lock (and the memberships) stay on the
+	// maintenance connection. That second connection comes from the pool of
+	// dbName, never from the pool the lock connection is pinned from, so an
+	// exhausted pool (max_connections) cannot make it wait forever. When
+	// dbName is the maintenance database itself, both would come from the
+	// same pool, so the lock connection is used.
+	var reassignTxn *sql.Tx
+	if dbName == db.client.databaseName {
+		reassignTxn, err = conn.Begin()
+	} else {
+		var targetDB *DBConnection
+		targetDB, err = initConnection(db.client, dbName)
+		if err != nil {
+			return err
+		}
+		reassignTxn, err = targetDB.Begin()
+	}
 	if err != nil {
 		return fmt.Errorf("could not start transaction: %w", err)
 	}
-	defer deferredRollback(lockTxn)
+	defer deferredRollback(reassignTxn)
 	// REASSIGN used to run in the pgLockRole transaction, which had
 	// statement_timeout disabled.
-	if _, err := lockTxn.Exec("SET LOCAL statement_timeout = 0"); err != nil {
+	if _, err := reassignTxn.Exec("SET LOCAL statement_timeout = 0"); err != nil {
 		return fmt.Errorf("could not disable statement_timeout: %w", err)
 	}
 
-	sql := fmt.Sprintf("REASSIGN OWNED BY %s TO %s", pq.QuoteIdentifier(currentOwner), pq.QuoteIdentifier(newOwner))
-	if _, err := lockTxn.Exec(sql); err != nil {
+	query := fmt.Sprintf("REASSIGN OWNED BY %s TO %s", pq.QuoteIdentifier(currentOwner), pq.QuoteIdentifier(newOwner))
+	if _, err := reassignTxn.Exec(query); err != nil {
 		return fmt.Errorf("error reassigning objects owned by '%s': %w", currentOwner, err)
 	}
 
-	if err := lockTxn.Commit(); err != nil {
+	if err := reassignTxn.Commit(); err != nil {
 		return fmt.Errorf("error committing reassign: %w", err)
 	}
 	return nil
