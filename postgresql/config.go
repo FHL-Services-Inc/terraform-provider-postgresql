@@ -56,7 +56,15 @@ const (
 
 // defaultConnMaxIdleTime closes connections that stayed idle in the pool for
 // that long. Only used when max_idle_connections > 0.
-const defaultConnMaxIdleTime = 5 * time.Minute
+//
+// The provider keeps one pool per database it connects to, so the idle
+// connections it holds add up across pools. Busy pools reuse their connections
+// within milliseconds, so a short timeout costs little reuse, while it bounds
+// how long a pool that is no longer used (e.g. for a database whose resources
+// were all refreshed early in the run) keeps its sessions open on the server,
+// where they count against max_connections and block an out-of-band
+// DROP DATABASE.
+const defaultConnMaxIdleTime = 30 * time.Second
 
 var (
 	dbRegistryLock sync.Mutex
