@@ -356,8 +356,8 @@ func readImportedGrantOption(db *DBConnection, g grantImportID) (bool, error) {
 			args = append(args, pq.Array(names))
 		}
 	default: // table, sequence
-		query = `FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace, aclexplode(c.relacl) a WHERE n.nspname = $2 AND c.relkind = $3`
-		args = append(args, g.schema, objectTypes[g.objectType])
+		query = `FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace, aclexplode(c.relacl) a WHERE n.nspname = $2 AND c.relkind = ANY($3)`
+		args = append(args, g.schema, pq.Array(ownerRelkinds[g.objectType]))
 		if len(g.objects) > 0 {
 			query += ` AND c.relname = ANY($4)`
 			args = append(args, pq.Array(g.objects))

@@ -372,7 +372,7 @@ FROM (SELECT relname, attname, (aclexplode(attacl)).*
                JOIN pg_attribute ON pg_class.oid = attrelid
       WHERE nspname = $2
         AND relname = $3
-        AND relkind = $4)
+        AND relkind = ANY($4))
          AS col_privs
          JOIN pg_roles ON pg_roles.oid = col_privs.grantee
 WHERE rolname = $1
@@ -381,7 +381,7 @@ GROUP BY col_privs.relname, col_privs.attname, col_privs.privilege_type
 ORDER BY col_privs.attname
 ;`
 	rows, err := txn.Query(
-		query, d.Get("role").(string), d.Get("schema"), objects.List()[0], objectTypes["table"], d.Get("privileges").(*schema.Set).List()[0],
+		query, d.Get("role").(string), d.Get("schema"), objects.List()[0], pq.Array(ownerRelkinds["column"]), d.Get("privileges").(*schema.Set).List()[0],
 	)
 
 	if err != nil {
@@ -444,7 +444,7 @@ ORDER BY col_privs.attname
 // buildReadTableRolePrivilegesQuery builds the Read query and bind arguments
 // for the table/sequence object types. When the resource lists explicit
 // objects, the relname filter is pushed into the query (relname = ANY) instead
-// of fetching every relation of this relkind in the schema and discarding the
+// of fetching every relation of these relkinds in the schema and discarding the
 // surplus afterwards; on schemas with many relations this avoids transferring
 // rows that are immediately dropped. An empty objects set means "all objects in
 // the schema", so the predicate is only added when objects are listed — the
@@ -456,7 +456,11 @@ ORDER BY col_privs.attname
 // aclexplode over every relation in the catalog once per matched object.
 // Relations without an ACL entry for the role (including a NULL relacl) still
 // produce a row with an empty privilege array.
-func buildReadTableRolePrivilegesQuery(roleOID uint32, schemaName, relkind string, objects *schema.Set) (string, []interface{}) {
+//
+// relkinds is the set of pg_class.relkind values the object type covers
+// (ownerRelkinds): ON TABLE also applies to views, materialized views,
+// partitioned and foreign tables, so all of them must be read back.
+func buildReadTableRolePrivilegesQuery(roleOID uint32, schemaName string, relkinds []string, objects *schema.Set) (string, []interface{}) {
 	query := `
 SELECT c.relname, array_remove(array_agg(a.privilege_type), NULL)
 FROM pg_class c
@@ -464,8 +468,8 @@ JOIN pg_namespace n ON n.oid = c.relnamespace
 LEFT JOIN LATERAL (
     SELECT privilege_type FROM aclexplode(c.relacl) WHERE grantee = $1
 ) a ON true
-WHERE n.nspname = $2 AND c.relkind = $3`
-	args := []interface{}{roleOID, schemaName, relkind}
+WHERE n.nspname = $2 AND c.relkind = ANY($3)`
+	args := []interface{}{roleOID, schemaName, pq.Array(relkinds)}
 
 	if objects.Len() > 0 {
 		objectNames := make([]string, 0, objects.Len())
@@ -532,13 +536,13 @@ GROUP BY pg_proc.proname
 	default:
 		var args []interface{}
 		query, args = buildReadTableRolePrivilegesQuery(
-			roleOID, d.Get("schema").(string), objectTypes[objectType], objects,
+			roleOID, d.Get("schema").(string), ownerRelkinds[objectType], objects,
 		)
 		rows, err = txn.Query(query, args...)
 	}
 
 	// This returns, for the specified role (rolname),
-	// the list of all object of the specified type (relkind) in the specified schema (namespace)
+	// the list of all object of the specified type (relkinds) in the specified schema (namespace)
 	// with the list of the currently applied privileges (aggregation of privilege_type)
 	//
 	// Our goal is to check that every object has the same privileges as saved in the state.
