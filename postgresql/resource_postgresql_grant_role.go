@@ -37,6 +37,9 @@ func resourcePostgreSQLGrantRole() *schema.Resource {
 		Create: PGResourceFunc(resourcePostgreSQLGrantRoleCreate),
 		Read:   PGResourceFunc(resourcePostgreSQLGrantRoleRead),
 		Delete: PGResourceFunc(resourcePostgreSQLGrantRoleDelete),
+		Importer: &schema.ResourceImporter{
+			StateContext: resourcePostgreSQLGrantRoleImport,
+		},
 
 		Schema: map[string]*schema.Schema{
 			"role": {

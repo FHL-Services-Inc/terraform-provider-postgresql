@@ -47,3 +47,25 @@ resource "postgresql_grant_role" "bob_admin" {
 * `role` - (Required) The name of the role that is granted a new membership.
 * `grant_role` - (Required) The name of the role that is added to `role`.
 * `with_admin_option` - (Optional) Giving ability to grant membership to others or not for `role`. (Default: false)
+
+## Import
+
+`postgresql_grant_role` can be imported using the resource ID,
+`<role>_<grant_role>_<with_admin_option>`, where `<with_admin_option>` is
+`true` or `false` (it is refreshed from the server either way). As role names
+may contain `_` themselves, the provider resolves the ID against the existing
+roles; the import fails if no split of the ID matches, or if more than one
+does.
+
+```hcl
+import {
+  to = postgresql_grant_role.grant_root
+  id = "root_application_true"
+}
+```
+
+or, with the CLI:
+
+```
+$ terraform import postgresql_grant_role.grant_root root_application_true
+```
