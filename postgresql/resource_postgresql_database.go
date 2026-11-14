@@ -170,6 +170,11 @@ func createDatabase(db *DBConnection, d *schema.ResourceData) error {
 		fmt.Fprint(b, " TEMPLATE DEFAULT")
 	case ok:
 		fmt.Fprint(b, " TEMPLATE ", pq.QuoteIdentifier(v.(string)))
+		// CREATE DATABASE fails while any session is connected to the
+		// template, including our own idle pooled ones (only kept with
+		// max_idle_connections > 0), e.g. when the template is a database
+		// managed by this provider.
+		evictOtherDBPool(db, v.(string))
 	case v.(string) == "":
 		fmt.Fprint(b, " TEMPLATE template0")
 	}
@@ -407,7 +412,7 @@ func resourcePostgreSQLDatabaseUpdate(db *DBConnection, d *schema.ResourceData) 
 	return resourcePostgreSQLDatabaseReadImpl(db, d)
 }
 
-func setDBName(db QueryAble, d *schema.ResourceData) error {
+func setDBName(db *DBConnection, d *schema.ResourceData) error {
 	if !d.HasChange(dbNameAttr) {
 		return nil
 	}
@@ -419,6 +424,13 @@ func setDBName(db QueryAble, d *schema.ResourceData) error {
 		return errors.New("error setting database name to an empty string")
 	}
 
+	// RENAME fails while any session is connected to the database, including
+	// our own idle pooled ones (only kept with max_idle_connections > 0).
+	// A pool registered under the new name can only be a stale one from an
+	// earlier database with that name, drop it as well.
+	evictOtherDBPool(db, o)
+	evictOtherDBPool(db, n)
+
 	sql := fmt.Sprintf("ALTER DATABASE %s RENAME TO %s", pq.QuoteIdentifier(o), pq.QuoteIdentifier(n))
 	if _, err := db.Exec(sql); err != nil {
 		return fmt.Errorf("error updating database name: %w", err)
@@ -426,6 +438,19 @@ func setDBName(db QueryAble, d *schema.ResourceData) error {
 	d.SetId(n)
 
 	return nil
+}
+
+// evictOtherDBPool closes this provider's pooled connections to database
+// (see evictDBConnection), unless database is the one db itself is connected
+// to: the statement that follows still needs that pool, and PostgreSQL refuses
+// to rename or copy the database of the current session anyway.
+func evictOtherDBPool(db *DBConnection, database string) {
+	if database == db.client.databaseName {
+		return
+	}
+	if db.client.config.evictDBConnection(database) {
+		log.Printf("[DEBUG] evicted pooled connections to database %q", database)
+	}
 }
 
 func setDBOwner(db *DBConnection, d *schema.ResourceData) error {
