@@ -450,6 +450,21 @@ func setDBOwner(db *DBConnection, d *schema.ResourceData) error {
 
 	dbName := d.Get(dbNameAttr).(string)
 
+	// ALTER DATABASE ... OWNER TO also requires owning the database, i.e.
+	// membership in its current owner, which a non-superuser connection role
+	// usually does not have.
+	currentOwner, err := getDatabaseOwner(conn, dbName)
+	if err != nil {
+		return fmt.Errorf("error getting current database OWNER: %w", err)
+	}
+	currentOwnerGranted, err := grantRoleMembership(conn, currentOwner, currentUser)
+	if err != nil {
+		return err
+	}
+	if currentOwnerGranted {
+		defer revokeRoleMembershipDeferred(conn, currentOwner, currentUser)
+	}
+
 	sql := fmt.Sprintf("ALTER DATABASE %s OWNER TO %s", pq.QuoteIdentifier(dbName), pq.QuoteIdentifier(owner))
 	if _, err := conn.Exec(sql); err != nil {
 		return fmt.Errorf("error updating database OWNER: %w", err)
