@@ -422,18 +422,6 @@ func startTransaction(client *Client, database string) (*sql.Tx, error) {
 	return txn, nil
 }
 
-func dbExists(db QueryAble, dbname string) (bool, error) {
-	err := db.QueryRow("SELECT datname FROM pg_database WHERE datname=$1", dbname).Scan(&dbname)
-	switch {
-	case err == sql.ErrNoRows:
-		return false, nil
-	case err != nil:
-		return false, fmt.Errorf("could not check if database exists: %w", err)
-	}
-
-	return true, nil
-}
-
 func roleExists(txn *sql.Tx, rolname string) (bool, error) {
 	err := txn.QueryRow("SELECT 1 FROM pg_roles WHERE rolname=$1", rolname).Scan(&rolname)
 	switch {
@@ -587,18 +575,6 @@ func isSuperuser(db QueryAble, role string) (bool, error) {
 }
 
 const publicRole = "public"
-
-func getRoleOID(db QueryAble, role string) (uint32, error) {
-	if role == publicRole {
-		return 0, nil
-	}
-
-	var oid uint32
-	if err := db.QueryRow("SELECT oid FROM pg_roles WHERE rolname = $1", role).Scan(&oid); err != nil {
-		return 0, fmt.Errorf("could not find oid for role %s: %w", role, err)
-	}
-	return oid, nil
-}
 
 // Lock a role and all his members to avoid concurrent updates on some resources
 func pgLockRole(txn *sql.Tx, role string) error {

@@ -109,23 +109,7 @@ func resourcePostgreSQLGrantRead(db *DBConnection, d *schema.ResourceData) error
 		return fmt.Errorf("feature is not supported: %v", err)
 	}
 
-	exists, err := checkRoleDBSchemaExists(db, d)
-	if err != nil {
-		return err
-	}
-	if !exists {
-		d.SetId("")
-		return nil
-	}
-	d.SetId(generateGrantID(d))
-
-	txn, err := startTransaction(db.client, d.Get("database").(string))
-	if err != nil {
-		return err
-	}
-	defer deferredRollback(txn)
-
-	return readRolePrivileges(txn, db, d)
+	return readRolePrivileges(db, d)
 }
 
 func resourcePostgreSQLGrantCreate(db *DBConnection, d *schema.ResourceData) error {
@@ -212,13 +196,7 @@ func resourcePostgreSQLGrantCreateOrUpdate(db *DBConnection, d *schema.ResourceD
 
 	d.SetId(generateGrantID(d))
 
-	txn, err = startTransaction(db.client, database)
-	if err != nil {
-		return err
-	}
-	defer deferredRollback(txn)
-
-	return readRolePrivileges(txn, db, d)
+	return readRolePrivileges(db, d)
 }
 
 func resourcePostgreSQLGrantDelete(db *DBConnection, d *schema.ResourceData) error {
@@ -263,20 +241,141 @@ func resourcePostgreSQLGrantDelete(db *DBConnection, d *schema.ResourceData) err
 	return nil
 }
 
-func readDatabaseRolePrivileges(txn *sql.Tx, db *DBConnection, d *schema.ResourceData, roleOID uint32) error {
-	dbName := d.Get("database").(string)
-	query := `
-SELECT array_agg(privilege_type)
-FROM (
-	SELECT (aclexplode(datacl)).* FROM pg_database WHERE datname=$1
-) as privileges
-WHERE grantee = $2
-`
+// grantReadRoleCTE resolves the grantee inside the Read query instead of with a
+// separate role existence check and OID lookup. It always yields exactly one
+// row: PUBLIC is grantee 0 and is not looked up in pg_roles (where it has no
+// row), any other role yields its OID, or NULL when it does not exist. $1 is the
+// role name.
+const grantReadRoleCTE = `WITH r AS (
+    SELECT CASE WHEN $1::name = '` + publicRole + `' THEN 0::oid
+                ELSE (SELECT oid FROM pg_roles WHERE rolname = $1::name) END AS oid
+)`
 
-	var privileges pq.ByteaArray
-	if err := txn.QueryRow(query, dbName, roleOID).Scan(&privileges); err != nil {
-		return fmt.Errorf("could not read privileges for database %s: %w", dbName, err)
+// grantReadSchemaCTE resolves the schema of the resource ($2). The Read queries
+// report whether it exists next to the privileges, so a dropped schema is not
+// mistaken for a schema whose objects have no privileges.
+const grantReadSchemaCTE = `,
+n AS (SELECT oid FROM pg_namespace WHERE nspname = $2)`
+
+// queryGrantRead runs the single Read query of postgresql_grant or
+// postgresql_default_privileges on the resource's database, outside of any
+// transaction: the query reads only catalogs, so one statement already sees one
+// consistent snapshot.
+//
+// When that database no longer exists (SQLSTATE 3D000, either while connecting
+// or, when a pool for it already exists, on the query itself) the resource is
+// removed from state and (nil, nil) is returned. That replaces the separate
+// check against pg_database on the maintenance database.
+func queryGrantRead(db *DBConnection, d *schema.ResourceData, query string, args ...any) (*sql.Rows, error) {
+	database := d.Get("database").(string)
+
+	conn, err := initConnection(db.client, database)
+	if err == nil {
+		var rows *sql.Rows
+		if rows, err = conn.Query(query, args...); err == nil {
+			return rows, nil
+		}
 	}
+	if isDatabaseDoesNotExistError(err) {
+		log.Printf("[WARN] PostgreSQL database (%s) not found, removing %s from state", database, d.Id())
+		d.SetId("")
+		return nil, nil
+	}
+	return nil, err
+}
+
+// closeGrantReadRows closes the rows of queryGrantRead. Without a transaction
+// around the Read, rows left open would keep the connection checked out.
+func closeGrantReadRows(rows *sql.Rows) {
+	if err := rows.Close(); err != nil {
+		log.Printf("[ERR] could not close rows: %v", err)
+	}
+}
+
+// grantTargetGone removes the resource from state when the role or the schema
+// it refers to no longer exists, as reported by the role_exists/schema_exists
+// columns of the Read query, and reports whether it did.
+func grantTargetGone(d *schema.ResourceData, roleExists, schemaExists bool) bool {
+	if !roleExists {
+		log.Printf("[DEBUG] role %s does not exists", d.Get("role").(string))
+		d.SetId("")
+		return true
+	}
+	if !schemaExists {
+		log.Printf("[DEBUG] schema %s does not exists", d.Get("schema").(string))
+		d.SetId("")
+		return true
+	}
+	return false
+}
+
+// buildReadSingleObjectRolePrivilegesQuery builds the Read query for the object
+// types granted on one named object (database, schema, foreign data wrapper,
+// foreign server). It returns one row: role_exists, schema_exists (always true
+// when the object type is not schema-scoped) and the privileges granted to the
+// role on the object (NULL when there are none).
+func buildReadSingleObjectRolePrivilegesQuery(d *schema.ResourceData) (string, []any) {
+	role := d.Get("role").(string)
+
+	if d.Get("object_type").(string) == "schema" {
+		return grantReadRoleCTE + `
+SELECT r.oid IS NOT NULL, n.oid IS NOT NULL,
+    (SELECT array_agg(a.privilege_type) FROM aclexplode(n.nspacl) a WHERE a.grantee = r.oid)
+FROM r
+LEFT JOIN pg_namespace n ON n.nspname = $2
+`, []any{role, d.Get("schema").(string)}
+	}
+
+	var catalog, acl, nameColumn, name string
+	switch d.Get("object_type").(string) {
+	case "database":
+		catalog, acl, nameColumn = "pg_database", "datacl", "datname"
+		name = d.Get("database").(string)
+	case "foreign_data_wrapper":
+		catalog, acl, nameColumn = "pg_foreign_data_wrapper", "fdwacl", "fdwname"
+		name = d.Get("objects").(*schema.Set).List()[0].(string)
+	case "foreign_server":
+		catalog, acl, nameColumn = "pg_foreign_server", "srvacl", "srvname"
+		name = d.Get("objects").(*schema.Set).List()[0].(string)
+	}
+
+	return grantReadRoleCTE + fmt.Sprintf(`
+SELECT r.oid IS NOT NULL, true,
+    (SELECT pg_catalog.array_agg(a.privilege_type)
+     FROM pg_catalog.%s o, pg_catalog.aclexplode(o.%s) a
+     WHERE o.%s = $2 AND a.grantee = r.oid)
+FROM r
+`, catalog, acl, nameColumn), []any{role, name}
+}
+
+func readSingleObjectRolePrivileges(db *DBConnection, d *schema.ResourceData) error {
+	query, args := buildReadSingleObjectRolePrivilegesQuery(d)
+	rows, err := queryGrantRead(db, d, query, args...)
+	if err != nil {
+		return fmt.Errorf("could not read privileges: %w", err)
+	}
+	if rows == nil {
+		return nil
+	}
+	defer closeGrantReadRows(rows)
+
+	if !rows.Next() {
+		if err := rows.Err(); err != nil {
+			return fmt.Errorf("could not read privileges: %w", err)
+		}
+		return fmt.Errorf("could not read privileges: query returned no row")
+	}
+
+	var roleExists, schemaExists bool
+	var privileges pq.ByteaArray
+	if err := rows.Scan(&roleExists, &schemaExists, &privileges); err != nil {
+		return fmt.Errorf("could not read privileges: %w", err)
+	}
+	if grantTargetGone(d, roleExists, schemaExists) {
+		return nil
+	}
+	d.SetId(generateGrantID(d))
+
 	granted := pgArrayToSet(privileges)
 	if !resourcePrivilegesEqual(granted, db, d) {
 		return d.Set("privileges", granted)
@@ -284,122 +383,80 @@ WHERE grantee = $2
 	return nil
 }
 
-func readSchemaRolePrivileges(txn *sql.Tx, db *DBConnection, d *schema.ResourceData, roleOID uint32) error {
-	dbName := d.Get("schema").(string)
-	query := `
-SELECT array_agg(privilege_type)
-FROM (
-	SELECT (aclexplode(nspacl)).* FROM pg_namespace WHERE nspname=$1
-) as privileges
-WHERE grantee = $2
+// buildReadColumnRolePrivilegesQuery builds the Read query for column grants.
+// It returns role_exists and schema_exists on every row, then one row per
+// column of the table that has the wanted privilege explicitly granted to the
+// role (attacl holds only explicit column grants), or a single row with NULL
+// table/column when there is none.
+func buildReadColumnRolePrivilegesQuery(d *schema.ResourceData) (string, []any) {
+	query := grantReadRoleCTE + grantReadSchemaCTE + `
+SELECT r.oid IS NOT NULL, EXISTS (SELECT 1 FROM n), o.table_name, o.column_name, o.column_privileges
+FROM r
+LEFT JOIN LATERAL (
+    SELECT c.relname AS table_name, att.attname AS column_name, array_agg(a.privilege_type) AS column_privileges
+    FROM pg_class c
+    JOIN n ON n.oid = c.relnamespace
+    JOIN pg_attribute att ON att.attrelid = c.oid
+    CROSS JOIN LATERAL aclexplode(att.attacl) a
+    WHERE c.relname = $3 AND c.relkind = $4 AND a.grantee = r.oid AND a.privilege_type = $5
+    GROUP BY c.relname, att.attname, a.privilege_type
+) o ON true
+ORDER BY o.column_name
 `
-
-	var privileges pq.ByteaArray
-	if err := txn.QueryRow(query, dbName, roleOID).Scan(&privileges); err != nil {
-		return fmt.Errorf("could not read privileges for schema %s: %w", dbName, err)
+	return query, []any{
+		d.Get("role").(string),
+		d.Get("schema").(string),
+		d.Get("objects").(*schema.Set).List()[0],
+		objectTypes["table"],
+		d.Get("privileges").(*schema.Set).List()[0],
 	}
-
-	granted := pgArrayToSet(privileges)
-	if !resourcePrivilegesEqual(granted, db, d) {
-		return d.Set("privileges", granted)
-	}
-	return nil
 }
 
-func readForeignDataWrapperRolePrivileges(txn *sql.Tx, db *DBConnection, d *schema.ResourceData, roleOID uint32) error {
-	objects := d.Get("objects").(*schema.Set).List()
-	fdwName := objects[0].(string)
-	query := `
-SELECT pg_catalog.array_agg(privilege_type)
-FROM (
-	SELECT (pg_catalog.aclexplode(fdwacl)).* FROM pg_catalog.pg_foreign_data_wrapper WHERE fdwname=$1
-) as privileges
-WHERE grantee = $2
-`
-
-	var privileges pq.ByteaArray
-	if err := txn.QueryRow(query, fdwName, roleOID).Scan(&privileges); err != nil {
-		return fmt.Errorf("could not read privileges for foreign data wrapper %s: %w", fdwName, err)
-	}
-
-	granted := pgArrayToSet(privileges)
-	if !resourcePrivilegesEqual(granted, db, d) {
-		return d.Set("privileges", granted)
-	}
-	return nil
-}
-
-func readForeignServerRolePrivileges(txn *sql.Tx, db *DBConnection, d *schema.ResourceData, roleOID uint32) error {
-	objects := d.Get("objects").(*schema.Set).List()
-	srvName := objects[0].(string)
-	query := `
-SELECT pg_catalog.array_agg(privilege_type)
-FROM (
-	SELECT (pg_catalog.aclexplode(srvacl)).* FROM pg_catalog.pg_foreign_server WHERE srvname=$1
-) as privileges
-WHERE grantee = $2
-`
-
-	var privileges pq.ByteaArray
-	if err := txn.QueryRow(query, srvName, roleOID).Scan(&privileges); err != nil {
-		return fmt.Errorf("could not read privileges for foreign server %s: %w", srvName, err)
-	}
-
-	granted := pgArrayToSet(privileges)
-	if !resourcePrivilegesEqual(granted, db, d) {
-		return d.Set("privileges", granted)
-	}
-	return nil
-}
-
-func readColumnRolePrivileges(txn *sql.Tx, d *schema.ResourceData) error {
+func readColumnRolePrivileges(db *DBConnection, d *schema.ResourceData) error {
 	objects := d.Get("objects").(*schema.Set)
 
 	missingColumns := d.Get("columns").(*schema.Set) // Getting columns from state.
 	// If the query returns a column, it is a removed from the missingColumns.
 
-	var rows *sql.Rows
-
-	// The attacl column of pg_attribute contains information only about explicit column grants
-	query := `
-SELECT relname AS table_name, attname AS column_name, array_agg(privilege_type) AS column_privileges
-FROM (SELECT relname, attname, (aclexplode(attacl)).*
-      FROM pg_class
-               JOIN pg_namespace ON pg_class.relnamespace = pg_namespace.oid
-               JOIN pg_attribute ON pg_class.oid = attrelid
-      WHERE nspname = $2
-        AND relname = $3
-        AND relkind = $4)
-         AS col_privs
-         JOIN pg_roles ON pg_roles.oid = col_privs.grantee
-WHERE rolname = $1
-  AND privilege_type = $5
-GROUP BY col_privs.relname, col_privs.attname, col_privs.privilege_type
-ORDER BY col_privs.attname
-;`
-	rows, err := txn.Query(
-		query, d.Get("role").(string), d.Get("schema"), objects.List()[0], objectTypes["table"], d.Get("privileges").(*schema.Set).List()[0],
-	)
-
+	query, args := buildReadColumnRolePrivilegesQuery(d)
+	rows, err := queryGrantRead(db, d, query, args...)
 	if err != nil {
 		return err
 	}
+	if rows == nil {
+		return nil
+	}
+	defer closeGrantReadRows(rows)
 
+	checked := false
 	for rows.Next() {
-		var objName string
-		var colName string
+		var roleExists, schemaExists bool
+		var objName, colName sql.NullString
 		var privileges pq.ByteaArray
 
-		if err := rows.Scan(&objName, &colName, &privileges); err != nil {
+		if err := rows.Scan(&roleExists, &schemaExists, &objName, &colName, &privileges); err != nil {
 			return err
 		}
 
-		if objects.Len() > 0 && !objects.Contains(objName) {
+		if !checked {
+			if grantTargetGone(d, roleExists, schemaExists) {
+				return nil
+			}
+			d.SetId(generateGrantID(d))
+			checked = true
+		}
+
+		if !objName.Valid {
+			// No column has the privilege: only the existence flags were returned.
 			continue
 		}
 
-		if missingColumns.Contains(colName) {
-			missingColumns.Remove(colName)
+		if objects.Len() > 0 && !objects.Contains(objName.String) {
+			continue
+		}
+
+		if missingColumns.Contains(colName.String) {
+			missingColumns.Remove(colName.String)
 		}
 
 		privilegesSet := pgArrayToSet(privileges)
@@ -409,11 +466,17 @@ ORDER BY col_privs.attname
 			// we return its privileges to force an update.
 			log.Printf(
 				"[DEBUG] %s %s has not the expected privileges %v for role %s",
-				strings.ToTitle("column"), objName, privileges, d.Get("role"),
+				strings.ToTitle("column"), objName.String, privileges, d.Get("role"),
 			)
 			d.Set("privileges", privilegesSet)
 			break
 		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if !checked {
+		return fmt.Errorf("could not read column privileges: query returned no row")
 	}
 
 	if missingColumns.Len() > 0 {
@@ -431,13 +494,18 @@ ORDER BY col_privs.attname
 }
 
 // buildReadTableRolePrivilegesQuery builds the Read query and bind arguments
-// for the table/sequence object types. When the resource lists explicit
-// objects, the relname filter is pushed into the query (relname = ANY) instead
-// of fetching every relation of this relkind in the schema and discarding the
-// surplus afterwards; on schemas with many relations this avoids transferring
-// rows that are immediately dropped. An empty objects set means "all objects in
-// the schema", so the predicate is only added when objects are listed — the
-// empty case returns the query without it and a three-argument bind list.
+// for the table/sequence object types. It returns role_exists and
+// schema_exists on every row, then one row per relation of the relkind in the
+// schema with the privileges granted to the role, or a single row with a NULL
+// relation when there is none (or when the role or schema is missing).
+//
+// When the resource lists explicit objects, the relname filter is pushed into
+// the query (relname = ANY) instead of fetching every relation of this relkind
+// in the schema and discarding the surplus afterwards; on schemas with many
+// relations this avoids transferring rows that are immediately dropped. An
+// empty objects set means "all objects in the schema", so the predicate is only
+// added when objects are listed — the empty case returns the query without it
+// and a three-argument bind list.
 //
 // The ACL is exploded per selected relation through LEFT JOIN LATERAL rather
 // than in a subquery over the whole pg_class joined back by name: with the
@@ -445,16 +513,19 @@ ORDER BY col_privs.attname
 // aclexplode over every relation in the catalog once per matched object.
 // Relations without an ACL entry for the role (including a NULL relacl) still
 // produce a row with an empty privilege array.
-func buildReadTableRolePrivilegesQuery(roleOID uint32, schemaName, relkind string, objects *schema.Set) (string, []interface{}) {
-	query := `
-SELECT c.relname, array_remove(array_agg(a.privilege_type), NULL)
-FROM pg_class c
-JOIN pg_namespace n ON n.oid = c.relnamespace
+func buildReadTableRolePrivilegesQuery(role, schemaName, relkind string, objects *schema.Set) (string, []interface{}) {
+	query := grantReadRoleCTE + grantReadSchemaCTE + `
+SELECT r.oid IS NOT NULL, EXISTS (SELECT 1 FROM n), o.relname, o.privileges
+FROM r
 LEFT JOIN LATERAL (
-    SELECT privilege_type FROM aclexplode(c.relacl) WHERE grantee = $1
-) a ON true
-WHERE n.nspname = $2 AND c.relkind = $3`
-	args := []interface{}{roleOID, schemaName, relkind}
+    SELECT c.relname, array_remove(array_agg(a.privilege_type), NULL) AS privileges
+    FROM pg_class c
+    JOIN n ON n.oid = c.relnamespace
+    LEFT JOIN LATERAL (
+        SELECT privilege_type FROM aclexplode(c.relacl) WHERE grantee = r.oid
+    ) a ON true
+    WHERE c.relkind = $3`
+	args := []interface{}{role, schemaName, relkind}
 
 	if objects.Len() > 0 {
 		objectNames := make([]string, 0, objects.Len())
@@ -464,66 +535,64 @@ WHERE n.nspname = $2 AND c.relkind = $3`
 		query += " AND c.relname = ANY($4)"
 		args = append(args, pq.Array(objectNames))
 	}
-	query += "\nGROUP BY c.relname\n"
+	query += `
+    GROUP BY c.relname
+) o ON true
+`
 
 	return query, args
 }
 
-func readRolePrivileges(txn *sql.Tx, db *DBConnection, d *schema.ResourceData) error {
+// buildReadFunctionRolePrivilegesQuery builds the Read query for the
+// function/procedure/routine object types: role_exists and schema_exists on
+// every row, then one row per function name in the schema (overloads merged)
+// with the privileges granted to the role, or a single row with a NULL name.
+// Every function of the schema is returned: the resource's objects may carry
+// argument signatures, so they are still matched by name in Go.
+func buildReadFunctionRolePrivilegesQuery(role, schemaName string) (string, []interface{}) {
+	query := grantReadRoleCTE + grantReadSchemaCTE + `
+SELECT r.oid IS NOT NULL, EXISTS (SELECT 1 FROM n), o.proname, o.privileges
+FROM r
+LEFT JOIN LATERAL (
+    SELECT p.proname, array_remove(array_agg(a.privilege_type), NULL) AS privileges
+    FROM pg_proc p
+    JOIN n ON n.oid = p.pronamespace
+    LEFT JOIN LATERAL (
+        SELECT privilege_type FROM aclexplode(p.proacl) WHERE grantee = r.oid
+    ) a ON true
+    GROUP BY p.proname
+) o ON true
+`
+	return query, []interface{}{role, schemaName}
+}
+
+// readRolePrivileges reads the privileges granted to the role with a single
+// statement on the target database, without a transaction. The same statement
+// reports whether the role and the schema still exist: a missing database,
+// role or schema removes the resource from state, so a dropped object is never
+// confused with an object without privileges.
+func readRolePrivileges(db *DBConnection, d *schema.ResourceData) error {
 	role := d.Get("role").(string)
 	objectType := d.Get("object_type").(string)
 	objects := d.Get("objects").(*schema.Set)
 
-	roleOID, err := getRoleOID(txn, role)
-	if err != nil {
-		return err
-	}
-
 	var query string
-	var rows *sql.Rows
+	var args []interface{}
 
 	switch objectType {
-	case "database":
-		return readDatabaseRolePrivileges(txn, db, d, roleOID)
-
-	case "schema":
-		return readSchemaRolePrivileges(txn, db, d, roleOID)
-
-	case "foreign_data_wrapper":
-		return readForeignDataWrapperRolePrivileges(txn, db, d, roleOID)
-
-	case "foreign_server":
-		return readForeignServerRolePrivileges(txn, db, d, roleOID)
-
-	case "function", "procedure", "routine":
-		query = `
-SELECT pg_proc.proname, array_remove(array_agg(privilege_type), NULL)
-FROM pg_proc
-JOIN pg_namespace ON pg_namespace.oid = pg_proc.pronamespace
-LEFT JOIN (
-    select acls.*
-    from (
-             SELECT proname, pronamespace, (aclexplode(proacl)).* FROM pg_proc
-         ) acls
-    WHERE grantee = $1
-) privs
-USING (proname, pronamespace)
-      WHERE nspname = $2
-GROUP BY pg_proc.proname
-`
-		rows, err = txn.Query(
-			query, roleOID, d.Get("schema"),
-		)
+	case "database", "schema", "foreign_data_wrapper", "foreign_server":
+		return readSingleObjectRolePrivileges(db, d)
 
 	case "column":
-		return readColumnRolePrivileges(txn, d)
+		return readColumnRolePrivileges(db, d)
+
+	case "function", "procedure", "routine":
+		query, args = buildReadFunctionRolePrivilegesQuery(role, d.Get("schema").(string))
 
 	default:
-		var args []interface{}
 		query, args = buildReadTableRolePrivilegesQuery(
-			roleOID, d.Get("schema").(string), objectTypes[objectType], objects,
+			role, d.Get("schema").(string), objectTypes[objectType], objects,
 		)
-		rows, err = txn.Query(query, args...)
 	}
 
 	// This returns, for the specified role (rolname),
@@ -531,23 +600,44 @@ GROUP BY pg_proc.proname
 	// with the list of the currently applied privileges (aggregation of privilege_type)
 	//
 	// Our goal is to check that every object has the same privileges as saved in the state.
+	rows, err := queryGrantRead(db, d, query, args...)
 	if err != nil {
 		return err
 	}
+	if rows == nil {
+		return nil
+	}
+	defer closeGrantReadRows(rows)
 
+	checked := false
 	for rows.Next() {
-		var objName string
+		var roleExists, schemaExists bool
+		var objName sql.NullString
 		var privileges pq.ByteaArray
 
-		if err := rows.Scan(&objName, &privileges); err != nil {
+		if err := rows.Scan(&roleExists, &schemaExists, &objName, &privileges); err != nil {
 			return err
+		}
+
+		if !checked {
+			if grantTargetGone(d, roleExists, schemaExists) {
+				return nil
+			}
+			d.SetId(generateGrantID(d))
+			checked = true
+		}
+
+		if !objName.Valid {
+			// The schema has no object of this type: only the existence flags
+			// were returned.
+			continue
 		}
 
 		// For the table/sequence path this set is already filtered in SQL
 		// above; the check is kept because the function/procedure/routine path
 		// still fetches every object in the schema (its object names may carry
 		// argument signatures, so it is filtered here rather than in SQL).
-		if objects.Len() > 0 && !objects.Contains(objName) {
+		if objects.Len() > 0 && !objects.Contains(objName.String) {
 			continue
 		}
 
@@ -557,11 +647,17 @@ GROUP BY pg_proc.proname
 			// we return its privileges to force an update.
 			log.Printf(
 				"[DEBUG] %s %s has not the expected privileges %v for role %s",
-				strings.ToTitle(objectType), objName, privileges, d.Get("role"),
+				strings.ToTitle(objectType), objName.String, privileges, d.Get("role"),
 			)
 			d.Set("privileges", privilegesSet)
 			break
 		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if !checked {
+		return fmt.Errorf("could not read privileges: query returned no row")
 	}
 
 	return nil
@@ -759,53 +855,6 @@ func revokeRolePrivileges(txn *sql.Tx, d *schema.ResourceData, usePrevious bool)
 		return fmt.Errorf("could not execute revoke query: %w", err)
 	}
 	return nil
-}
-
-func checkRoleDBSchemaExists(db *DBConnection, d *schema.ResourceData) (bool, error) {
-	// Check the database exists
-	database := d.Get("database").(string)
-	exists, err := dbExists(db, database)
-	if err != nil {
-		return false, err
-	}
-	if !exists {
-		log.Printf("[DEBUG] database %s does not exists", database)
-		return false, nil
-	}
-
-	txn, err := startTransaction(db.client, database)
-	if err != nil {
-		return false, err
-	}
-	defer deferredRollback(txn)
-
-	// Check the role exists
-	role := d.Get("role").(string)
-	if role != publicRole {
-		exists, err := roleExists(txn, role)
-		if err != nil {
-			return false, err
-		}
-		if !exists {
-			log.Printf("[DEBUG] role %s does not exists", role)
-			return false, nil
-		}
-	}
-
-	// Check the schema exists (the SQL connection needs to be on the right database)
-	pgSchema := d.Get("schema").(string)
-	if !sliceContainsStr([]string{"database", "foreign_data_wrapper", "foreign_server"}, d.Get("object_type").(string)) && pgSchema != "" {
-		exists, err = schemaExists(txn, pgSchema)
-		if err != nil {
-			return false, err
-		}
-		if !exists {
-			log.Printf("[DEBUG] schema %s does not exists", pgSchema)
-			return false, nil
-		}
-	}
-
-	return true, nil
 }
 
 func generateGrantID(d *schema.ResourceData) string {
