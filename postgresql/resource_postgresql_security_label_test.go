@@ -11,6 +11,8 @@ import (
 )
 
 func TestAccPostgresqlSecurityLabel_Basic(t *testing.T) {
+	roleName := testUniqueName("security_label_test_role")
+
 	resource.Test(t, resource.TestCase{
 		PreCheck: func() {
 			testAccPreCheck(t)
@@ -21,13 +23,13 @@ func TestAccPostgresqlSecurityLabel_Basic(t *testing.T) {
 		CheckDestroy: testAccCheckPostgresqlSecurityLabelDestroy,
 		Steps: []resource.TestStep{
 			{
-				Config: testAccPostgresqlSecurityLabelConfig,
+				Config: testAccPostgresqlSecurityLabelConfig(roleName),
 				Check: resource.ComposeTestCheckFunc(
 					testAccCheckPostgresqlSecurityLabelExists("postgresql_security_label.test_label"),
 					resource.TestCheckResourceAttr(
 						"postgresql_security_label.test_label", "object_type", "role"),
 					resource.TestCheckResourceAttr(
-						"postgresql_security_label.test_label", "object_name", "security_label_test_role"),
+						"postgresql_security_label.test_label", "object_name", roleName),
 					resource.TestCheckResourceAttr(
 						"postgresql_security_label.test_label", "label_provider", "dummy"),
 					resource.TestCheckResourceAttr(
@@ -39,6 +41,10 @@ func TestAccPostgresqlSecurityLabel_Basic(t *testing.T) {
 }
 
 func TestAccPostgresqlSecurityLabel_Update(t *testing.T) {
+	roleName := testUniqueName("security_label_test_role")
+	// The hyphen checks that the role name is quoted.
+	roleName2 := testUniqueName("security_label_test-role2")
+
 	resource.Test(t, resource.TestCase{
 		PreCheck: func() {
 			testAccPreCheck(t)
@@ -49,13 +55,13 @@ func TestAccPostgresqlSecurityLabel_Update(t *testing.T) {
 		CheckDestroy: testAccCheckPostgresqlSecurityLabelDestroy,
 		Steps: []resource.TestStep{
 			{
-				Config: testAccPostgresqlSecurityLabelConfig,
+				Config: testAccPostgresqlSecurityLabelConfig(roleName),
 				Check: resource.ComposeTestCheckFunc(
 					testAccCheckPostgresqlSecurityLabelExists("postgresql_security_label.test_label"),
 					resource.TestCheckResourceAttr(
 						"postgresql_security_label.test_label", "object_type", "role"),
 					resource.TestCheckResourceAttr(
-						"postgresql_security_label.test_label", "object_name", "security_label_test_role"),
+						"postgresql_security_label.test_label", "object_name", roleName),
 					resource.TestCheckResourceAttr(
 						"postgresql_security_label.test_label", "label_provider", "dummy"),
 					resource.TestCheckResourceAttr(
@@ -63,7 +69,7 @@ func TestAccPostgresqlSecurityLabel_Update(t *testing.T) {
 				),
 			},
 			{
-				Config: testAccPostgresqlSecurityLabelChanges2,
+				Config: testAccPostgresqlSecurityLabelChanges2(roleName),
 				Check: resource.ComposeTestCheckFunc(
 					testAccCheckPostgresqlSecurityLabelExists("postgresql_security_label.test_label"),
 					resource.TestCheckResourceAttr(
@@ -71,11 +77,11 @@ func TestAccPostgresqlSecurityLabel_Update(t *testing.T) {
 				),
 			},
 			{
-				Config: testAccPostgresqlSecurityLabelChanges3,
+				Config: testAccPostgresqlSecurityLabelChanges3(roleName2),
 				Check: resource.ComposeTestCheckFunc(
 					testAccCheckPostgresqlSecurityLabelExists("postgresql_security_label.test_label"),
 					resource.TestCheckResourceAttr(
-						"postgresql_security_label.test_label", "object_name", "security_label_test-role2"),
+						"postgresql_security_label.test_label", "object_name", roleName2),
 				),
 			},
 		},
@@ -171,9 +177,10 @@ func testAccCheckPostgresqlSecurityLabelExists(n string) resource.TestCheckFunc 
 	}
 }
 
-var testAccPostgresqlSecurityLabelConfig = `
+func testAccPostgresqlSecurityLabelConfig(roleName string) string {
+	return fmt.Sprintf(`
 resource "postgresql_role" "test_role" {
-  name            = "security_label_test_role"
+  name            = "%s"
   login           = true
   create_database = true
 }
@@ -183,11 +190,13 @@ resource "postgresql_security_label" "test_label" {
   label_provider = "dummy"
   label          = "secret"
 }
-`
+`, roleName)
+}
 
-var testAccPostgresqlSecurityLabelChanges2 = `
+func testAccPostgresqlSecurityLabelChanges2(roleName string) string {
+	return fmt.Sprintf(`
 resource "postgresql_role" "test_role" {
-  name            = "security_label_test_role"
+  name            = "%s"
   login           = true
   create_database = true
 }
@@ -197,11 +206,13 @@ resource "postgresql_security_label" "test_label" {
   label_provider = "dummy"
   label          = "top secret"
 }
-`
+`, roleName)
+}
 
-var testAccPostgresqlSecurityLabelChanges3 = `
+func testAccPostgresqlSecurityLabelChanges3(roleName string) string {
+	return fmt.Sprintf(`
 resource "postgresql_role" "test_role" {
-  name            = "security_label_test-role2"
+  name            = "%s"
   login           = true
   create_database = true
 }
@@ -211,4 +222,5 @@ resource "postgresql_security_label" "test_label" {
   label_provider = "dummy"
   label          = "top secret"
 }
-`
+`, roleName)
+}
