@@ -126,7 +126,12 @@ resource "postgresql_role" "app_user" {
   [PostgreSQL's `password_encryption` setting](https://www.postgresql.org/docs/current/static/runtime-config-connection.html#GUC-PASSWORD-ENCRYPTION).
 
 * `password` - (Optional) Sets the role's password. A password is only of use
-  for roles having the `login` attribute set to true.
+  for roles having the `login` attribute set to true. The value is stored
+  exactly as configured, including backslashes. Earlier versions of the
+  provider doubled every backslash in a password (with the default
+  `standard_conforming_strings = on`); such a role gets the configured
+  password the next time the provider sets it, for example when the
+  password in the configuration changes.
 
 * `password_wo` - (Optional) Sets the role's password without storing it in the state file.
   This is useful for managing passwords securely. Must be used together with `password_wo_version`.
@@ -141,6 +146,13 @@ resource "postgresql_role" "app_user" {
   On update, only the roles added to or removed from the list are granted or
   revoked; memberships that stay in the list (and their `ADMIN OPTION`) are not
   touched, and an update that does not change `roles` does not touch memberships.
+  The list is still authoritative: after a refresh, a membership granted
+  outside of Terraform shows up as a change and is revoked by the next apply.
+  A membership granted outside of Terraform after the last refresh (for
+  example with `-refresh=false`) is left in place by an update. If you manage
+  memberships of the same role with `postgresql_grant_role`, add `roles` to
+  `ignore_changes` (see
+  [`postgresql_grant_role`](postgresql_grant_role.html)).
 
 * `search_path` - (Optional) Alters the search path of this new role. Note that
   due to limitations in the implementation, values cannot contain the substring
