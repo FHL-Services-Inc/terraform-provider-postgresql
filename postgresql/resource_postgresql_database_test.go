@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"os"
 	"strconv"
 	"testing"
 
@@ -558,6 +559,89 @@ resource "postgresql_database" "mydb_default_owner" {
 
 `
 
+// TestAccPostgresqlDatabase_DropWithIdleConnections drops and recreates a
+// database that the provider holds pooled connections to (because a schema
+// lives in it) with max_idle_connections > 0. The pool for the dropped
+// database must be evicted, otherwise the recreated database would be reached
+// through stale, server-terminated connections.
+func TestAccPostgresqlDatabase_DropWithIdleConnections(t *testing.T) {
+	const dbName = "tf_tests_idle_conns_db"
+
+	// dbRegistry is process-wide and keyed by DSN only, so a pool opened by
+	// an earlier test (with max_idle_connections = 0) would be reused here.
+	// A connect_timeout unique to this test gives the provider its own DSN,
+	// hence its own pools.
+	providerOnly := `
+provider "postgresql" {
+  max_idle_connections = 2
+  connect_timeout      = 175
+}
+`
+
+	config := providerOnly + fmt.Sprintf(`
+resource "postgresql_database" "db" {
+  name = "%[1]s"
+}
+
+resource "postgresql_schema" "schema" {
+  name     = "idle_conns"
+  database = postgresql_database.db.name
+}
+`, dbName)
+
+	resource.Test(t, resource.TestCase{
+		PreCheck: func() { testAccPreCheck(t) },
+		// ProviderFactories (unlike Providers) lets the step config carry its
+		// own provider block with max_idle_connections set.
+		ProviderFactories: map[string]func() (*schema.Provider, error){
+			"postgresql": func() (*schema.Provider, error) { return testAccProvider, nil },
+		},
+		CheckDestroy: testAccCheckPostgresqlDatabaseDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config: config,
+				Check: resource.ComposeTestCheckFunc(
+					testAccCheckPostgresqlDatabaseExists("postgresql_database.db"),
+					resource.TestCheckResourceAttr("postgresql_schema.schema", "database", dbName),
+					testAccCheckDBConnectionRegistered(dbName, true),
+				),
+			},
+			{
+				// Drop the database (and the schema in it).
+				Config: providerOnly,
+				Check:  testAccCheckDBConnectionRegistered(dbName, false),
+			},
+			{
+				// Recreate it under the same name and connect into it again.
+				Config: config,
+				Check: resource.ComposeTestCheckFunc(
+					testAccCheckPostgresqlDatabaseExists("postgresql_database.db"),
+					resource.TestCheckResourceAttr("postgresql_schema.schema", "database", dbName),
+					testAccCheckDBConnectionRegistered(dbName, true),
+				),
+			},
+		},
+	})
+}
+
+// testAccCheckDBConnectionRegistered checks whether the provider currently
+// holds a pooled connection to the given database in dbRegistry.
+func testAccCheckDBConnectionRegistered(dbName string, want bool) resource.TestCheckFunc {
+	return func(s *terraform.State) error {
+		client := testAccProvider.Meta().(*Client)
+		dsn := client.config.connStr(dbName)
+
+		dbRegistryLock.Lock()
+		_, found := dbRegistry[dsn]
+		dbRegistryLock.Unlock()
+
+		if found != want {
+			return fmt.Errorf("connection to database %q registered = %t, want %t", dbName, found, want)
+		}
+		return nil
+	}
+}
+
 // singleConnProviderFactories lets a step config carry its own provider block
 // (max_connections), which Providers does not.
 var singleConnProviderFactories = map[string]func() (*schema.Provider, error){
@@ -614,7 +698,11 @@ resource "postgresql_database" "db" {
 				),
 			},
 			{
-				Config: dbConfig("owner2"),
+				// ALTER DATABASE OWNER also needs membership in the current
+				// owner, which setDBOwner does not grant, so a non-superuser
+				// cannot change the owner here (same without max_connections).
+				SkipFunc: func() (bool, error) { return os.Getenv("PGSUPERUSER") == "false", nil },
+				Config:   dbConfig("owner2"),
 				Check: resource.ComposeTestCheckFunc(
 					testAccCheckPostgresqlDatabaseExists("postgresql_database.db"),
 					resource.TestCheckResourceAttr("postgresql_database.db", "owner", "tf_tests_single_conn_owner2"),
@@ -843,87 +931,4 @@ resource "postgresql_database" "quoted" {
 			},
 		},
 	})
-}
-
-// TestAccPostgresqlDatabase_DropWithIdleConnections drops and recreates a
-// database that the provider holds pooled connections to (because a schema
-// lives in it) with max_idle_connections > 0. The pool for the dropped
-// database must be evicted, otherwise the recreated database would be reached
-// through stale, server-terminated connections.
-func TestAccPostgresqlDatabase_DropWithIdleConnections(t *testing.T) {
-	const dbName = "tf_tests_idle_conns_db"
-
-	// dbRegistry is process-wide and keyed by DSN only, so a pool opened by
-	// an earlier test (with max_idle_connections = 0) would be reused here.
-	// A connect_timeout unique to this test gives the provider its own DSN,
-	// hence its own pools.
-	providerOnly := `
-provider "postgresql" {
-  max_idle_connections = 2
-  connect_timeout      = 175
-}
-`
-
-	config := providerOnly + fmt.Sprintf(`
-resource "postgresql_database" "db" {
-  name = "%[1]s"
-}
-
-resource "postgresql_schema" "schema" {
-  name     = "idle_conns"
-  database = postgresql_database.db.name
-}
-`, dbName)
-
-	resource.Test(t, resource.TestCase{
-		PreCheck: func() { testAccPreCheck(t) },
-		// ProviderFactories (unlike Providers) lets the step config carry its
-		// own provider block with max_idle_connections set.
-		ProviderFactories: map[string]func() (*schema.Provider, error){
-			"postgresql": func() (*schema.Provider, error) { return testAccProvider, nil },
-		},
-		CheckDestroy: testAccCheckPostgresqlDatabaseDestroy,
-		Steps: []resource.TestStep{
-			{
-				Config: config,
-				Check: resource.ComposeTestCheckFunc(
-					testAccCheckPostgresqlDatabaseExists("postgresql_database.db"),
-					resource.TestCheckResourceAttr("postgresql_schema.schema", "database", dbName),
-					testAccCheckDBConnectionRegistered(dbName, true),
-				),
-			},
-			{
-				// Drop the database (and the schema in it).
-				Config: providerOnly,
-				Check:  testAccCheckDBConnectionRegistered(dbName, false),
-			},
-			{
-				// Recreate it under the same name and connect into it again.
-				Config: config,
-				Check: resource.ComposeTestCheckFunc(
-					testAccCheckPostgresqlDatabaseExists("postgresql_database.db"),
-					resource.TestCheckResourceAttr("postgresql_schema.schema", "database", dbName),
-					testAccCheckDBConnectionRegistered(dbName, true),
-				),
-			},
-		},
-	})
-}
-
-// testAccCheckDBConnectionRegistered checks whether the provider currently
-// holds a pooled connection to the given database in dbRegistry.
-func testAccCheckDBConnectionRegistered(dbName string, want bool) resource.TestCheckFunc {
-	return func(s *terraform.State) error {
-		client := testAccProvider.Meta().(*Client)
-		dsn := client.config.connStr(dbName)
-
-		dbRegistryLock.Lock()
-		_, found := dbRegistry[dsn]
-		dbRegistryLock.Unlock()
-
-		if found != want {
-			return fmt.Errorf("connection to database %q registered = %t, want %t", dbName, found, want)
-		}
-		return nil
-	}
 }

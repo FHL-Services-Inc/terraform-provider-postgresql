@@ -57,3 +57,20 @@ func TestProviderMaxIdleConnectionsEnvDefault(t *testing.T) {
 		t.Errorf("with PGMAXIDLECONNECTIONS=4: DefaultValue() = %#v, %v; want \"4\"", v, err)
 	}
 }
+
+func TestProviderMaxTotalConnectionsEnvDefault(t *testing.T) {
+	s := Provider().Schema["max_total_connections"]
+	if s == nil {
+		t.Fatal("provider has no max_total_connections argument")
+	}
+
+	t.Setenv("PGMAXTOTALCONNECTIONS", "")
+	if v, err := s.DefaultValue(); err != nil || v != 0 {
+		t.Errorf("without PGMAXTOTALCONNECTIONS: DefaultValue() = %v, %v; want 0", v, err)
+	}
+
+	t.Setenv("PGMAXTOTALCONNECTIONS", "10")
+	if v, err := s.DefaultValue(); err != nil || v != "10" {
+		t.Errorf("with PGMAXTOTALCONNECTIONS=10: DefaultValue() = %#v, %v; want \"10\"", v, err)
+	}
+}

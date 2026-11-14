@@ -176,6 +176,9 @@ The following arguments are supported:
   seconds, across all connection retries. The default is `5`.
 * `max_connections` - (Optional) Set the maximum number of open connections to
   the database. The default is `20`.  Zero means unlimited open connections.
+  The provider keeps a separate pool for each database it connects to, so this
+  limit applies per database; use `max_total_connections` for a limit across
+  all databases.
 * `max_idle_connections` - (Optional) Maximum number of idle connections kept
   open for reuse, per database the provider connects to. The default is `0`:
   every connection is closed once it is returned, so each query opens a new
@@ -193,6 +196,26 @@ The following arguments are supported:
   PostgreSQL 13+. The value is capped to `max_connections` when the latter is
   non-zero. It can also be set with the `PGMAXIDLECONNECTIONS` environment
   variable.
+* `max_total_connections` - (Optional) Maximum number of connections open at
+  once to the server, across all the databases the provider connects to. The
+  limit is shared by every provider configuration (alias) that connects to the
+  same host and port as the same user. The default is `0`: no limit besides
+  `max_connections` per database. Without it, the connections the provider
+  holds add up across databases: with `max_idle_connections` set, each
+  database's pool can keep up to `max_connections` connections, so peak usage
+  grows with the number of databases. When the limit is reached, the provider
+  closes an idle connection of another database to open the one it needs, and
+  otherwise waits for one to be returned. If none becomes available within
+  `connect_timeout` (180 seconds when `connect_timeout` is zero), the operation
+  fails with an error instead of waiting forever; raise the limit or lower
+  `terraform -parallelism`. Setting it also caps `max_connections` to the same
+  value. With pooling, set `max_idle_connections = max_total_connections`.
+  Each connection belongs to one database, so a limit close to or below
+  `-parallelism` makes the provider close and reopen connections to move them
+  between databases; about twice `-parallelism` keeps almost all of the reuse.
+  Only supported with the `postgres`
+  scheme; ignored for `awspostgres` and `gcppostgres`. It can also be set with
+  the `PGMAXTOTALCONNECTIONS` environment variable.
 * `conn_max_lifetime_seconds` - (Optional) Maximum lifetime of a connection,
   in seconds. The default is `0`.  Zero means unlimited.
 * `advisory_lock_timeout` - (Optional) Maximum wait, in milliseconds, for the
