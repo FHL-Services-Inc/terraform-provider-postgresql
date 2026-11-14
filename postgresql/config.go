@@ -277,6 +277,12 @@ type Config struct {
 	// Password is left empty, so the DSN and the dbRegistry key carry no
 	// token. It is a pointer: all Clients of a provider share the cache.
 	AuthTokens *authTokenSource
+
+	// CatalogSnapshot lets grant and default privileges Reads share one
+	// per-database catalog snapshot (see catalog_snapshot.go) instead of each
+	// querying the catalogs; CatalogSnapshotTTLSeconds bounds its age.
+	CatalogSnapshot           bool
+	CatalogSnapshotTTLSeconds int
 }
 
 // Client struct holding connection string

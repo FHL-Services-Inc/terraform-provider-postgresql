@@ -47,9 +47,9 @@ LIMIT 1;
 
 func resourcePostgreSQLGrantRole() *schema.Resource {
 	return &schema.Resource{
-		Create: PGResourceFunc(resourcePostgreSQLGrantRoleCreate),
+		Create: PGResourceClusterWriteFunc(resourcePostgreSQLGrantRoleCreate),
 		Read:   PGResourceFunc(resourcePostgreSQLGrantRoleRead),
-		Delete: PGResourceFunc(resourcePostgreSQLGrantRoleDelete),
+		Delete: PGResourceClusterWriteFunc(resourcePostgreSQLGrantRoleDelete),
 		Importer: &schema.ResourceImporter{
 			StateContext: resourcePostgreSQLGrantRoleImport,
 		},
