@@ -455,8 +455,8 @@ func TestAccTokenAuthConnectorRefreshesToken(t *testing.T) {
 	config.MaxIdleConns = 0
 	config.ConnectionRetryTimeoutSeconds = defaultProviderConnectionRetryTimeoutSeconds
 
-	// The empty password keeps this pool apart from the ones other tests
-	// register for the same database.
+	// The auth kind in the registry key keeps this pool apart from the ones
+	// other tests register for the same database.
 	dsn := config.connStr("postgres")
 	if strings.Contains(dsn, ":"+url.PathEscape(password)+"@") {
 		t.Fatalf("connStr() = %q contains the token", dsn)
@@ -467,7 +467,7 @@ func TestAccTokenAuthConnectorRefreshesToken(t *testing.T) {
 	}
 	t.Cleanup(func() {
 		dbRegistryLock.Lock()
-		delete(dbRegistry, dsn)
+		delete(dbRegistry, config.registryKey("postgres"))
 		dbRegistryLock.Unlock()
 		_ = db.Close()
 	})

@@ -206,7 +206,7 @@ func TestConfigEvictDBConnection(t *testing.T) {
 		if err != nil {
 			t.Fatalf("sql.Open() returned unexpected error: %v", err)
 		}
-		dsn := c.connStr(database)
+		dsn := c.registryKey(database)
 		dbRegistryLock.Lock()
 		dbRegistry[dsn] = &DBConnection{DB: db, client: c.NewClient(database)}
 		dbRegistryLock.Unlock()
@@ -303,11 +303,11 @@ func TestConnectConcurrentCallsDialOnce(t *testing.T) {
 		// the fake driver can't answer.
 		ExpectedVersion: semver.MustParse("16.0.0"),
 	}
-	dsn := config.connStr("db")
+	key := config.registryKey("db")
 	t.Cleanup(func() {
 		dbRegistryLock.Lock()
-		conn := dbRegistry[dsn]
-		delete(dbRegistry, dsn)
+		conn := dbRegistry[key]
+		delete(dbRegistry, key)
 		dbRegistryLock.Unlock()
 		if conn != nil {
 			_ = conn.Close()
@@ -360,11 +360,11 @@ func TestConnectDoesNotCacheErrors(t *testing.T) {
 		ConnectionRetryTimeoutSeconds: 5,
 		ExpectedVersion:               semver.MustParse("16.0.0"),
 	}
-	dsn := config.connStr("db")
+	key := config.registryKey("db")
 	t.Cleanup(func() {
 		dbRegistryLock.Lock()
-		conn := dbRegistry[dsn]
-		delete(dbRegistry, dsn)
+		conn := dbRegistry[key]
+		delete(dbRegistry, key)
 		dbRegistryLock.Unlock()
 		if conn != nil {
 			_ = conn.Close()
@@ -379,5 +379,100 @@ func TestConnectDoesNotCacheErrors(t *testing.T) {
 	}
 	if got := drv.attempts.Load(); got != 2 {
 		t.Errorf("expected 2 connection attempts, got %d", got)
+	}
+}
+
+func TestConfigRegistryKeySeparatesAuthKinds(t *testing.T) {
+	tokens := func(name string) *authTokenSource {
+		return newAuthTokenSource(name, func(ctx context.Context) (string, time.Time, error) {
+			return "token", time.Now().Add(time.Hour), nil
+		})
+	}
+	base := Config{Scheme: "postgres", Host: "db", Port: 5432, Username: "app", SSLMode: "require"}
+
+	passwordless := base
+	rdsIAM := base
+	rdsIAM.AuthTokens = tokens("AWS RDS IAM")
+	azure := base
+	azure.AuthTokens = tokens("Azure AD")
+
+	// Precondition: the DSNs are identical, only the auth kind differs.
+	if passwordless.connStr("postgres") != rdsIAM.connStr("postgres") {
+		t.Fatal("expected identical DSNs for passwordless and token auth")
+	}
+
+	keys := map[string]string{}
+	for name, c := range map[string]Config{"passwordless": passwordless, "rds": rdsIAM, "azure": azure} {
+		key := c.registryKey("postgres")
+		if other, dup := keys[key]; dup {
+			t.Errorf("%s and %s share the registry key %q", name, other, key)
+		}
+		keys[key] = name
+	}
+
+	// The impersonated service account changes the pool's identity.
+	gcp := Config{Scheme: "gcppostgres", Host: "project/region/instance", Port: 5432, Username: "app"}
+	gcpImpersonated := gcp
+	gcpImpersonated.GCPIAMImpersonateServiceAccount = "sa@project.iam.gserviceaccount.com"
+	gcpOther := gcp
+	gcpOther.GCPIAMImpersonateServiceAccount = "other@project.iam.gserviceaccount.com"
+	gcpKeys := map[string]bool{}
+	for _, c := range []Config{gcp, gcpImpersonated, gcpOther} {
+		gcpKeys[c.registryKey("postgres")] = true
+	}
+	if len(gcpKeys) != 3 {
+		t.Errorf("gcppostgres configs differing only in the impersonated service account share registry keys: %v", gcpKeys)
+	}
+
+	// Two Clients of the same provider (same token source) share a pool.
+	rdsIAM2 := rdsIAM
+	if rdsIAM.registryKey("postgres") != rdsIAM2.registryKey("postgres") {
+		t.Error("copies of one provider Config must map to the same registry key")
+	}
+	if rdsIAM.registryKey("postgres") == rdsIAM.registryKey("other") {
+		t.Error("different databases must map to different registry keys")
+	}
+}
+
+func TestClientConnectSeparatesAuthKinds(t *testing.T) {
+	drv := &flakyPingDriver{}
+	sql.Register("registry-auth-kind", drv)
+
+	base := Config{Scheme: "postgres", Host: "auth-kind-test", Port: 5432, Username: "app", SSLMode: "disable", ExpectedVersion: semver.MustParse("16.0.0")}
+	tokenAuth := base
+	tokenAuth.AuthTokens = newAuthTokenSource("test", func(ctx context.Context) (string, time.Time, error) {
+		return "token", time.Now().Add(time.Hour), nil
+	})
+
+	for _, c := range []*Config{&base, &tokenAuth} {
+		key := c.registryKey("postgres")
+		db, err := sql.Open("registry-auth-kind", "dsn")
+		if err != nil {
+			t.Fatal(err)
+		}
+		dbRegistryLock.Lock()
+		dbRegistry[key] = &DBConnection{DB: db, client: c.NewClient("postgres")}
+		dbRegistryLock.Unlock()
+		t.Cleanup(func() {
+			dbRegistryLock.Lock()
+			delete(dbRegistry, key)
+			dbRegistryLock.Unlock()
+			_ = db.Close()
+		})
+	}
+
+	plain, err := base.NewClient("postgres").Connect()
+	if err != nil {
+		t.Fatal(err)
+	}
+	token, err := tokenAuth.NewClient("postgres").Connect()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plain == token {
+		t.Error("a passwordless and a token-auth provider got the same pool")
+	}
+	if token.client.config.AuthTokens == nil {
+		t.Error("the token-auth provider got the passwordless pool")
 	}
 }

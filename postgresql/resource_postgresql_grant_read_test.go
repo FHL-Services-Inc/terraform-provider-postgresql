@@ -136,13 +136,13 @@ func newGrantReadConnection(t *testing.T, row []driver.Value, openErr error) *DB
 	client := &Client{config: Config{Scheme: "awspostgres"}, databaseName: "testdb"}
 	conn := &DBConnection{DB: sqlDB, client: client, version: semver.MustParse("16.0.0")}
 
-	dsn := client.config.connStr(client.databaseName)
+	key := client.config.registryKey(client.databaseName)
 	dbRegistryLock.Lock()
-	dbRegistry[dsn] = conn
+	dbRegistry[key] = conn
 	dbRegistryLock.Unlock()
 	t.Cleanup(func() {
 		dbRegistryLock.Lock()
-		delete(dbRegistry, dsn)
+		delete(dbRegistry, key)
 		dbRegistryLock.Unlock()
 		_ = sqlDB.Close()
 	})
