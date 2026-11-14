@@ -10,24 +10,32 @@ import (
 )
 
 func TestAccPostgresqlServer_Basic(t *testing.T) {
+	postgresName := testUniqueName("myserver_postgres")
+	fileName := testUniqueName("myserver_file")
+	ownerName := testUniqueName("owner")
+	config := fmt.Sprintf(testAccPostgresqlServerConfig,
+		postgresName, fileName, ownerName,
+		testUniqueName("with_owner"), testUniqueName("myserver_with_type"), testUniqueName("myserver_with_version"))
+
 	resource.Test(t, resource.TestCase{
 		PreCheck: func() {
 			testAccPreCheck(t)
 			testCheckCompatibleVersion(t, featureServer)
 			testSuperuserPreCheck(t)
+			testDropExtensionsIfExist(t, "postgres_fdw", "file_fdw")
 		},
 		Providers:    testAccProviders,
 		CheckDestroy: testAccCheckPostgresqlServerDestroy,
 		Steps: []resource.TestStep{
 			{
-				Config: testAccPostgresqlServerConfig,
+				Config: config,
 				Check: resource.ComposeTestCheckFunc(
 					testAccCheckPostgresqlServerExists("postgresql_server.myserver_postgres"),
 					testAccCheckPostgresqlServerExists("postgresql_server.myserver_file"),
 					testAccCheckPostgresqlServerExists("postgresql_server.myserver_with_owner"),
 					testAccCheckPostgresqlServerExists("postgresql_server.myserver_with_version"),
 					resource.TestCheckResourceAttr(
-						"postgresql_server.myserver_postgres", "server_name", "myserver_postgres"),
+						"postgresql_server.myserver_postgres", "server_name", postgresName),
 					resource.TestCheckResourceAttr(
 						"postgresql_server.myserver_postgres", "server_owner", "postgres"),
 					resource.TestCheckResourceAttr(
@@ -39,13 +47,13 @@ func TestAccPostgresqlServer_Basic(t *testing.T) {
 					resource.TestCheckResourceAttr(
 						"postgresql_server.myserver_postgres", "options.port", "5432"),
 					resource.TestCheckResourceAttr(
-						"postgresql_server.myserver_file", "server_name", "myserver_file"),
+						"postgresql_server.myserver_file", "server_name", fileName),
 					resource.TestCheckResourceAttr(
 						"postgresql_server.myserver_file", "server_owner", "postgres"),
 					resource.TestCheckResourceAttr(
 						"postgresql_server.myserver_file", "fdw_name", "file_fdw"),
 					resource.TestCheckResourceAttr(
-						"postgresql_server.myserver_with_owner", "server_owner", "owner"),
+						"postgresql_server.myserver_with_owner", "server_owner", ownerName),
 					resource.TestCheckResourceAttr(
 						"postgresql_server.myserver_with_type", "server_type", "slave"),
 					resource.TestCheckResourceAttr(
@@ -122,33 +130,37 @@ func testAccCheckPostgresqlServerExists(n string) resource.TestCheckFunc {
 }
 
 func TestAccPostgresqlServer_Update(t *testing.T) {
+	name := testUniqueName("myserver_postgres")
+	updatedName := testUniqueName("myserver_postgres_updated")
+
 	resource.Test(t, resource.TestCase{
 		PreCheck: func() {
 			testAccPreCheck(t)
 			testCheckCompatibleVersion(t, featureServer)
 			testSuperuserPreCheck(t)
+			testDropExtensionsIfExist(t, "postgres_fdw")
 		},
 		Providers:    testAccProviders,
 		CheckDestroy: testAccCheckPostgresqlServerDestroy,
 		Steps: []resource.TestStep{
 			{
-				Config: testAccPostgresqlServerChanges1,
+				Config: fmt.Sprintf(testAccPostgresqlServerChanges1, name),
 				Check: resource.ComposeTestCheckFunc(
 					testAccCheckPostgresqlServerExists("postgresql_server.myserver_postgres"),
 					resource.TestCheckResourceAttr(
-						"postgresql_server.myserver_postgres", "server_name", "myserver_postgres"),
+						"postgresql_server.myserver_postgres", "server_name", name),
 				),
 			},
 			{
-				Config: testAccPostgresqlServerChanges2,
+				Config: fmt.Sprintf(testAccPostgresqlServerChanges2, updatedName),
 				Check: resource.ComposeTestCheckFunc(
 					testAccCheckPostgresqlServerExists("postgresql_server.myserver_postgres"),
 					resource.TestCheckResourceAttr(
-						"postgresql_server.myserver_postgres", "server_name", "myserver_postgres_updated"),
+						"postgresql_server.myserver_postgres", "server_name", updatedName),
 				),
 			},
 			{
-				Config: testAccPostgresqlServerChanges3,
+				Config: fmt.Sprintf(testAccPostgresqlServerChanges3, updatedName),
 				Check: resource.ComposeTestCheckFunc(
 					testAccCheckPostgresqlServerExists("postgresql_server.myserver_postgres"),
 					resource.TestCheckResourceAttr(
@@ -156,7 +168,7 @@ func TestAccPostgresqlServer_Update(t *testing.T) {
 				),
 			},
 			{
-				Config: testAccPostgresqlServerChanges4,
+				Config: fmt.Sprintf(testAccPostgresqlServerChanges4, updatedName),
 				Check: resource.ComposeTestCheckFunc(
 					testAccCheckPostgresqlServerExists("postgresql_server.myserver_postgres"),
 					resource.TestCheckResourceAttr(
@@ -164,7 +176,7 @@ func TestAccPostgresqlServer_Update(t *testing.T) {
 				),
 			},
 			{
-				Config: testAccPostgresqlServerChanges5,
+				Config: fmt.Sprintf(testAccPostgresqlServerChanges5, updatedName),
 				Check: resource.ComposeTestCheckFunc(
 					testAccCheckPostgresqlServerExists("postgresql_server.myserver_postgres"),
 					resource.TestCheckResourceAttr(
@@ -176,7 +188,7 @@ func TestAccPostgresqlServer_Update(t *testing.T) {
 				),
 			},
 			{
-				Config: testAccPostgresqlServerChanges6,
+				Config: fmt.Sprintf(testAccPostgresqlServerChanges6, updatedName),
 				Check: resource.ComposeTestCheckFunc(
 					testAccCheckPostgresqlServerExists("postgresql_server.myserver_postgres"),
 					resource.TestCheckResourceAttr(
@@ -184,13 +196,13 @@ func TestAccPostgresqlServer_Update(t *testing.T) {
 				),
 			},
 			{
-				Config: testAccPostgresqlServerChanges7,
+				Config: fmt.Sprintf(testAccPostgresqlServerChanges7, updatedName),
 				Check: resource.ComposeTestCheckFunc(
 					testAccCheckPostgresqlServerExists("postgresql_server.myserver_postgres"),
 				),
 			},
 			{
-				Config: testAccPostgresqlServerChanges8,
+				Config: fmt.Sprintf(testAccPostgresqlServerChanges8, updatedName),
 				Check: resource.ComposeTestCheckFunc(
 					testAccCheckPostgresqlServerExists("postgresql_server.myserver_postgres"),
 					resource.TestCheckResourceAttr(
@@ -217,14 +229,16 @@ func checkServerExists(txn *sql.Tx, serverName string) (bool, error) {
 func TestAccPostgresqlServer_DropCascade(t *testing.T) {
 	skipIfNotAcc(t)
 	testSuperuserPreCheck(t)
+	testDropExtensionsIfExist(t, "postgres_fdw")
 
-	var testAccPostgresqlServerConfig = `
+	serverName := testUniqueName("myserver")
+	var testAccPostgresqlServerConfig = fmt.Sprintf(`
 resource "postgresql_extension" "ext_postgres_fdw" {
   name = "postgres_fdw"
 }
 	
 resource "postgresql_server" "cascade" {
-  server_name = "myserver"
+  server_name = "%s"
   fdw_name    = "postgres_fdw"
   options = {
 	host   = "foo"
@@ -235,7 +249,7 @@ resource "postgresql_server" "cascade" {
 
   depends_on = [postgresql_extension.ext_postgres_fdw]
 }
-`
+`, serverName)
 	resource.Test(t, resource.TestCase{
 		PreCheck: func() {
 			testAccPreCheck(t)
@@ -248,9 +262,9 @@ resource "postgresql_server" "cascade" {
 				Config: testAccPostgresqlServerConfig,
 				Check: resource.ComposeTestCheckFunc(
 					testAccCheckPostgresqlServerExists("postgresql_server.cascade"),
-					resource.TestCheckResourceAttr("postgresql_server.cascade", "server_name", "myserver"),
+					resource.TestCheckResourceAttr("postgresql_server.cascade", "server_name", serverName),
 					// This will create a dependency on the server.
-					testAccCreateServerDependency("myserver"),
+					testAccCreateServerDependency(serverName),
 				),
 			},
 		},
@@ -288,7 +302,7 @@ resource "postgresql_extension" "ext_file_fdw" {
 }
 
 resource "postgresql_server" "myserver_postgres" {
-  server_name = "myserver_postgres"
+  server_name = "%[1]s"
   fdw_name    = "postgres_fdw"
   options = {
     host   = "foo"
@@ -301,17 +315,17 @@ resource "postgresql_server" "myserver_postgres" {
 
 
 resource "postgresql_server" "myserver_file" {
-  server_name = "myserver_file"
+  server_name = "%[2]s"
   fdw_name    = "file_fdw"  
   depends_on = [postgresql_extension.ext_file_fdw]
 }
 
 resource "postgresql_role" "owner" {
-  name = "owner"
+  name = "%[3]s"
 }
 
 resource "postgresql_server" "myserver_with_owner" {
-  server_name  = "with_owner"
+  server_name  = "%[4]s"
   server_owner = postgresql_role.owner.name
   fdw_name     = "postgres_fdw"
   options = {
@@ -324,7 +338,7 @@ resource "postgresql_server" "myserver_with_owner" {
 }
 
 resource "postgresql_server" "myserver_with_type" {
-  server_name = "myserver_with_type"
+  server_name = "%[5]s"
   server_type = "slave"
   fdw_name    = "postgres_fdw"
   options = {
@@ -338,7 +352,7 @@ resource "postgresql_server" "myserver_with_type" {
 
 
 resource "postgresql_server" "myserver_with_version" {
-  server_name    = "myserver_with_version"
+  server_name    = "%[6]s"
   server_version = "1.1.1"
   fdw_name       = "postgres_fdw"
   options = {
@@ -358,7 +372,7 @@ resource "postgresql_extension" "ext_postgres_fdw" {
 }
 
 resource "postgresql_server" "myserver_postgres" {
-  server_name = "myserver_postgres"
+  server_name = "%s"
   fdw_name    = "postgres_fdw"
   options = {
     host   = "foo"
@@ -375,7 +389,7 @@ resource "postgresql_extension" "ext_postgres_fdw" {
 }
 
 resource "postgresql_server" "myserver_postgres" {
-	server_name = "myserver_postgres_updated"
+	server_name = "%s"
 	fdw_name    = "postgres_fdw"
 	options = {
 		host   = "foo"
@@ -393,7 +407,7 @@ resource "postgresql_extension" "ext_postgres_fdw" {
 }
 
 resource "postgresql_server" "myserver_postgres" {
-	server_name = "myserver_postgres_updated"
+	server_name = "%s"
 	server_type = "custom"
 	fdw_name    = "postgres_fdw"
 	options = {
@@ -412,7 +426,7 @@ resource "postgresql_extension" "ext_postgres_fdw" {
 }
 
 resource "postgresql_server" "myserver_postgres" {
-	server_name    = "myserver_postgres_updated"
+	server_name    = "%s"
 	server_version = "1.2.3"
 	fdw_name       = "postgres_fdw"
 	options = {
@@ -431,7 +445,7 @@ resource "postgresql_extension" "ext_postgres_fdw" {
 }
 
 resource "postgresql_server" "myserver_postgres" {
-	server_name    = "myserver_postgres_updated"
+	server_name    = "%s"
 	server_version = "1.2.3"
 	fdw_name       = "postgres_fdw"
 	options = {
@@ -450,7 +464,7 @@ resource "postgresql_extension" "ext_postgres_fdw" {
 }
 
 resource "postgresql_server" "myserver_postgres" {
-	server_name    = "myserver_postgres_updated"
+	server_name    = "%s"
 	server_version = "1.2.3"
 	fdw_name       = "postgres_fdw"
 	options = {
@@ -470,7 +484,7 @@ resource "postgresql_extension" "ext_postgres_fdw" {
 }
 
 resource "postgresql_server" "myserver_postgres" {
-	server_name    = "myserver_postgres_updated"
+	server_name    = "%s"
 	server_version = "1.2.3"
 	fdw_name       = "postgres_fdw"
 	options = {
@@ -489,7 +503,7 @@ resource "postgresql_extension" "ext_postgres_fdw" {
 }
 
 resource "postgresql_server" "myserver_postgres" {
-	server_name    = "myserver_postgres_updated"
+	server_name    = "%s"
 	server_version = "1.2.3"
 	fdw_name       = "postgres_fdw"
 	depends_on = [postgresql_extension.ext_postgres_fdw]
