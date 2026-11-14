@@ -142,3 +142,115 @@ func TestConnectWithRetryGivesUpAfterMaxConnRetries(t *testing.T) {
 		t.Errorf("expected exactly 4 connection attempts (1 initial + MaxConnRetries), got %d", got)
 	}
 }
+
+func TestConfigConnStrIsDeterministic(t *testing.T) {
+	// dbRegistry is keyed by the DSN, so connStr must return the same string
+	// for the same database on every call (connParams is built from a map).
+	c := &Config{
+		Scheme:            "postgres",
+		Host:              "localhost",
+		Port:              5432,
+		Username:          "user",
+		Password:          "pass",
+		SSLMode:           "disable",
+		ConnectTimeoutSec: 10,
+		ApplicationName:   "Terraform provider",
+		ExpectedVersion:   semver.MustParse("16.0.0"),
+		SSLRootCertPath:   "/path/to/root.pem",
+	}
+
+	want := c.connStr("mydb")
+	for i := 0; i < 50; i++ {
+		if got := c.connStr("mydb"); got != want {
+			t.Fatalf("Config.connStr() is not stable: got %q, then %q", want, got)
+		}
+	}
+}
+
+func TestConfigConfigurePoolIdleConnections(t *testing.T) {
+	drv := &flakyPingDriver{}
+	sql.Register("pool-idle-test", drv)
+
+	for _, tc := range []struct {
+		maxIdle  int
+		wantIdle int
+	}{
+		{maxIdle: 0, wantIdle: 0},
+		{maxIdle: 2, wantIdle: 1},
+	} {
+		db, err := sql.Open("pool-idle-test", "dsn")
+		if err != nil {
+			t.Fatalf("sql.Open() returned unexpected error: %v", err)
+		}
+		c := &Config{MaxConns: 20, MaxIdleConns: tc.maxIdle}
+		c.configurePool(db)
+
+		if err := db.Ping(); err != nil {
+			t.Fatalf("Ping() returned unexpected error: %v", err)
+		}
+		if got := db.Stats().Idle; got != tc.wantIdle {
+			t.Errorf("max_idle_connections=%d: expected %d idle connection(s) after a query, got %d", tc.maxIdle, tc.wantIdle, got)
+		}
+		_ = db.Close()
+	}
+}
+
+func TestConfigEvictDBConnection(t *testing.T) {
+	drv := &flakyPingDriver{}
+	sql.Register("pool-evict-test", drv)
+
+	newEntry := func(c *Config, database string) (string, *sql.DB) {
+		db, err := sql.Open("pool-evict-test", "dsn")
+		if err != nil {
+			t.Fatalf("sql.Open() returned unexpected error: %v", err)
+		}
+		dsn := c.connStr(database)
+		dbRegistryLock.Lock()
+		dbRegistry[dsn] = &DBConnection{DB: db, client: c.NewClient(database)}
+		dbRegistryLock.Unlock()
+		t.Cleanup(func() {
+			dbRegistryLock.Lock()
+			delete(dbRegistry, dsn)
+			dbRegistryLock.Unlock()
+			_ = db.Close()
+		})
+		return dsn, db
+	}
+	inRegistry := func(dsn string) bool {
+		dbRegistryLock.Lock()
+		defer dbRegistryLock.Unlock()
+		_, found := dbRegistry[dsn]
+		return found
+	}
+
+	pooled := &Config{Scheme: "postgres", Host: "evict-test", Port: 5432, SSLMode: "disable", MaxIdleConns: 2}
+
+	dsn, db := newEntry(pooled, "dropped_db")
+	if !pooled.evictDBConnection("dropped_db") {
+		t.Fatal("evictDBConnection() returned false for a pooled database in the registry")
+	}
+	if inRegistry(dsn) {
+		t.Error("evictDBConnection() left the entry in dbRegistry")
+	}
+	if err := db.Ping(); err == nil || !strings.Contains(err.Error(), "database is closed") {
+		t.Errorf("expected the evicted pool to be closed, Ping() returned %v", err)
+	}
+
+	if pooled.evictDBConnection("dropped_db") {
+		t.Error("evictDBConnection() returned true for a database that is no longer in the registry")
+	}
+	if pooled.evictDBConnection("never_connected") {
+		t.Error("evictDBConnection() returned true for a database that was never connected")
+	}
+
+	// Pools created with max_idle_connections = 0 keep no idle connections,
+	// so they are left alone (default behavior unchanged).
+	unpooled := &Config{Scheme: "postgres", Host: "evict-test-unpooled", Port: 5432, SSLMode: "disable"}
+	dsn, _ = newEntry(unpooled, "dropped_db")
+	if unpooled.evictDBConnection("dropped_db") {
+		t.Error("evictDBConnection() returned true for a pool without idle connections")
+	}
+	if !inRegistry(dsn) {
+		t.Error("evictDBConnection() removed a pool without idle connections")
+	}
+}
