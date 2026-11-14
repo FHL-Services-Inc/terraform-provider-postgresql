@@ -384,6 +384,11 @@ ORDER BY col_privs.attname
 	if err != nil {
 		return err
 	}
+	defer func() {
+		if err := rows.Close(); err != nil {
+			log.Printf("[WARN] could not close rows while reading column privileges: %v", err)
+		}
+	}()
 
 	for rows.Next() {
 		var objName string
@@ -414,6 +419,9 @@ ORDER BY col_privs.attname
 			d.Set("privileges", privilegesSet)
 			break
 		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
 	}
 
 	if missingColumns.Len() > 0 {
@@ -534,6 +542,11 @@ GROUP BY pg_proc.proname
 	if err != nil {
 		return err
 	}
+	defer func() {
+		if err := rows.Close(); err != nil {
+			log.Printf("[WARN] could not close rows while reading %s privileges: %v", objectType, err)
+		}
+	}()
 
 	for rows.Next() {
 		var objName string
@@ -564,7 +577,7 @@ GROUP BY pg_proc.proname
 		}
 	}
 
-	return nil
+	return rows.Err()
 }
 
 func createGrantQuery(d *schema.ResourceData, privileges []string) string {
@@ -830,7 +843,8 @@ func generateGrantID(d *schema.ResourceData) string {
 
 func getRolesToGrant(txn *sql.Tx, d *schema.ResourceData) ([]string, error) {
 	// If user we use for Terraform is not a superuser (e.g.: in RDS)
-	// we need to grant owner of the schema and owners of tables in the schema
+	// we need to grant owner of the schema and owners of the granted objects
+	// (all objects of that type in the schema when objects is empty)
 	// in order to change theirs permissions.
 	owners := []string{}
 	objectType := d.Get("object_type")
@@ -842,8 +856,13 @@ func getRolesToGrant(txn *sql.Tx, d *schema.ResourceData) ([]string, error) {
 	schemaName := d.Get("schema").(string)
 
 	if objectType != "schema" {
+		var objects []string
+		for _, object := range d.Get("objects").(*schema.Set).List() {
+			objects = append(objects, object.(string))
+		}
+
 		var err error
-		owners, err = getTablesOwner(txn, schemaName)
+		owners, err = getObjectsOwners(txn, schemaName, objectType.(string), objects)
 		if err != nil {
 			return nil, err
 		}
