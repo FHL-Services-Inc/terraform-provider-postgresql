@@ -97,9 +97,9 @@ func dataSourcePostgreSQLSequencesRead(db *DBConnection, d *schema.ResourceData)
 	query := sequenceQuery
 	queryConcatKeyword := queryConcatKeywordWhere
 
-	query = applySequenceDataSourceQueryFilters(query, queryConcatKeyword, d)
+	query, args := applySequenceDataSourceQueryFilters(query, queryConcatKeyword, d)
 
-	rows, err := txn.Query(query)
+	rows, err := txn.Query(query, args...)
 	if err != nil {
 		return err
 	}
@@ -143,13 +143,14 @@ func generateDataSourceSequencesID(d *schema.ResourceData, databaseName string) 
 	}, "_")
 }
 
-func applySequenceDataSourceQueryFilters(query string, queryConcatKeyword string, d *schema.ResourceData) string {
+func applySequenceDataSourceQueryFilters(query string, queryConcatKeyword string, d *schema.ResourceData) (string, []any) {
+	var args queryArgs
 	filters := []string{}
-	schemasTypeFilter := applyTypeMatchingToQuery(sequenceSchemaKeyword, d.Get("schemas").([]any))
+	schemasTypeFilter := applyTypeMatchingToQuery(sequenceSchemaKeyword, d.Get("schemas").([]any), &args)
 	if len(schemasTypeFilter) > 0 {
 		filters = append(filters, schemasTypeFilter)
 	}
-	filters = append(filters, applyPatternMatchingToQuery(sequencePatternMatchingTarget, d)...)
+	filters = append(filters, applyPatternMatchingToQuery(sequencePatternMatchingTarget, d, &args)...)
 
-	return finalizeQueryWithFilters(query, queryConcatKeyword, filters)
+	return finalizeQueryWithFilters(query, queryConcatKeyword, filters), args
 }
