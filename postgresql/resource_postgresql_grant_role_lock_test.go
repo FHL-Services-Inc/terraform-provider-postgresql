@@ -93,7 +93,7 @@ func newRecordingDBConnection(t *testing.T, rec *stmtRecorder) *DBConnection {
 		t.Fatal(err)
 	}
 	db.SetMaxOpenConns(1)
-	conn := &DBConnection{DB: db, client: client, version: semver.MustParse("16.0.0")}
+	conn := &DBConnection{DB: db, client: client, version: semver.MustParse("16.0.0"), pool: &dbPool{config: *config}}
 
 	key := config.registryKey("postgres")
 	dbRegistryLock.Lock()

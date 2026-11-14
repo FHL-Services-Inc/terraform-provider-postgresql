@@ -59,7 +59,7 @@ func openSingleConnLockDB(t *testing.T, timeoutMs int) *DBConnection {
 	raw.SetMaxOpenConns(1)
 	t.Cleanup(func() { closeDB(t, raw) })
 
-	return &DBConnection{DB: raw, client: config.NewClient("postgres")}
+	return &DBConnection{DB: raw, client: config.NewClient("postgres"), pool: &dbPool{config: config}}
 }
 
 // holdRoleAdvisoryLock takes a session-level advisory lock on the role OID in

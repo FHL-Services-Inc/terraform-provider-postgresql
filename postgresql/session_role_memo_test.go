@@ -123,7 +123,7 @@ func newSessionRoleConnection(t *testing.T, version string, superuser bool) (*DB
 	sqlDB.SetMaxIdleConns(0)
 	t.Cleanup(func() { _ = sqlDB.Close() })
 
-	return &DBConnection{DB: sqlDB, version: semver.MustParse(version)}, drv
+	return &DBConnection{DB: sqlDB, version: semver.MustParse(version), pool: &dbPool{}}, drv
 }
 
 // sessionRoleConnector binds a sql.DB to one sessionRoleDriver instance.
@@ -217,7 +217,7 @@ func TestFeatureAuthMembersSetOption(t *testing.T) {
 		{"16.0.0", true},
 		{"17.2.0", true},
 	} {
-		db := &DBConnection{version: semver.MustParse(tc.version)}
+		db := &DBConnection{version: semver.MustParse(tc.version), pool: &dbPool{}}
 		if got := db.featureSupported(featureAuthMembersSetOption); got != tc.want {
 			t.Errorf("featureSupported(featureAuthMembersSetOption) on %s = %v, want %v", tc.version, got, tc.want)
 		}

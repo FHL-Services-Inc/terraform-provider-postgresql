@@ -208,7 +208,7 @@ func TestConfigEvictDBConnection(t *testing.T) {
 		}
 		dsn := c.registryKey(database)
 		dbRegistryLock.Lock()
-		dbRegistry[dsn] = &DBConnection{DB: db, client: c.NewClient(database)}
+		dbRegistry[dsn] = &DBConnection{DB: db, client: c.NewClient(database), pool: &dbPool{config: *c}}
 		dbRegistryLock.Unlock()
 		t.Cleanup(func() {
 			dbRegistryLock.Lock()
@@ -338,8 +338,10 @@ func TestConnectConcurrentCallsDialOnce(t *testing.T) {
 		if err != nil {
 			t.Fatalf("connect() #%d returned unexpected error: %v", i, err)
 		}
-		if conns[i] != conns[0] {
-			t.Errorf("connect() #%d returned a different *DBConnection than #0", i)
+		// Every caller gets its own view of the pool (forClient), but all
+		// views share the one *sql.DB the single flight opened.
+		if conns[i].DB != conns[0].DB {
+			t.Errorf("connect() #%d returned a different pool than #0", i)
 		}
 	}
 	if got := drv.dials.Load(); got != 1 {
@@ -451,7 +453,7 @@ func TestClientConnectSeparatesAuthKinds(t *testing.T) {
 			t.Fatal(err)
 		}
 		dbRegistryLock.Lock()
-		dbRegistry[key] = &DBConnection{DB: db, client: c.NewClient("postgres")}
+		dbRegistry[key] = &DBConnection{DB: db, client: c.NewClient("postgres"), pool: &dbPool{config: *c}}
 		dbRegistryLock.Unlock()
 		t.Cleanup(func() {
 			dbRegistryLock.Lock()
@@ -469,10 +471,10 @@ func TestClientConnectSeparatesAuthKinds(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if plain == token {
+	if plain.DB == token.DB {
 		t.Error("a passwordless and a token-auth provider got the same pool")
 	}
-	if token.client.config.AuthTokens == nil {
+	if token.pool.config.AuthTokens == nil {
 		t.Error("the token-auth provider got the passwordless pool")
 	}
 }

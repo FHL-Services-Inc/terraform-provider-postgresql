@@ -134,7 +134,7 @@ func newGrantReadConnection(t *testing.T, row []driver.Value, openErr error) *DB
 	// A non-"postgres" scheme keeps connStr down to a single query parameter,
 	// so the DSN used as registry key is stable from one call to the next.
 	client := &Client{config: Config{Scheme: "awspostgres"}, databaseName: "testdb"}
-	conn := &DBConnection{DB: sqlDB, client: client, version: semver.MustParse("16.0.0")}
+	conn := &DBConnection{DB: sqlDB, client: client, version: semver.MustParse("16.0.0"), pool: &dbPool{config: client.config}}
 
 	key := client.config.registryKey(client.databaseName)
 	dbRegistryLock.Lock()

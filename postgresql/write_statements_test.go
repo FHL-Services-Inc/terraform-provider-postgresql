@@ -134,7 +134,7 @@ func newWriteStmtConnection(t *testing.T, advisoryLockTimeout int, execErr error
 		config:       Config{Scheme: "awspostgres", AdvisoryLockTimeout: advisoryLockTimeout},
 		databaseName: writeStmtDatabase,
 	}
-	conn := &DBConnection{DB: sqlDB, client: client, version: semver.MustParse("16.0.0")}
+	conn := &DBConnection{DB: sqlDB, client: client, version: semver.MustParse("16.0.0"), pool: &dbPool{config: client.config}}
 
 	key := client.config.registryKey(client.databaseName)
 	dbRegistryLock.Lock()
