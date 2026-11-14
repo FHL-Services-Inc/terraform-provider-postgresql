@@ -23,10 +23,10 @@ const (
 
 func resourcePostgreSQLExtension() *schema.Resource {
 	return &schema.Resource{
-		Create: PGResourceFunc(resourcePostgreSQLExtensionCreate),
+		Create: PGResourceWriteFunc(resourcePostgreSQLExtensionCreate),
 		Read:   PGResourceFunc(resourcePostgreSQLExtensionRead),
-		Update: PGResourceFunc(resourcePostgreSQLExtensionUpdate),
-		Delete: PGResourceFunc(resourcePostgreSQLExtensionDelete),
+		Update: PGResourceWriteFunc(resourcePostgreSQLExtensionUpdate),
+		Delete: PGResourceWriteFunc(resourcePostgreSQLExtensionDelete),
 		Importer: &schema.ResourceImporter{
 			StateContext: schema.ImportStatePassthroughContext,
 		},

@@ -34,9 +34,9 @@ WHERE
 
 func resourcePostgreSQLGrantRole() *schema.Resource {
 	return &schema.Resource{
-		Create: PGResourceFunc(resourcePostgreSQLGrantRoleCreate),
+		Create: PGResourceClusterWriteFunc(resourcePostgreSQLGrantRoleCreate),
 		Read:   PGResourceFunc(resourcePostgreSQLGrantRoleRead),
-		Delete: PGResourceFunc(resourcePostgreSQLGrantRoleDelete),
+		Delete: PGResourceClusterWriteFunc(resourcePostgreSQLGrantRoleDelete),
 
 		Schema: map[string]*schema.Schema{
 			"role": {

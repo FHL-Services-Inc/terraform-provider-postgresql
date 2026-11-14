@@ -29,10 +29,10 @@ const (
 
 func resourcePostgreSQLDatabase() *schema.Resource {
 	return &schema.Resource{
-		Create: PGResourceFunc(resourcePostgreSQLDatabaseCreate),
+		Create: PGResourceClusterWriteFunc(resourcePostgreSQLDatabaseCreate),
 		Read:   PGResourceFunc(resourcePostgreSQLDatabaseRead),
-		Update: PGResourceFunc(resourcePostgreSQLDatabaseUpdate),
-		Delete: PGResourceFunc(resourcePostgreSQLDatabaseDelete),
+		Update: PGResourceClusterWriteFunc(resourcePostgreSQLDatabaseUpdate),
+		Delete: PGResourceClusterWriteFunc(resourcePostgreSQLDatabaseDelete),
 		Importer: &schema.ResourceImporter{
 			StateContext: schema.ImportStatePassthroughContext,
 		},

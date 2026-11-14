@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -193,6 +194,12 @@ type Config struct {
 	SSLClientCert                   *ClientCertificateConfig
 	SSLRootCertPath                 string
 	GCPIAMImpersonateServiceAccount string
+
+	// CatalogSnapshot lets grant and default privileges Reads share one
+	// per-database catalog snapshot (see catalog_snapshot.go) instead of each
+	// querying the catalogs; CatalogSnapshotTTLSeconds bounds its age.
+	CatalogSnapshot           bool
+	CatalogSnapshotTTLSeconds int
 }
 
 // Client struct holding connection string
@@ -253,6 +260,9 @@ func (c *Config) connParams() []string {
 	for key, value := range params {
 		paramsArray = append(paramsArray, fmt.Sprintf("%s=%s", key, url.QueryEscape(value)))
 	}
+	// The connection string is the key of dbRegistry and of the catalog
+	// snapshots; map iteration order would make it differ between calls.
+	sort.Strings(paramsArray)
 
 	return paramsArray
 }

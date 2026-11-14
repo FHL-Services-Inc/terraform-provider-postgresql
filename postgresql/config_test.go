@@ -75,6 +75,23 @@ func TestConfigConnStr(t *testing.T) {
 	}
 }
 
+// TestConfigConnStrIsStable pins that connStr returns the same string on
+// every call: it is the key of dbRegistry and of the catalog snapshots, and
+// the connection parameters come from a map.
+func TestConfigConnStrIsStable(t *testing.T) {
+	config := &Config{
+		Scheme: "postgres", Host: "localhost", Port: 5432, Username: "u", Password: "p",
+		SSLMode: "require", ConnectTimeoutSec: 10, SSLRootCertPath: "/root.pem",
+		ExpectedVersion: semver.MustParse("9.0.0"), ApplicationName: "Terraform provider",
+	}
+	want := config.connStr("db")
+	for i := 0; i < 100; i++ {
+		if got := config.connStr("db"); got != want {
+			t.Fatalf("connStr differs between calls:\n%s\n%s", want, got)
+		}
+	}
+}
+
 // flakyPingDriver is a fake database/sql/driver.Driver whose connections fail
 // to Ping a configurable number of times before succeeding, used to exercise
 // Client.connectWithRetry without a real PostgreSQL server.
