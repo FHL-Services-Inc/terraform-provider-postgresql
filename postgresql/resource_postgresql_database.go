@@ -141,12 +141,12 @@ func createDatabase(db *DBConnection, d *schema.ResourceData) error {
 
 		// Needed in order to set the owner of the db if the connection user is not a
 		// superuser
-		ownerGranted, err := grantRoleMembership(conn, owner, currentUser)
+		ownerGranted, err := grantRoleMembership(conn, db.featureSupported(featureAuthMembersSetOption), owner, currentUser)
 		if err != nil {
 			return err
 		}
 		if ownerGranted {
-			defer revokeRoleMembershipDeferred(conn, owner, currentUser)
+			defer revokeRoleMembershipDeferred(conn, db.featureSupported(featureAuthMembersSetOption), owner, currentUser)
 		}
 	}
 
@@ -249,12 +249,12 @@ func resourcePostgreSQLDatabaseDelete(db *DBConnection, d *schema.ResourceData) 
 
 		// Needed in order to set the owner of the db if the connection user is not a
 		// superuser
-		ownerGranted, err := grantRoleMembership(conn, owner, currentUser)
+		ownerGranted, err := grantRoleMembership(conn, db.featureSupported(featureAuthMembersSetOption), owner, currentUser)
 		if err != nil {
 			return err
 		}
 		if ownerGranted {
-			defer revokeRoleMembershipDeferred(conn, owner, currentUser)
+			defer revokeRoleMembershipDeferred(conn, db.featureSupported(featureAuthMembersSetOption), owner, currentUser)
 		}
 	}
 
@@ -440,12 +440,12 @@ func setDBOwner(db *DBConnection, d *schema.ResourceData) error {
 	defer release()
 
 	//needed in order to set the owner of the db if the connection user is not a superuser
-	ownerGranted, err := grantRoleMembership(conn, owner, currentUser)
+	ownerGranted, err := grantRoleMembership(conn, db.featureSupported(featureAuthMembersSetOption), owner, currentUser)
 	if err != nil {
 		return err
 	}
 	if ownerGranted {
-		defer revokeRoleMembershipDeferred(conn, owner, currentUser)
+		defer revokeRoleMembershipDeferred(conn, db.featureSupported(featureAuthMembersSetOption), owner, currentUser)
 	}
 
 	dbName := d.Get(dbNameAttr).(string)
@@ -457,12 +457,12 @@ func setDBOwner(db *DBConnection, d *schema.ResourceData) error {
 	if err != nil {
 		return fmt.Errorf("error getting current database OWNER: %w", err)
 	}
-	currentOwnerGranted, err := grantRoleMembership(conn, currentOwner, currentUser)
+	currentOwnerGranted, err := grantRoleMembership(conn, db.featureSupported(featureAuthMembersSetOption), currentOwner, currentUser)
 	if err != nil {
 		return err
 	}
 	if currentOwnerGranted {
-		defer revokeRoleMembershipDeferred(conn, currentOwner, currentUser)
+		defer revokeRoleMembershipDeferred(conn, db.featureSupported(featureAuthMembersSetOption), currentOwner, currentUser)
 	}
 
 	sql := fmt.Sprintf("ALTER DATABASE %s OWNER TO %s", pq.QuoteIdentifier(dbName), pq.QuoteIdentifier(owner))
@@ -513,12 +513,12 @@ func setAlterOwnership(db *DBConnection, d *schema.ResourceData) error {
 		return nil
 	}
 
-	currentOwnerGranted, err := grantRoleMembership(conn, currentOwner, currentUser)
+	currentOwnerGranted, err := grantRoleMembership(conn, db.featureSupported(featureAuthMembersSetOption), currentOwner, currentUser)
 	if err != nil {
 		return err
 	}
 	if currentOwnerGranted {
-		defer revokeRoleMembershipDeferred(conn, currentOwner, currentUser)
+		defer revokeRoleMembershipDeferred(conn, db.featureSupported(featureAuthMembersSetOption), currentOwner, currentUser)
 	}
 
 	lockTxn, err := conn.Begin()
