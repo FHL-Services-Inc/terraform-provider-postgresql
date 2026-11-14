@@ -52,7 +52,7 @@ func TestBuildReadTableRolePrivilegesQuery(t *testing.T) {
 			"WHEN $1::name = 'public' THEN 0::oid",
 			"SELECT oid FROM pg_namespace WHERE nspname = $2",
 			"SELECT c.relname, array_remove(array_agg(a.privilege_type), NULL) AS privileges",
-			"LEFT JOIN LATERAL (\n        SELECT privilege_type FROM aclexplode(c.relacl) WHERE grantee = r.oid\n    ) a ON true",
+			"LEFT JOIN LATERAL (\n        SELECT privilege_type FROM aclexplode(COALESCE(c.relacl, acldefault('r', c.relowner))) WHERE grantee = r.oid\n    ) a ON true",
 			"WHERE c.relkind = $3",
 			"GROUP BY c.relname",
 		} {
