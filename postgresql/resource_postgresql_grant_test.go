@@ -17,8 +17,9 @@ import (
 
 // TestBuildReadTableRolePrivilegesQuery locks in the table/sequence Read query
 // shape. With an empty objects set the query must stay unfiltered and bind
-// exactly three arguments ("empty means all objects in the schema"). With an
-// explicit objects list the relname filter must be pushed into SQL as
+// exactly three arguments ("empty means all objects in the schema"); the
+// relkind filter is an array (ON TABLE covers views, partitioned tables, ...).
+// With an explicit objects list the relname filter must be pushed into SQL as
 // "relname = ANY($4)" with a fourth bind argument, so the whole schema is not
 // transferred only to be discarded by the Go filter afterwards. In both cases
 // the ACL must be exploded per selected relation (LEFT JOIN LATERAL), not for
@@ -28,9 +29,9 @@ func TestBuildReadTableRolePrivilegesQuery(t *testing.T) {
 	roleOID := uint32(1234)
 
 	emptyQuery, emptyArgs := buildReadTableRolePrivilegesQuery(
-		roleOID, "test_schema", "r", schema.NewSet(schema.HashString, nil),
+		roleOID, "test_schema", ownerRelkinds["table"], schema.NewSet(schema.HashString, nil),
 	)
-	if strings.Contains(emptyQuery, "ANY(") {
+	if strings.Contains(emptyQuery, "relname = ANY(") {
 		t.Fatalf("empty objects must not push a relname filter, got: %q", emptyQuery)
 	}
 	if len(emptyArgs) != 3 {
@@ -38,7 +39,7 @@ func TestBuildReadTableRolePrivilegesQuery(t *testing.T) {
 	}
 
 	objects := schema.NewSet(schema.HashString, []interface{}{"test_table", "test_table2"})
-	query, args := buildReadTableRolePrivilegesQuery(roleOID, "test_schema", "r", objects)
+	query, args := buildReadTableRolePrivilegesQuery(roleOID, "test_schema", ownerRelkinds["table"], objects)
 	if !strings.Contains(query, "AND c.relname = ANY($4)") {
 		t.Fatalf("explicit objects must push relname = ANY($4), got: %q", query)
 	}
@@ -56,7 +57,7 @@ func TestBuildReadTableRolePrivilegesQuery(t *testing.T) {
 		if strings.Count(q, "pg_class") != 1 {
 			t.Fatalf("query must scan pg_class once: %q", q)
 		}
-		if !strings.Contains(q, "WHERE n.nspname = $2 AND c.relkind = $3") {
+		if !strings.Contains(q, "WHERE n.nspname = $2 AND c.relkind = ANY($3)") {
 			t.Fatalf("query missing schema/relkind filter: %q", q)
 		}
 		if !strings.Contains(q, "GROUP BY c.relname") {
@@ -67,7 +68,8 @@ func TestBuildReadTableRolePrivilegesQuery(t *testing.T) {
 
 // TestAccPostgresqlGrantReadTablePrivilegesQuery pins the rows returned by the
 // table/sequence Read query against a real catalog: one row per relation of the
-// requested relkind in the schema (or per listed object that exists), with the
+// requested relkinds in the schema (or per listed object that exists; for
+// "table" that includes views, materialized views and partitioned tables), with the
 // privileges granted to the role, and an empty array for relations with a NULL
 // ACL or an ACL without an entry for the role. PUBLIC is read with grantee 0.
 func TestAccPostgresqlGrantReadTablePrivilegesQuery(t *testing.T) {
@@ -91,6 +93,8 @@ func TestAccPostgresqlGrantReadTablePrivilegesQuery(t *testing.T) {
 		"CREATE TABLE test_schema.t_public (val text)",
 		"CREATE TABLE test_schema.t_revoked (val text)",
 		"CREATE VIEW test_schema.v_granted AS SELECT 1 AS val",
+		"CREATE MATERIALIZED VIEW test_schema.m_default AS SELECT 1 AS val",
+		"CREATE TABLE test_schema.p_granted (val text) PARTITION BY LIST (val)",
 		"CREATE SEQUENCE test_schema.s_default",
 		"CREATE SEQUENCE test_schema.s_granted",
 		"CREATE TABLE dev_schema.t_granted (val text)",
@@ -99,6 +103,7 @@ func TestAccPostgresqlGrantReadTablePrivilegesQuery(t *testing.T) {
 		fmt.Sprintf("GRANT SELECT ON test_schema.t_revoked TO %s", roleName),
 		fmt.Sprintf("REVOKE ALL ON test_schema.t_revoked FROM %s", roleName),
 		fmt.Sprintf("GRANT SELECT ON test_schema.v_granted TO %s", roleName),
+		fmt.Sprintf("GRANT SELECT, UPDATE ON test_schema.p_granted TO %s", roleName),
 		fmt.Sprintf("GRANT USAGE ON SEQUENCE test_schema.s_granted TO %s", roleName),
 		fmt.Sprintf("GRANT UPDATE ON dev_schema.t_granted TO %s", roleName),
 	} {
@@ -116,48 +121,55 @@ func TestAccPostgresqlGrantReadTablePrivilegesQuery(t *testing.T) {
 		name     string
 		roleOID  uint32
 		schema   string
-		relkind  string
+		relkinds []string
 		objects  []any
 		expected map[string][]string
 	}{
 		{
-			name: "all tables", roleOID: roleOID, schema: "test_schema", relkind: "r",
+			name: "all tables", roleOID: roleOID, schema: "test_schema", relkinds: ownerRelkinds["table"],
 			expected: map[string][]string{
 				"t_default": {}, "t_granted": {"INSERT", "SELECT"}, "t_public": {}, "t_revoked": {},
+				"v_granted": {"SELECT"}, "m_default": {}, "p_granted": {"SELECT", "UPDATE"},
 			},
 		},
 		{
-			name: "listed tables", roleOID: roleOID, schema: "test_schema", relkind: "r",
+			name: "listed tables", roleOID: roleOID, schema: "test_schema", relkinds: ownerRelkinds["table"],
 			objects:  []any{"t_granted", "t_default", "t_missing"},
 			expected: map[string][]string{"t_default": {}, "t_granted": {"INSERT", "SELECT"}},
 		},
 		{
-			name: "listed table with ACL but no entry for the role", roleOID: roleOID, schema: "test_schema", relkind: "r",
+			name: "listed view and partitioned table", roleOID: roleOID, schema: "test_schema", relkinds: ownerRelkinds["table"],
+			objects:  []any{"v_granted", "p_granted"},
+			expected: map[string][]string{"v_granted": {"SELECT"}, "p_granted": {"SELECT", "UPDATE"}},
+		},
+		{
+			name: "listed table with ACL but no entry for the role", roleOID: roleOID, schema: "test_schema", relkinds: ownerRelkinds["table"],
 			objects:  []any{"t_revoked"},
 			expected: map[string][]string{"t_revoked": {}},
 		},
 		{
-			name: "public", roleOID: 0, schema: "test_schema", relkind: "r",
+			name: "public", roleOID: 0, schema: "test_schema", relkinds: ownerRelkinds["table"],
 			expected: map[string][]string{
 				"t_default": {}, "t_granted": {}, "t_public": {"SELECT"}, "t_revoked": {},
+				"v_granted": {}, "m_default": {}, "p_granted": {},
 			},
 		},
 		{
-			name: "listed public", roleOID: 0, schema: "test_schema", relkind: "r",
+			name: "listed public", roleOID: 0, schema: "test_schema", relkinds: ownerRelkinds["table"],
 			objects:  []any{"t_public"},
 			expected: map[string][]string{"t_public": {"SELECT"}},
 		},
 		{
-			name: "all sequences", roleOID: roleOID, schema: "test_schema", relkind: "S",
+			name: "all sequences", roleOID: roleOID, schema: "test_schema", relkinds: ownerRelkinds["sequence"],
 			expected: map[string][]string{"s_default": {}, "s_granted": {"USAGE"}},
 		},
 		{
-			name: "listed sequences", roleOID: roleOID, schema: "test_schema", relkind: "S",
+			name: "listed sequences", roleOID: roleOID, schema: "test_schema", relkinds: ownerRelkinds["sequence"],
 			objects:  []any{"s_granted"},
 			expected: map[string][]string{"s_granted": {"USAGE"}},
 		},
 		{
-			name: "other schema", roleOID: roleOID, schema: "dev_schema", relkind: "r",
+			name: "other schema", roleOID: roleOID, schema: "dev_schema", relkinds: ownerRelkinds["table"],
 			expected: map[string][]string{"t_granted": {"UPDATE"}},
 		},
 	}
@@ -165,7 +177,7 @@ func TestAccPostgresqlGrantReadTablePrivilegesQuery(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			query, args := buildReadTableRolePrivilegesQuery(
-				tc.roleOID, tc.schema, tc.relkind, schema.NewSet(schema.HashString, tc.objects),
+				tc.roleOID, tc.schema, tc.relkinds, schema.NewSet(schema.HashString, tc.objects),
 			)
 			rows, err := db.Query(query, args...)
 			if err != nil {
@@ -655,6 +667,91 @@ func TestAccPostgresqlGrantColumns(t *testing.T) {
 						return testCheckColumnPrivileges(t, dbName, roleName, []string{testTables[0]}, []string{"UPDATE"}, []string{"test_column_one", "test_column_two"})
 					},
 				),
+			},
+		},
+	})
+}
+
+// TestAccPostgresqlGrantViewAndPartitionedTable covers relations other than
+// plain tables, which GRANT ... ON TABLE also accepts: a column grant on a view
+// must read back its columns (columns forces replacement, so a miss shows up
+// as a replace on the plan right after apply), and a revoke done outside
+// Terraform on a partitioned table must show up as drift.
+func TestAccPostgresqlGrantViewAndPartitionedTable(t *testing.T) {
+	skipIfNotAcc(t)
+
+	config := getTestConfig(t)
+	dbSuffix, teardown := setupTestDatabase(t, true, true)
+	defer teardown()
+
+	dbName, roleName := getTestDBNames(dbSuffix)
+	dsn := config.connStr(dbName)
+	dbExecute(t, dsn, "CREATE TABLE test_schema.parted (id int) PARTITION BY RANGE (id)")
+	dbExecute(t, dsn, "CREATE VIEW test_schema.v AS SELECT 1 AS id")
+
+	testGrant := fmt.Sprintf(`
+	resource "postgresql_grant" "view_cols" {
+		database    = "%[1]s"
+		role        = "%[2]s"
+		schema      = "test_schema"
+		object_type = "column"
+		objects     = ["v"]
+		columns     = ["id"]
+		privileges  = ["SELECT"]
+	}
+
+	resource "postgresql_grant" "parted" {
+		database    = "%[1]s"
+		role        = "%[2]s"
+		schema      = "test_schema"
+		object_type = "table"
+		objects     = ["parted"]
+		privileges  = ["SELECT"]
+	}
+	`, dbName, roleName)
+
+	checkPartedSelect := func(*terraform.State) error {
+		var granted bool
+		db, err := sql.Open("postgres", dsn)
+		if err != nil {
+			return err
+		}
+		defer closeDB(t, db)
+		if err := db.QueryRow(
+			"SELECT has_table_privilege($1, 'test_schema.parted', 'SELECT')", roleName,
+		).Scan(&granted); err != nil {
+			return err
+		}
+		if !granted {
+			return fmt.Errorf("%s has no SELECT on test_schema.parted", roleName)
+		}
+		return nil
+	}
+
+	resource.Test(t, resource.TestCase{
+		PreCheck: func() {
+			testAccPreCheck(t)
+			testCheckCompatibleVersion(t, featurePrivileges)
+		},
+		Providers: testAccProviders,
+		Steps: []resource.TestStep{
+			{
+				// The plan run after apply must be empty: the view column
+				// grant is read back.
+				Config: testGrant,
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr("postgresql_grant.view_cols", "columns.#", "1"),
+					checkPartedSelect,
+				),
+			},
+			{
+				// Revoke outside Terraform: the refresh must see it and
+				// the apply must grant SELECT again.
+				PreConfig: func() {
+					dbExecute(t, dsn, fmt.Sprintf("REVOKE SELECT ON test_schema.parted FROM %s", pq.QuoteIdentifier(roleName)))
+				},
+				Config: testGrant,
+				Check:  checkPartedSelect,
 			},
 		},
 	})

@@ -542,7 +542,8 @@ SELECT rolname
 
 // ownerRelkinds lists the pg_class.relkind values a GRANT of the given
 // object_type can touch. ON TABLE (and ON ALL TABLES IN SCHEMA) also covers
-// views, materialized views and foreign tables; column grants are on tables.
+// views, materialized views, partitioned and foreign tables; column grants are
+// on any of those. Used for the owners lookup and by the grant Read and import.
 var ownerRelkinds = map[string][]string{
 	"table":    {"r", "p", "v", "m", "f"},
 	"column":   {"r", "p", "v", "m", "f"},
