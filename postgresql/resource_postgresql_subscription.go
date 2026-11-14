@@ -113,17 +113,18 @@ func resourcePostgreSQLSubscriptionReadImpl(db *DBConnection, d *schema.Resource
 		return fmt.Errorf("could not get subscription name: %w", err)
 	}
 
-	txn, err := startTransaction(db.client, databaseName)
+	// Both SELECTs run directly on the database connection: under READ
+	// COMMITTED a read-only transaction gives them no common snapshot and
+	// only costs BEGIN/ROLLBACK round-trips.
+	dbc, err := initConnection(db.client, databaseName)
 	if err != nil {
 		if isDatabaseDoesNotExistError(err) {
 			log.Printf("[WARN] PostgreSQL database (%s) not found, removing subscription (%s) from state", databaseName, subName)
 			d.SetId("")
 			return nil
 		}
-		// startTransaction already provides context; avoid double-wrapping.
 		return err
 	}
-	defer deferredRollback(txn)
 
 	var publications []string
 	var connInfo string
@@ -134,9 +135,13 @@ func resourcePostgreSQLSubscriptionReadImpl(db *DBConnection, d *schema.Resource
 	// A missing subscription yields no row, so QueryRow returns ErrNoRows.
 	// Treat that as "gone" and clear the ID (this used to be handled by the
 	// now-removed Exists callback); anything else is a real error.
-	switch err = txn.QueryRow(queryExists, subName).Scan(&subExists); {
+	switch err = dbc.QueryRow(queryExists, subName).Scan(&subExists); {
 	case err == sql.ErrNoRows:
 		log.Printf("[WARN] PostgreSQL Subscription (%s) not found for database %s", subName, databaseName)
+		d.SetId("")
+		return nil
+	case isDatabaseDoesNotExistError(err):
+		log.Printf("[WARN] PostgreSQL database (%s) not found, removing subscription (%s) from state", databaseName, subName)
 		d.SetId("")
 		return nil
 	case err != nil:
@@ -145,7 +150,7 @@ func resourcePostgreSQLSubscriptionReadImpl(db *DBConnection, d *schema.Resource
 
 	// pg_subscription requires superuser permissions, it is okay to fail here
 	query := "SELECT subconninfo, subpublications, subslotname FROM pg_catalog.pg_subscription WHERE subname = $1"
-	err = txn.QueryRow(query, subName).Scan(&connInfo, pq.Array(&publications), &slotName)
+	err = dbc.QueryRow(query, subName).Scan(&connInfo, pq.Array(&publications), &slotName)
 
 	if err != nil {
 		// we already checked that the subscription exists
