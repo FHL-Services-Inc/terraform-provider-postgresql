@@ -65,3 +65,51 @@ resource "postgresql_grant" "revoke_public" {
   privileges  = []
 }
 ```
+
+## Import
+
+`postgresql_grant` can be imported using the resource ID, which is the
+attributes joined with `_`:
+
+* `<role>_<database>_<object_type>` for `object_type = "database"`,
+* `<role>_<database>_<object_type>_<object>` for `foreign_data_wrapper` and `foreign_server`,
+* `<role>_<database>_<schema>_<object_type>` for `schema`, and for `table`,
+  `sequence`, `function`, `procedure` and `routine` grants on all objects of the schema
+  (no `objects`),
+* `<role>_<database>_<schema>_<object_type>_<object>[_<object>...]` for grants on
+  listed `objects`, in any order.
+
+Use `public` as the role for grants to `PUBLIC`. As names may contain `_`
+themselves, the provider resolves the ID against the roles, databases, schemas
+and objects that exist on the server; the import fails if no split of the ID
+matches, or if more than one does (e.g. both `a_b` and `a` + `b` are tables of
+the schema). Grants with `object_type = "column"` cannot be imported: their ID
+does not identify the privilege.
+
+`privileges` and `with_grant_option` are read from the server. For a grant
+without `objects`, `privileges` is read from the objects of the schema the
+same way as on refresh, so the imported grant only shows no changes if all of
+them have the same privileges.
+
+```hcl
+import {
+  to = postgresql_grant.readonly_tables
+  id = "readonly_role_test_db_public_table"
+}
+
+import {
+  to = postgresql_grant.readonly_two_tables
+  id = "readonly_role_test_db_public_table_table1_table2"
+}
+
+import {
+  to = postgresql_grant.connect_db
+  id = "readonly_role_test_db_database"
+}
+```
+
+or, with the CLI:
+
+```
+$ terraform import postgresql_grant.readonly_tables readonly_role_test_db_public_table
+```

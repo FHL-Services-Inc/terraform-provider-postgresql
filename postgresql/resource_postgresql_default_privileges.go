@@ -19,6 +19,9 @@ func resourcePostgreSQLDefaultPrivileges() *schema.Resource {
 		Update: PGResourceFunc(resourcePostgreSQLDefaultPrivilegesCreate),
 		Read:   PGResourceFunc(resourcePostgreSQLDefaultPrivilegesRead),
 		Delete: PGResourceFunc(resourcePostgreSQLDefaultPrivilegesDelete),
+		Importer: &schema.ResourceImporter{
+			StateContext: resourcePostgreSQLDefaultPrivilegesImport,
+		},
 
 		Schema: map[string]*schema.Schema{
 			"role": {

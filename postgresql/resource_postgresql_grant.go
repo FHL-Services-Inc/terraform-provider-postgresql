@@ -43,6 +43,9 @@ func resourcePostgreSQLGrant() *schema.Resource {
 		Update: PGResourceFunc(resourcePostgreSQLGrantUpdate),
 		Read:   PGResourceFunc(resourcePostgreSQLGrantRead),
 		Delete: PGResourceFunc(resourcePostgreSQLGrantDelete),
+		Importer: &schema.ResourceImporter{
+			StateContext: resourcePostgreSQLGrantImport,
+		},
 
 		Schema: map[string]*schema.Schema{
 			"role": {
