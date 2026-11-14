@@ -20,7 +20,6 @@ import (
 	"gocloud.dev/gcp"
 	"gocloud.dev/gcp/cloudsql"
 	"gocloud.dev/postgres"
-	_ "gocloud.dev/postgres/awspostgres"
 	"gocloud.dev/postgres/gcppostgres"
 	"google.golang.org/api/impersonate"
 )
@@ -423,6 +422,8 @@ func (c *Client) connectWithRetry(ctx context.Context, postgresDriverName, dsn s
 			db, err = c.config.openTokenAuthDB(dsn)
 		} else if c.config.Scheme == "postgres" {
 			db, err = sql.Open(postgresDriverName, dsn)
+		} else if c.config.Scheme == "awspostgres" {
+			db, err = c.config.openAWSPostgres(dsn)
 		} else if c.config.Scheme == "gcppostgres" && c.config.GCPIAMImpersonateServiceAccount != "" {
 			db, err = openImpersonatedGCPDBConnection(ctx, dsn, c.config.GCPIAMImpersonateServiceAccount)
 		} else {

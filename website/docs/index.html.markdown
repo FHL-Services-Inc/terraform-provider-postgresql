@@ -205,8 +205,7 @@ The following arguments are supported:
 * `aws_rds_iam_auth` - (Optional) If set to `true`, call the AWS RDS API to grab a temporary password, using AWS Credentials
   from the environment (or the given profile, see `aws_rds_iam_profile`). With `scheme = "postgres"` (the default) or
   `scheme = "awspostgres"` the token is cached and renewed before it expires (RDS tokens are valid for 15 minutes),
-  and every new connection uses a current one, so long-running applies keep working. With `awspostgres` the provider
-  then opens the connections itself, with the same TLS setup as GoCloud (RDS CA bundle, no proxy).
+  and every new connection uses a current one, so long-running applies keep working.
 * `aws_rds_iam_profile` - (Optional) The AWS IAM Profile to use while using AWS RDS IAM Auth.
 * `aws_rds_iam_region` - (Optional) The AWS region to use while using AWS RDS IAM Auth.
 * `aws_rds_iam_provider_role_arn` - (Optional) AWS IAM role to assume while using AWS RDS IAM Auth.
@@ -222,6 +221,11 @@ By default, the provider uses the [lib/pq][libpq] library to directly connect to
 
 To enable GoCloud based connections to AWS RDS instances, set `scheme` to `awspostgres` and `host` to the RDS database's endpoint value.
 (e.g.: `instance.xxxxxx.region.rds.amazonaws.com`)
+
+Connections are made the way GoCloud's `awspostgres` driver makes them: TLS verified against the
+[RDS CA bundle](https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem) and dialed directly (no proxy);
+`clientcert` and `sslrootcert` can't be used and `sslmode` is ignored. The provider downloads the bundle once
+and keeps it for a day instead of downloading it for every connection.
 
 ```hcl
 provider "postgresql" {

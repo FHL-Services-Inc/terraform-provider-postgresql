@@ -4,6 +4,8 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"database/sql"
+	"database/sql/driver"
 	"errors"
 	"fmt"
 	"io"
@@ -144,6 +146,32 @@ func awsPostgresConfig(dsn string) (pq.Config, error) {
 	u2.Scheme = "postgres"
 	u2.RawQuery = query.Encode()
 	return pq.NewConfig(u2.String())
+}
+
+// newAWSPostgresConnector returns a connector for an awspostgres:// DSN with
+// a static password, dialing through dialer (rdsTLSDialer): what gocloud's
+// awspostgres opener does, but with the cached RDS CA bundle.
+func newAWSPostgresConnector(dsn string, dialer pq.Dialer) (driver.Connector, error) {
+	cfg, err := awsPostgresConfig(dsn)
+	if err != nil {
+		return nil, err
+	}
+	connector, err := pq.NewConnectorConfig(cfg)
+	if err != nil {
+		return nil, err
+	}
+	connector.Dialer(dialer)
+	return connector, nil
+}
+
+// openAWSPostgres opens a pool for the "awspostgres" scheme with password
+// authentication (with auth tokens, see newPostgresConnector).
+func (c *Config) openAWSPostgres(dsn string) (*sql.DB, error) {
+	connector, err := newAWSPostgresConnector(dsn, newRDSTLSDialer())
+	if err != nil {
+		return nil, err
+	}
+	return sql.OpenDB(connector), nil
 }
 
 // rdsTLSDialer is the dialer of gocloud's awspostgres, which keeps it

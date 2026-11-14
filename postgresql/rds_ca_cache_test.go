@@ -4,10 +4,13 @@ import (
 	"context"
 	"crypto/x509"
 	"errors"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/lib/pq"
 )
 
 // fakeCertFetcher is an rds.CertPoolProvider returning pools[min(n, len-1)]
@@ -204,5 +207,56 @@ func TestRDSCertPoolCacheInvalidateOnlyCurrentPool(t *testing.T) {
 	}
 	if got := f.calls.Load(); got != 2 {
 		t.Errorf("fetched %d times, want 2", got)
+	}
+}
+
+func TestAWSPostgresPasswordAuthUsesCachedBundle(t *testing.T) {
+	addr, pool := newTestTLSServer(t, 'S')
+	f := &fakeCertFetcher{pools: []*x509.CertPool{pool}}
+	dialer := rdsTLSDialer{certs: newRDSCertPoolCache(f)}
+
+	connector, err := newAWSPostgresConnector("awspostgres://app:s3cr%2Ft@"+addr+"/mydb", dialer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The test server closes the connection after the TLS handshake, so the
+	// PostgreSQL startup fails; the dial (and bundle lookup) happened.
+	const dials = 5
+	for range dials {
+		if _, err := connector.Connect(context.Background()); err == nil {
+			t.Fatal("Connect() to the test TLS server unexpectedly succeeded")
+		}
+	}
+	if got := f.calls.Load(); got != 1 {
+		t.Errorf("CA bundle fetched %d times for %d password-auth dials, want 1", got, dials)
+	}
+}
+
+func TestAWSPostgresConnectorDSNValidation(t *testing.T) {
+	for _, param := range []string{"sslmode=verify-full", "sslrootcert=/ca.pem", "sslcert=/c.pem", "sslkey=/k.pem"} {
+		_, err := newAWSPostgresConnector("awspostgres://app:pw@db:5432/mydb?"+param, newRDSTLSDialer())
+		if err == nil || !strings.Contains(err.Error(), "not allowed") {
+			t.Errorf("%s: err = %v, want gocloud's 'not allowed' error", param, err)
+		}
+	}
+
+	cfg, err := awsPostgresConfig("awspostgres://app:s3cr%2Ft@db.example.com:5432/mydb?connect_timeout=5")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Password != "s3cr/t" || cfg.User != "app" || cfg.SSLMode != pq.SSLModeDisable || cfg.ConnectTimeout != 5*time.Second {
+		t.Errorf("parsed config = user %q password %q sslmode %q connect_timeout %v", cfg.User, cfg.Password, cfg.SSLMode, cfg.ConnectTimeout)
+	}
+}
+
+func TestOpenAWSPostgresDoesNotNeedGocloud(t *testing.T) {
+	c := &Config{Scheme: "awspostgres"}
+	db, err := c.openAWSPostgres("awspostgres://app:pw@db.example.com:5432/mydb")
+	if err != nil {
+		t.Fatalf("openAWSPostgres(): %v", err)
+	}
+	_ = db.Close()
+	if _, err := c.openAWSPostgres("awspostgres://app:pw@db:5432/mydb?sslmode=require"); err == nil {
+		t.Error("openAWSPostgres() accepted an SSL parameter")
 	}
 }
