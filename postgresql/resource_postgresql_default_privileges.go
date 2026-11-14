@@ -15,10 +15,10 @@ import (
 
 func resourcePostgreSQLDefaultPrivileges() *schema.Resource {
 	return &schema.Resource{
-		Create: PGResourceFunc(resourcePostgreSQLDefaultPrivilegesCreate),
-		Update: PGResourceFunc(resourcePostgreSQLDefaultPrivilegesCreate),
+		Create: PGResourceFunc(retryOnConcurrentCatalogUpdate(resourcePostgreSQLDefaultPrivilegesCreate)),
+		Update: PGResourceFunc(retryOnConcurrentCatalogUpdate(resourcePostgreSQLDefaultPrivilegesCreate)),
 		Read:   PGResourceFunc(resourcePostgreSQLDefaultPrivilegesRead),
-		Delete: PGResourceFunc(resourcePostgreSQLDefaultPrivilegesDelete),
+		Delete: PGResourceFunc(retryOnConcurrentCatalogUpdate(resourcePostgreSQLDefaultPrivilegesDelete)),
 
 		Schema: map[string]*schema.Schema{
 			"role": {
@@ -151,7 +151,7 @@ func resourcePostgreSQLDefaultPrivilegesCreate(db *DBConnection, d *schema.Resou
 	}
 	defer deferredRollback(txn)
 
-	if err := pgLockRole(db, txn, owner); err != nil {
+	if err := lockDefaultPrivileges(db, txn, d); err != nil {
 		return err
 	}
 
@@ -206,7 +206,7 @@ func resourcePostgreSQLDefaultPrivilegesDelete(db *DBConnection, d *schema.Resou
 	}
 	defer deferredRollback(txn)
 
-	if err := pgLockRole(db, txn, owner); err != nil {
+	if err := lockDefaultPrivileges(db, txn, d); err != nil {
 		return err
 	}
 
@@ -224,6 +224,14 @@ func resourcePostgreSQLDefaultPrivilegesDelete(db *DBConnection, d *schema.Resou
 	return nil
 }
 
+// lockDefaultPrivileges locks the owner role (not its members: default
+// privileges change no membership) and the pg_default_acl row of the
+// resource, in one round-trip.
+func lockDefaultPrivileges(db *DBConnection, txn *sql.Tx, d *schema.ResourceData) error {
+	return pgLockRoleAndObjects(db, txn, d.Get("owner").(string), nil,
+		[]advisoryLockKey{defaultPrivilegesLockKey(d)})
+}
+
 func readRoleDefaultPrivileges(txn *sql.Tx, db *DBConnection, d *schema.ResourceData) error {
 	role := d.Get("role").(string)
 	owner := d.Get("owner").(string)
@@ -231,7 +239,7 @@ func readRoleDefaultPrivileges(txn *sql.Tx, db *DBConnection, d *schema.Resource
 	objectType := d.Get("object_type").(string)
 	privilegesInput := d.Get("privileges").(*schema.Set).List()
 
-	if err := pgLockRole(db, txn, owner); err != nil {
+	if err := lockDefaultPrivileges(db, txn, d); err != nil {
 		return err
 	}
 

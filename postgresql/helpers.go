@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"regexp"
+	"slices"
 	"strings"
 
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
@@ -166,7 +167,9 @@ func withRolesGranted(txn *sql.Tx, roles []string, fn func() error) error {
 	var grantedRoles []string
 	var revokedRoles []string
 
-	for _, role := range roles {
+	// Sorted, so that the membership locks below are always taken in the same
+	// order by concurrent transactions.
+	for _, role := range slices.Sorted(slices.Values(roles)) {
 		// We need to check if the role we want to grant is a superuser
 		// in this case Postgres disallows to grant it to a current user which is not superuser.
 		superuser, err := isSuperuser(txn, role)
@@ -194,7 +197,7 @@ func withRolesGranted(txn *sql.Tx, roles []string, fn func() error) error {
 		//  - GRANT postgres TO foo
 
 		// Check the opposite relation and revoke currentUser from role if needed
-		revoked, err := revokeRoleMembership(txn, currentUser, role)
+		revoked, err := revokeReverseMembership(txn, currentUser, role)
 		if err != nil {
 			return err
 		}
@@ -240,6 +243,39 @@ func withRolesGranted(txn *sql.Tx, roles []string, fn func() error) error {
 	}
 
 	return nil
+}
+
+// revokeReverseMembership is revokeRoleMembership(txn, currentUser, role) for
+// withRolesGranted, which grants the membership back before commit. It locks
+// the membership before revoking it: two transactions doing this for the same
+// pair would delete the same pg_auth_members row and the second would fail
+// with "tuple concurrently deleted"; with the lock it waits and then sees the
+// re-granted row.
+//
+// Plain temporary grants (GRANT owner TO current_user, revoked before commit)
+// take no lock: a concurrent identical GRANT waits on the unique index for the
+// first transaction, whose row is gone by the time it commits, so it goes
+// through. Locking them would serialize every non-superuser write sharing an
+// owner. Like all advisory locks this is scoped to the current database, while
+// pg_auth_members is shared by all databases.
+func revokeReverseMembership(txn *sql.Tx, currentUser, role string) (bool, error) {
+	if currentUser == role {
+		return false, nil
+	}
+	isMember, err := isMemberOfRole(txn, currentUser, role)
+	if err != nil || !isMember {
+		return false, err
+	}
+	if _, err := txn.Exec("SELECT " + membershipLockKey(currentUser, role).call()); err != nil {
+		return false, fmt.Errorf("could not get advisory lock for membership of %s in %s: %w", role, currentUser, err)
+	}
+
+	log.Printf("revokeReverseMembership: Revoke %s from %s", currentUser, role)
+	query := fmt.Sprintf("REVOKE %s FROM %s", pq.QuoteIdentifier(currentUser), pq.QuoteIdentifier(role))
+	if _, err := txn.Exec(query); err != nil {
+		return false, fmt.Errorf("error revoking role %s from %s: %w", currentUser, role, err)
+	}
+	return true, nil
 }
 
 func sliceContainsStr(haystack []string, needle string) bool {
@@ -600,23 +636,34 @@ func getRoleOID(db QueryAble, role string) (uint32, error) {
 	return oid, nil
 }
 
-// Lock a role and all his members to avoid concurrent updates on some resources
+// pgLockRole locks a role and all its members, for the paths that change
+// role memberships: dropping or altering a role (a membership row is
+// serialized on the lock of its member, and DROP ROLE removes the rows where
+// the dropped role is the granted one, hence its members) and the
+// database owner handling, which temporarily grants the owner to the provider
+// user. Grant and default privileges writes change ACLs, not memberships; they
+// lock the role alone plus the objects they change (pgLockRoleAndObjects).
+//
+// Advisory locks are scoped to the database the transaction runs in, so this
+// serializes writers of the same role in the same database only. That matches
+// what the per-database catalogs need (object ACLs, default ACLs), which are
+// the ones grants race on; see grant_locks.go.
 func pgLockRole(db *DBConnection, txn *sql.Tx, role string) error {
 	literal := pq.QuoteLiteral(role)
-	return execAdvisoryLock(db, txn, "role", role,
+	return execAdvisoryLock(db, txn, fmt.Sprintf("role %q", role),
 		fmt.Sprintf("could not get advisory lock for role %s", role),
-		"SELECT pg_advisory_xact_lock(oid::bigint) FROM pg_roles WHERE rolname = "+literal,
+		roleLockStatement(role),
 		// Members are locked in OID order so that concurrent transactions
 		// touching overlapping member sets acquire them in the same order.
 		"SELECT pg_advisory_xact_lock(member::bigint) FROM pg_auth_members JOIN pg_roles ON roleid = pg_roles.oid WHERE rolname = "+literal+" ORDER BY member",
 	)
 }
 
-// Lock a database and all his members to avoid concurrent updates on some resources
+// Lock a database to avoid concurrent updates of its ACL
 func pgLockDatabase(db *DBConnection, txn *sql.Tx, database string) error {
-	return execAdvisoryLock(db, txn, "database", database,
+	return execAdvisoryLock(db, txn, fmt.Sprintf("database %q", database),
 		fmt.Sprintf("could not get advisory lock for database %s", database),
-		"SELECT pg_advisory_xact_lock(oid::bigint) FROM pg_database WHERE datname = "+pq.QuoteLiteral(database),
+		databaseLockStatement(database),
 	)
 }
 
@@ -644,7 +691,7 @@ const savedLockTimeoutSetting = "terraform_provider_postgresql.saved_lock_timeou
 // as literals (pq.QuoteLiteral). If a statement fails, PostgreSQL skips the
 // rest and the error of the failing statement is returned; the transaction is
 // aborted either way, so nothing needs to be restored.
-func execAdvisoryLock(db *DBConnection, txn *sql.Tx, kind, name, errPrefix string, lockStmts ...string) error {
+func execAdvisoryLock(db *DBConnection, txn *sql.Tx, what, errPrefix string, lockStmts ...string) error {
 	timeoutMs := db.client.config.AdvisoryLockTimeout
 
 	// Disable statement timeout for this transaction otherwise the lock could fail
@@ -666,9 +713,9 @@ func execAdvisoryLock(db *DBConnection, txn *sql.Tx, kind, name, errPrefix strin
 	if _, err := txn.Exec(strings.Join(stmts, ";\n")); err != nil {
 		if timeoutMs > 0 && isLockTimeoutError(err) {
 			return fmt.Errorf(
-				"timed out after %dms waiting for advisory lock on %s %q: another Terraform run or session holds it; "+
+				"timed out after %dms waiting for advisory lock on %s: another Terraform run or session holds it; "+
 					"retry, serialize the applies, or raise the provider advisory_lock_timeout (0 waits indefinitely): %w",
-				timeoutMs, kind, name, err,
+				timeoutMs, what, err,
 			)
 		}
 		return fmt.Errorf("%s: %w", errPrefix, err)

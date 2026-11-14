@@ -179,8 +179,9 @@ The following arguments are supported:
 * `conn_max_lifetime_seconds` - (Optional) Maximum lifetime of a connection,
   in seconds. The default is `0`.  Zero means unlimited.
 * `advisory_lock_timeout` - (Optional) Maximum wait, in milliseconds, for the
-  advisory locks the provider takes on a role (and its members) or a database
-  before changing grants, default privileges, roles and database ownership.
+  advisory locks the provider takes on a role (and its members), a database or
+  the granted objects before changing grants, default privileges, roles and
+  database ownership.
   The default is `0`, which waits indefinitely (previous behavior). When set,
   an apply that cannot get the lock in time fails with an error naming the
   locked role or database instead of hanging, e.g. when another Terraform run
@@ -189,6 +190,15 @@ The following arguments are supported:
   queue on these locks (e.g. every `postgresql_database` with an `owner` locks
   the provider's own role while it is created), so pick a value well above how
   long such operations take rather than a few hundred milliseconds.
+
+  These locks are PostgreSQL advisory locks, which are scoped to one database:
+  `postgresql_grant` and `postgresql_default_privileges` lock the role and the
+  objects (or default privileges row) they change in the database they
+  change them in, so writes on the same objects serialize across resources,
+  applies and Terraform processes. Locks taken in different databases don't
+  wait for each other; that is enough for grants, whose ACLs are stored per
+  database, but it does not serialize changes of the same role made from two
+  databases.
 * `expected_version` - (Optional) Specify a hint to Terraform regarding the
   expected version that the provider will be talking with.  This is a required
   hint in order for Terraform to talk with an ancient version of PostgreSQL.

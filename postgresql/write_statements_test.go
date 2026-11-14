@@ -331,13 +331,21 @@ func TestGrantCreateWriteStatements(t *testing.T) {
 
 		stmts := writeStmtCounter.inTxn()
 		assertNoBindParameters(t, stmts)
-		// role lock, database lock, REVOKE+GRANT
-		if len(stmts) != 3 {
-			t.Fatalf("timeout %d: grant Create sent %d statements in its write transaction, want 3: %+v", tc.timeoutMs, len(stmts), stmts)
+		// role and database locks, REVOKE+GRANT
+		if len(stmts) != 2 {
+			t.Fatalf("timeout %d: grant Create sent %d statements in its write transaction, want 2: %+v", tc.timeoutMs, len(stmts), stmts)
+		}
+		for _, part := range []string{"FROM pg_roles WHERE rolname = 'r1'", "FROM pg_database WHERE datname = 'writetestdb'"} {
+			if !strings.Contains(stmts[0].query, part) {
+				t.Fatalf("timeout %d: lock preamble is missing %q:\n%s", tc.timeoutMs, part, stmts[0].query)
+			}
+		}
+		if strings.Contains(stmts[0].query, "pg_auth_members") {
+			t.Fatalf("timeout %d: grant Create locks the members of the grantee:\n%s", tc.timeoutMs, stmts[0].query)
 		}
 		want := `REVOKE ALL PRIVILEGES ON DATABASE "writetestdb" FROM "r1";` + "\n" + `GRANT CONNECT ON DATABASE "writetestdb" TO "r1"`
-		if stmts[2].query != want {
-			t.Fatalf("timeout %d: revoke/grant statement = %q, want %q", tc.timeoutMs, stmts[2].query, want)
+		if stmts[1].query != want {
+			t.Fatalf("timeout %d: revoke/grant statement = %q, want %q", tc.timeoutMs, stmts[1].query, want)
 		}
 	}
 }
