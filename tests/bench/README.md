@@ -105,14 +105,23 @@ work dir replaces it. Every plan must exit with code 0, which
 means no changes. Exit code 2 means drift and is logged, so a provider that reads
 something differently stands out.
 
-`run.sh` pauses for `COOLDOWN` seconds before each plan. The default is 2*MSL + 5 s,
+`run.sh` pauses for `COOLDOWN` seconds before a plan. The default is 2*MSL + 5 s,
 which is 35 s on macOS and 65 s elsewhere. Today a plan opens one connection per few
 statements, which is about 2,800 at the default size. Each connection leaves its
 ephemeral ports in TIME_WAIT. On macOS, two or three plans in a row exhaust the port
 range, and the plan then fails with `connect: can't assign requested address`. The
 `container` port forwarder and the latency proxy use extra ports, so this happens
-sooner. As a rough guide, each plan takes about 50 s including the cooldown. For example,
-4 providers x 3 latencies x 3 runs took 32 minutes on an M-series Mac.
+sooner. The pause only happens when the previous plan (or the setup apply) opened more
+than `COOLDOWN_MIN_CONNS` connections (default 500). A plan with
+`max_idle_connections > 0` opens a few dozen, so the plan after it starts right away;
+`COOLDOWN_MIN_CONNS=0` pauses before every plan. As a rough guide, a plan that reconnects
+for every statement takes about 50 s including the cooldown. For example, 4 providers x 3
+latencies x 3 runs, all without connection reuse, took 32 minutes on an M-series Mac.
+Lowering `net.inet.tcp.msl` (macOS) shortens the default pause.
+
+Several matrices can run at the same time against separate PostgreSQL containers: give
+each its own `PGPORT`, `PROXY_PORT` and `-w`. They do compete for CPU, so compare
+numbers within one matrix, not across matrices that ran in parallel.
 
 To clean up, run `psql -f <workdir>/tf/cleanup.sql` and `container stop pg-tf-bench`
 (the container was started with `--rm`, so stopping it also removes it).
