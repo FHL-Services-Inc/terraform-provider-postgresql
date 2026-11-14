@@ -229,7 +229,7 @@ func resourcePostgreSQLFunctionReadImpl(db *DBConnection, d *schema.ResourceData
 		`LEFT JOIN pg_namespace n ON p.pronamespace = n.oid ` +
 		`WHERE p.oid = to_regprocedure($1)`
 
-	txn, err := startTransaction(db.client, databaseName)
+	dbc, err := initConnection(db.client, databaseName)
 	if err != nil {
 		if isDatabaseDoesNotExistError(err) {
 			log.Printf("[WARN] PostgreSQL database (%s) not found, removing function (%s) from state", databaseName, functionId)
@@ -238,20 +238,19 @@ func resourcePostgreSQLFunctionReadImpl(db *DBConnection, d *schema.ResourceData
 		}
 		return err
 	}
-	defer deferredRollback(txn)
 
-	err = txn.QueryRow(query, functionSignature).Scan(&funcDefinition)
+	err = dbc.QueryRow(query, functionSignature).Scan(&funcDefinition)
 	switch {
 	case err == sql.ErrNoRows:
 		log.Printf("[WARN] PostgreSQL function: %s", functionId)
 		d.SetId("")
 		return nil
+	case isDatabaseDoesNotExistError(err):
+		log.Printf("[WARN] PostgreSQL database (%s) not found, removing function (%s) from state", databaseName, functionId)
+		d.SetId("")
+		return nil
 	case err != nil:
 		return fmt.Errorf("error reading function: %w", err)
-	}
-
-	if err := txn.Commit(); err != nil {
-		return err
 	}
 
 	var pgFunction PGFunction

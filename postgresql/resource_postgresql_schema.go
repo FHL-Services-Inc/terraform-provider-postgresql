@@ -284,7 +284,7 @@ func resourcePostgreSQLSchemaReadImpl(db *DBConnection, d *schema.ResourceData) 
 		return err
 	}
 
-	txn, err := startTransaction(db.client, database)
+	dbc, err := initConnection(db.client, database)
 	if err != nil {
 		if isDatabaseDoesNotExistError(err) {
 			log.Printf("[WARN] PostgreSQL database (%s) not found, removing schema (%s) from state", database, schemaName)
@@ -293,14 +293,17 @@ func resourcePostgreSQLSchemaReadImpl(db *DBConnection, d *schema.ResourceData) 
 		}
 		return err
 	}
-	defer deferredRollback(txn)
 
 	var schemaOwner string
 	var schemaACLs []string
-	err = txn.QueryRow("SELECT pg_catalog.pg_get_userbyid(n.nspowner), COALESCE(n.nspacl, '{}'::aclitem[])::TEXT[] FROM pg_catalog.pg_namespace n WHERE n.nspname=$1", schemaName).Scan(&schemaOwner, pq.Array(&schemaACLs))
+	err = dbc.QueryRow("SELECT pg_catalog.pg_get_userbyid(n.nspowner), COALESCE(n.nspacl, '{}'::aclitem[])::TEXT[] FROM pg_catalog.pg_namespace n WHERE n.nspname=$1", schemaName).Scan(&schemaOwner, pq.Array(&schemaACLs))
 	switch {
 	case err == sql.ErrNoRows:
 		log.Printf("[WARN] PostgreSQL schema (%s) not found in database %s", schemaName, database)
+		d.SetId("")
+		return nil
+	case isDatabaseDoesNotExistError(err):
+		log.Printf("[WARN] PostgreSQL database (%s) not found, removing schema (%s) from state", database, schemaName)
 		d.SetId("")
 		return nil
 	case err != nil:

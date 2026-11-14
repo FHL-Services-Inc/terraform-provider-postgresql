@@ -61,7 +61,7 @@ func (c *stmtRecorderConn) ExecContext(_ context.Context, query string, args []d
 }
 func (c *stmtRecorderConn) QueryContext(_ context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
 	c.r.record(query, args)
-	return emptyRows{}, nil
+	return stmtRecorderRows{}, nil
 }
 
 type stmtRecorderTx struct{ r *stmtRecorder }
@@ -69,11 +69,11 @@ type stmtRecorderTx struct{ r *stmtRecorder }
 func (t *stmtRecorderTx) Commit() error   { t.r.record("COMMIT", nil); return nil }
 func (t *stmtRecorderTx) Rollback() error { t.r.record("ROLLBACK", nil); return nil }
 
-type emptyRows struct{}
+type stmtRecorderRows struct{}
 
-func (emptyRows) Columns() []string         { return []string{"x"} }
-func (emptyRows) Close() error              { return nil }
-func (emptyRows) Next([]driver.Value) error { return io.EOF }
+func (stmtRecorderRows) Columns() []string         { return []string{"x"} }
+func (stmtRecorderRows) Close() error              { return nil }
+func (stmtRecorderRows) Next([]driver.Value) error { return io.EOF }
 
 var registerStmtRecorder sync.Once
 
