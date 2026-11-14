@@ -209,9 +209,11 @@ The following arguments are supported:
   `connect_timeout` (180 seconds when `connect_timeout` is zero), the operation
   fails with an error instead of waiting forever; raise the limit or lower
   `terraform -parallelism`. Setting it also caps `max_connections` to the same
-  value. A reasonable setting with pooling is `max_idle_connections =
-  max_total_connections`, with `-parallelism` up to about 1.5 times the limit;
-  more parallelism only queues operations. Only supported with the `postgres`
+  value. With pooling, set `max_idle_connections = max_total_connections`.
+  Each connection belongs to one database, so a limit close to or below
+  `-parallelism` makes the provider close and reopen connections to move them
+  between databases; about twice `-parallelism` keeps almost all of the reuse.
+  Only supported with the `postgres`
   scheme; ignored for `awspostgres` and `gcppostgres`. It can also be set with
   the `PGMAXTOTALCONNECTIONS` environment variable.
 * `conn_max_lifetime_seconds` - (Optional) Maximum lifetime of a connection,
