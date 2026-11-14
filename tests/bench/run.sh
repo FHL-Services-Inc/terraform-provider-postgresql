@@ -33,9 +33,15 @@ Environment:
   PGHOST/PGPORT/PGUSER/PGPASSWORD  superuser connection (default 127.0.0.1:25445,
                                    postgres/postgres)
   PROXY_PORT                       local port for the latency proxy (default PGPORT+1)
-  COOLDOWN                         seconds to pause before each plan so TIME_WAIT
+  COOLDOWN                         seconds to pause before a plan so TIME_WAIT
                                    sockets expire (default 2*MSL+5, 35 on macOS)
-  GEN_ARGS                         extra flags for genfixture, e.g. "-roles 400 -tables 2000"
+  COOLDOWN_MIN_CONNS               pause only if the previous plan (or the setup) opened
+                                   more connections than this (default 500); 0 pauses
+                                   before every plan
+  GEN_ARGS                         extra flags for genfixture, e.g. "-roles 400 -tables 2000",
+                                   or "-fixture-dbs 4" to spread the fixture over 4 databases
+  SAMPLE_INTERVAL                  how often connsampler polls pg_stat_activity during a plan
+                                   (default 100ms)
   TERRAFORM                        terraform binary (default: terraform from PATH)
 EOF
 }
@@ -87,8 +93,8 @@ workdir=$(cd "$workdir" && pwd)
 sql() { psql -qAtX -v ON_ERROR_STOP=1 -c "$1"; }
 
 # --- tools -------------------------------------------------------------------
-log "building genfixture and latencyproxy"
-(cd "$REPO_DIR" && go build -o "$workdir/bin/" ./tests/bench/genfixture ./tests/bench/latencyproxy)
+log "building genfixture, latencyproxy and connsampler"
+(cd "$REPO_DIR" && go build -o "$workdir/bin/" ./tests/bench/genfixture ./tests/bench/latencyproxy ./tests/bench/connsampler)
 
 # --- providers ---------------------------------------------------------------
 labels=()
@@ -176,6 +182,52 @@ stats_read() { # stats_read <sessions before> -> "queries connections"
 	echo "${row%%|*} $((${row##*|} - before - 1))"
 }
 
+# connsampler polls pg_stat_activity (directly, not through the latency proxy) and
+# writes one line per sample: time, provider connections, idle ones, per database.
+# It is started before stats_reset and stopped after stats_read, so its own session
+# never shows up in the connections column; its rows are cut to the plan's window.
+sampler_pid=""
+sampler_start() { # sampler_start <samples file>
+	"$workdir/bin/connsampler" -interval "${SAMPLE_INTERVAL:-100ms}" >"$1" 2>"$1.err" &
+	sampler_pid=$!
+	local _
+	for _ in $(seq 1 100); do
+		# PostgreSQL 15+ flushes the session counter up to 1 s after connect;
+		# wait so it lands before the stats_reset snapshot.
+		[ -s "$1" ] && { sleep 1.5; return 0; }
+		kill -0 "$sampler_pid" 2>/dev/null || break
+		sleep 0.1
+	done
+	die "connsampler did not start, see $1.err"
+}
+sampler_stop() {
+	if [ -n "$sampler_pid" ]; then
+		kill "$sampler_pid" 2>/dev/null || true
+		wait "$sampler_pid" 2>/dev/null || true
+	fi
+	sampler_pid=""
+}
+
+# peak_read <samples file> <t0> <t1> -> "peak p95 peak_idle by_db", where by_db is
+# the per-database split of the (first) peak sample, e.g. "bench:10;postgres:4".
+peak_read() {
+	awk -F'\t' -v a="$2" -v b="$3" '$1 >= a && $1 <= b {
+			print $2, $3, ($4 == "" ? "-" : $4)
+			if ($2 + 0 > pk) { pk = $2 + 0; db = $4 }
+		}
+		END { gsub(",", ";", db); print "@", (db == "" ? "-" : db) }' "$1" |
+		awk '$1 == "@" { db = $2; next } { c[NR] = $1; if ($2 > mi) mi = $2; n = NR }
+			END {
+				if (!n) { print "n/a n/a n/a -"; exit }
+				asort_n(c, n)
+				i = int(n * 0.95 + 0.999999); if (i > n) i = n # nearest rank
+				printf "%d %d %d %s\n", c[n], c[i], mi, db
+			}
+			function asort_n(a, n,   i, j, x) {
+				for (i = 2; i <= n; i++) { x = a[i]; for (j = i - 1; j >= 1 && a[j] > x; j--) a[j + 1] = a[j]; a[j + 1] = x }
+			}'
+}
+
 # --- setup -------------------------------------------------------------------
 if [ $skip_setup = 0 ]; then
 	log "generating fixture (GEN_ARGS=${GEN_ARGS:-})"
@@ -209,7 +261,7 @@ stop_proxy() {
 	fi
 	proxy_pid=""
 }
-trap stop_proxy EXIT
+trap 'stop_proxy; sampler_stop' EXIT
 
 # Every plan opens thousands of short-lived connections (each one takes an
 # ephemeral port in the client, and another in the latency proxy or a container
@@ -224,7 +276,10 @@ if [ -z "${COOLDOWN:-}" ]; then
 fi
 
 results="$workdir/results.csv"
-echo "provider,rtt_ms,run,seconds,exit_code,queries,connections" >"$results"
+echo "provider,rtt_ms,run,seconds,exit_code,queries,connections,peak_conns,p95_conns,peak_idle,peak_by_db" >"$results"
+
+# The setup apply opened thousands of connections, so the first plan always waits.
+last_conns=999999
 
 for rtt in $latencies; do
 	stop_proxy
@@ -244,17 +299,28 @@ for rtt in $latencies; do
 	# Runs are interleaved across providers so drift on the machine hits all of them.
 	for run in $(seq 1 "$runs"); do
 		for label in "${labels[@]}"; do
-			sleep "$COOLDOWN"
+			# Only plans that open many connections leave enough TIME_WAIT sockets
+			# behind to matter; after a plan on a pool that reuses connections
+			# (a few dozen) the next one can start right away.
+			if [ "$last_conns" -gt "${COOLDOWN_MIN_CONNS:-500}" ] || [ "${COOLDOWN_MIN_CONNS:-500}" = 0 ]; then
+				sleep "$COOLDOWN"
+			fi
+			samples="$workdir/logs/conns-$label-$rtt-$run.tsv"
+			sampler_start "$samples"
 			before=$(stats_reset)
 			t0=$(now)
 			rc=0
 			tf_plan "$label" plan -refresh=true -input=false -no-color -lock=false -detailed-exitcode \
 				-parallelism="$parallelism" -var "pg_port=$port" -var "pg_host=$host" -var "pg_password=$PGPASSWORD" \
 				>"$workdir/logs/plan-$label-$rtt-$run.log" 2>&1 || rc=$?
-			secs=$(echo "$(now) - $t0" | bc)
+			t1=$(now)
+			secs=$(echo "$t1 - $t0" | bc)
 			read -r queries conns <<<"$(stats_read "$before")"
-			echo "$label,$rtt,$run,$secs,$rc,$queries,$conns" >>"$results"
-			log "$label rtt=${rtt}ms run $run/$runs: ${secs}s exit=$rc queries=$queries connections=$conns"
+			sampler_stop
+			read -r peak p95 peak_idle by_db <<<"$(peak_read "$samples" "$t0" "$t1")"
+			echo "$label,$rtt,$run,$secs,$rc,$queries,$conns,$peak,$p95,$peak_idle,$by_db" >>"$results"
+			log "$label rtt=${rtt}ms run $run/$runs: ${secs}s exit=$rc queries=$queries connections=$conns peak=$peak p95=$p95 idle=$peak_idle by_db=$by_db"
+			case $conns in '' | *[!0-9]*) last_conns=999999 ;; *) last_conns=$conns ;; esac
 			[ $rc = 0 ] || log "  plan exit code $rc (2 = drift, 1 = error), see $workdir/logs/plan-$label-$rtt-$run.log"
 		done
 	done
@@ -267,25 +333,43 @@ summary="$workdir/summary.md"
 	echo "$resources resources, $runs runs each, -parallelism=$parallelism"
 	echo
 	echo "Only runs that exited 0 (no changes, no errors) count towards the medians."
+	echo "peak / p95 / idle: concurrent provider connections sampled every ${SAMPLE_INTERVAL:-100ms}"
+	echo "during the plan (median of the runs; peak also shows the highest run)."
 	echo
-	echo "| provider | added RTT | plan median (s) | min-max (s) | queries | connections | ok runs |"
-	echo "|---|---:|---:|---:|---:|---:|---:|"
+	echo "| provider | added RTT | plan median (s) | min-max (s) | queries | connections | peak conns (max) | p95 conns | peak idle | ok runs |"
+	echo "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|"
 	for rtt in $latencies; do
 		for label in "${labels[@]}"; do
 			awk -F, -v l="$label" -v r="$rtt" '
 				BEGIN { n = 0; all = 0 }
 				NR > 1 && $1 == l && $2 == r { all++ }
-				NR > 1 && $1 == l && $2 == r && $5 == 0 { t[n] = $4; q[n] = $6; c[n] = $7; n++ }
+				NR > 1 && $1 == l && $2 == r && $5 == 0 { t[n] = $4; q[n] = $6; c[n] = $7; pk[n] = $8; p95[n] = $9; id[n] = $10; n++ }
 				function med(a, n,   i, j, x) {
 					for (i = 1; i < n; i++) { x = a[i]; for (j = i - 1; j >= 0 && a[j] > x; j--) a[j + 1] = a[j]; a[j + 1] = x }
 					return n % 2 ? a[int(n / 2)] : (a[n / 2 - 1] + a[n / 2]) / 2
 				}
 				END {
-					if (!n) { if (all) printf "| %s | %s ms | - | - | - | - | 0/%d |\n", l, r, all; exit }
+					if (!n) { if (all) printf "| %s | %s ms | - | - | - | - | - | - | - | 0/%d |\n", l, r, all; exit }
 					lo = hi = t[0]; for (i = 1; i < n; i++) { if (t[i] < lo) lo = t[i]; if (t[i] > hi) hi = t[i] }
 					qs = (q[0] == "n/a") ? "n/a" : sprintf("%d", med(q, n))
-					printf "| %s | %s ms | %.1f | %.1f-%.1f | %s | %d | %d/%d |\n", l, r, med(t, n), lo, hi, qs, med(c, n), n, all
+					if (pk[0] == "n/a") { ps = "n/a"; p95s = "n/a"; ids = "n/a" } else {
+						mx = pk[0]; for (i = 1; i < n; i++) if (pk[i] + 0 > mx + 0) mx = pk[i]
+						ps = sprintf("%d (%d)", med(pk, n), mx); p95s = sprintf("%d", med(p95, n)); ids = sprintf("%d", med(id, n))
+					}
+					printf "| %s | %s ms | %.1f | %.1f-%.1f | %s | %d | %s | %s | %s | %d/%d |\n", l, r, med(t, n), lo, hi, qs, med(c, n), ps, p95s, ids, n, all
 				}' "$results"
+		done
+	done
+	echo
+	echo "Connections per database at the peak sample, one entry per ok run:"
+	echo
+	echo "| provider | added RTT | per database at peak |"
+	echo "|---|---:|---|"
+	for rtt in $latencies; do
+		for label in "${labels[@]}"; do
+			awk -F, -v l="$label" -v r="$rtt" '
+				NR > 1 && $1 == l && $2 == r && $5 == 0 { gsub(";", ", ", $11); s = s (s == "" ? "" : " / ") $11 }
+				END { if (s != "") printf "| %s | %s ms | %s |\n", l, r, s }' "$results"
 		done
 	done
 } >"$summary"
