@@ -105,9 +105,9 @@ func dataSourcePostgreSQLTablesRead(db *DBConnection, d *schema.ResourceData) er
 	query := tableQuery
 	queryConcatKeyword := queryConcatKeywordWhere
 
-	query = applyTableDataSourceQueryFilters(query, queryConcatKeyword, d)
+	query, args := applyTableDataSourceQueryFilters(query, queryConcatKeyword, d)
 
-	rows, err := txn.Query(query)
+	rows, err := txn.Query(query, args...)
 	if err != nil {
 		return err
 	}
@@ -152,17 +152,18 @@ func generateDataSourceTablesID(d *schema.ResourceData, databaseName string) str
 	}, "_")
 }
 
-func applyTableDataSourceQueryFilters(query string, queryConcatKeyword string, d *schema.ResourceData) string {
+func applyTableDataSourceQueryFilters(query string, queryConcatKeyword string, d *schema.ResourceData) (string, []any) {
+	var args queryArgs
 	filters := []string{}
-	schemasTypeFilter := applyTypeMatchingToQuery(tableSchemaKeyword, d.Get("schemas").([]any))
+	schemasTypeFilter := applyTypeMatchingToQuery(tableSchemaKeyword, d.Get("schemas").([]any), &args)
 	if len(schemasTypeFilter) > 0 {
 		filters = append(filters, schemasTypeFilter)
 	}
-	tableTypeFilter := applyTypeMatchingToQuery(tableTypeKeyword, d.Get("table_types").([]any))
+	tableTypeFilter := applyTypeMatchingToQuery(tableTypeKeyword, d.Get("table_types").([]any), &args)
 	if len(tableTypeFilter) > 0 {
 		filters = append(filters, tableTypeFilter)
 	}
-	filters = append(filters, applyPatternMatchingToQuery(tablePatternMatchingTarget, d)...)
+	filters = append(filters, applyPatternMatchingToQuery(tablePatternMatchingTarget, d, &args)...)
 
-	return finalizeQueryWithFilters(query, queryConcatKeyword, filters)
+	return finalizeQueryWithFilters(query, queryConcatKeyword, filters), args
 }
