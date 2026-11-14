@@ -43,3 +43,17 @@ func testAccPreCheck(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestProviderMaxIdleConnectionsEnvDefault(t *testing.T) {
+	s := Provider().Schema["max_idle_connections"]
+
+	t.Setenv("PGMAXIDLECONNECTIONS", "")
+	if v, err := s.DefaultValue(); err != nil || v != 0 {
+		t.Errorf("without PGMAXIDLECONNECTIONS: DefaultValue() = %v, %v; want 0", v, err)
+	}
+
+	t.Setenv("PGMAXIDLECONNECTIONS", "4")
+	if v, err := s.DefaultValue(); err != nil || v != "4" {
+		t.Errorf("with PGMAXIDLECONNECTIONS=4: DefaultValue() = %#v, %v; want \"4\"", v, err)
+	}
+}
