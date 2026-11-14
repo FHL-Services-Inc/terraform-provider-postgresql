@@ -139,7 +139,7 @@ func TestAccPostgresqlGrantRole(t *testing.T) {
 
 	_, roleName := getTestDBNames(dbSuffix)
 
-	grantedRoleName := "foo"
+	grantedRoleName := testUniqueName("foo")
 
 	testAccPostgresqlGrantRoleResources := fmt.Sprintf(`
 	resource postgresql_role "grant" {
