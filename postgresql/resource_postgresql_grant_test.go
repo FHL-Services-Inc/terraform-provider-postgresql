@@ -1053,7 +1053,6 @@ func TestAccPostgresqlGrantFunction(t *testing.T) {
 	dbExecute(t, dsn, fmt.Sprintf("CREATE ROLE %s LOGIN PASSWORD '%s'", testRole, testRolePassword))
 	dbExecute(t, dsn, fmt.Sprintf("CREATE SCHEMA %s", testSchema))
 	dbExecute(t, dsn, fmt.Sprintf("GRANT USAGE ON SCHEMA %s TO %s", testSchema, testRole))
-	dbExecute(t, dsn, "ALTER DEFAULT PRIVILEGES REVOKE ALL ON FUNCTIONS FROM PUBLIC")
 
 	// Create test function in this schema
 	dbExecute(t, dsn, fmt.Sprintf(`
@@ -1061,6 +1060,9 @@ CREATE FUNCTION %s.test() RETURNS text
 	AS $$ select 'foo'::text $$
     LANGUAGE SQL;
 `, testSchema))
+	// Functions are executable by PUBLIC by default. Revoke that on the test
+	// routines only, ALTER DEFAULT PRIVILEGES would leak into later tests.
+	dbExecute(t, dsn, fmt.Sprintf("REVOKE ALL ON ALL ROUTINES IN SCHEMA %s FROM PUBLIC", testSchema))
 	defer func() {
 		dbExecute(t, dsn, fmt.Sprintf("DROP SCHEMA %s CASCADE", testSchema))
 		dbExecute(t, dsn, fmt.Sprintf("DROP ROLE %s", testRole))
@@ -1117,7 +1119,6 @@ func TestAccPostgresqlGrantFunctionWithArgs(t *testing.T) {
 	dbExecute(t, dsn, fmt.Sprintf("CREATE ROLE %s LOGIN PASSWORD '%s'", testRole, testRolePassword))
 	dbExecute(t, dsn, fmt.Sprintf("CREATE SCHEMA %s", testSchema))
 	dbExecute(t, dsn, fmt.Sprintf("GRANT USAGE ON SCHEMA %s TO %s", testSchema, testRole))
-	dbExecute(t, dsn, "ALTER DEFAULT PRIVILEGES REVOKE ALL ON FUNCTIONS FROM PUBLIC")
 
 	// Create test function in this schema
 	dbExecute(t, dsn, fmt.Sprintf(`
@@ -1125,6 +1126,9 @@ CREATE FUNCTION %s.test(arg1 text, arg2 character) RETURNS text
 	AS $$ select 'foo'::text $$
     LANGUAGE SQL;
 `, testSchema))
+	// Functions are executable by PUBLIC by default. Revoke that on the test
+	// routines only, ALTER DEFAULT PRIVILEGES would leak into later tests.
+	dbExecute(t, dsn, fmt.Sprintf("REVOKE ALL ON ALL ROUTINES IN SCHEMA %s FROM PUBLIC", testSchema))
 	defer func() {
 		dbExecute(t, dsn, fmt.Sprintf("DROP SCHEMA %s CASCADE", testSchema))
 		dbExecute(t, dsn, fmt.Sprintf("DROP ROLE %s", testRole))
@@ -1183,7 +1187,6 @@ func TestAccPostgresqlGrantProcedure(t *testing.T) {
 	dbExecute(t, dsn, fmt.Sprintf("CREATE ROLE %s LOGIN PASSWORD '%s'", testRole, testRolePassword))
 	dbExecute(t, dsn, fmt.Sprintf("CREATE SCHEMA %s", testSchema))
 	dbExecute(t, dsn, fmt.Sprintf("GRANT USAGE ON SCHEMA %s TO %s", testSchema, testRole))
-	dbExecute(t, dsn, "ALTER DEFAULT PRIVILEGES REVOKE ALL ON FUNCTIONS FROM PUBLIC")
 
 	// Create test procedure in this schema
 	dbExecute(t, dsn, fmt.Sprintf(`
@@ -1191,6 +1194,9 @@ CREATE PROCEDURE %s.test()
 	AS $$ select 'foo'::text $$
     LANGUAGE SQL;
 `, testSchema))
+	// Functions are executable by PUBLIC by default. Revoke that on the test
+	// routines only, ALTER DEFAULT PRIVILEGES would leak into later tests.
+	dbExecute(t, dsn, fmt.Sprintf("REVOKE ALL ON ALL ROUTINES IN SCHEMA %s FROM PUBLIC", testSchema))
 	defer func() {
 		dbExecute(t, dsn, fmt.Sprintf("DROP SCHEMA %s CASCADE", testSchema))
 		dbExecute(t, dsn, fmt.Sprintf("DROP ROLE %s", testRole))
@@ -1248,7 +1254,6 @@ func TestAccPostgresqlGrantRoutine(t *testing.T) {
 	dbExecute(t, dsn, fmt.Sprintf("CREATE ROLE %s LOGIN PASSWORD '%s'", testRole, testRolePassword))
 	dbExecute(t, dsn, fmt.Sprintf("CREATE SCHEMA %s", testSchema))
 	dbExecute(t, dsn, fmt.Sprintf("GRANT USAGE ON SCHEMA %s TO %s", testSchema, testRole))
-	dbExecute(t, dsn, "ALTER DEFAULT PRIVILEGES REVOKE ALL ON FUNCTIONS FROM PUBLIC")
 
 	// Create test function in this schema
 	dbExecute(t, dsn, fmt.Sprintf(`
@@ -1262,6 +1267,9 @@ CREATE PROCEDURE %s.test_procedure()
 	AS $$ select 'foo'::text $$
     LANGUAGE SQL;
 `, testSchema))
+	// Functions are executable by PUBLIC by default. Revoke that on the test
+	// routines only, ALTER DEFAULT PRIVILEGES would leak into later tests.
+	dbExecute(t, dsn, fmt.Sprintf("REVOKE ALL ON ALL ROUTINES IN SCHEMA %s FROM PUBLIC", testSchema))
 	defer func() {
 		dbExecute(t, dsn, fmt.Sprintf("DROP SCHEMA %s CASCADE", testSchema))
 		dbExecute(t, dsn, fmt.Sprintf("DROP ROLE %s", testRole))
