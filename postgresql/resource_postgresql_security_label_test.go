@@ -2,12 +2,14 @@ package postgresql
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
 
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/resource"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/terraform"
+	"github.com/lib/pq"
 )
 
 func TestAccPostgresqlSecurityLabel_Basic(t *testing.T) {
@@ -16,6 +18,7 @@ func TestAccPostgresqlSecurityLabel_Basic(t *testing.T) {
 			testAccPreCheck(t)
 			testCheckCompatibleVersion(t, featureSecurityLabel)
 			testSuperuserPreCheck(t)
+			testSecurityLabelProviderPreCheck(t, "dummy")
 		},
 		Providers:    testAccProviders,
 		CheckDestroy: testAccCheckPostgresqlSecurityLabelDestroy,
@@ -44,6 +47,7 @@ func TestAccPostgresqlSecurityLabel_Update(t *testing.T) {
 			testAccPreCheck(t)
 			testCheckCompatibleVersion(t, featureSecurityLabel)
 			testSuperuserPreCheck(t)
+			testSecurityLabelProviderPreCheck(t, "dummy")
 		},
 		Providers:    testAccProviders,
 		CheckDestroy: testAccCheckPostgresqlSecurityLabelDestroy,
@@ -80,6 +84,43 @@ func TestAccPostgresqlSecurityLabel_Update(t *testing.T) {
 			},
 		},
 	})
+}
+
+// testSecurityLabelProviderPreCheck skips the test unless the label provider
+// is loaded on the server. The tests use the dummy_seclabel module, which the
+// image built from tests/build preloads but a stock postgres image doesn't
+// ship. The probe sets no label on the current role (IS NULL) in a transaction
+// that is rolled back, and fails with invalid_parameter_value (22023) when the
+// provider isn't loaded.
+func testSecurityLabelProviderPreCheck(t *testing.T, provider string) {
+	client := testAccProvider.Meta().(*Client)
+	db, err := client.Connect()
+	if err != nil {
+		t.Fatalf("could not connect to database: %v", err)
+	}
+
+	txn, err := db.Begin()
+	if err != nil {
+		t.Fatalf("could not start transaction: %v", err)
+	}
+	defer deferredRollback(txn)
+
+	var role string
+	if err := txn.QueryRow("SELECT current_user").Scan(&role); err != nil {
+		t.Fatalf("could not read current user: %v", err)
+	}
+
+	_, err = txn.Exec(fmt.Sprintf(
+		"SECURITY LABEL FOR %s ON ROLE %s IS NULL", pq.QuoteIdentifier(provider), pq.QuoteIdentifier(role),
+	))
+	var pqErr *pq.Error
+	switch {
+	case err == nil:
+	case errors.As(err, &pqErr) && pqErr.Code == "22023":
+		t.Skipf("Skip test: %s; run against an image built from tests/build", pqErr.Message)
+	default:
+		t.Fatalf("could not check security label provider %q: %v", provider, err)
+	}
 }
 
 func checkSecurityLabelExists(txn *sql.Tx, objectType string, objectName string, provider string) (bool, error) {
