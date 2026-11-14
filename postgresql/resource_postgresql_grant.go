@@ -545,11 +545,16 @@ LEFT JOIN LATERAL (
 
 // buildReadFunctionRolePrivilegesQuery builds the Read query for the
 // function/procedure/routine object types: role_exists and schema_exists on
-// every row, then one row per function name in the schema (overloads merged)
+// every row, then one row per routine name in the schema (overloads merged)
 // with the privileges granted to the role, or a single row with a NULL name.
-// Every function of the schema is returned: the resource's objects may carry
-// argument signatures, so they are still matched by name in Go.
-func buildReadFunctionRolePrivilegesQuery(role, schemaName string) (string, []interface{}) {
+//
+// With an explicit objects list only the listed names are returned
+// ("proname = ANY($3)"), so the planner can use the pg_proc name index instead
+// of exploding the ACL of every routine in the schema. The entries are bound
+// verbatim: rows are matched to objects by name, so an entry carrying an
+// argument signature (e.g. "f(integer)") selects no row, as it never matched
+// the name-based filter in readRolePrivileges either.
+func buildReadFunctionRolePrivilegesQuery(role, schemaName string, objects *schema.Set) (string, []interface{}) {
 	query := grantReadRoleCTE + grantReadSchemaCTE + `
 SELECT r.oid IS NOT NULL, EXISTS (SELECT 1 FROM n), o.proname, o.privileges
 FROM r
@@ -559,11 +564,23 @@ LEFT JOIN LATERAL (
     JOIN n ON n.oid = p.pronamespace
     LEFT JOIN LATERAL (
         SELECT privilege_type FROM aclexplode(p.proacl) WHERE grantee = r.oid
-    ) a ON true
+    ) a ON true`
+	args := []interface{}{role, schemaName}
+
+	if objects.Len() > 0 {
+		objectNames := make([]string, 0, objects.Len())
+		for _, o := range objects.List() {
+			objectNames = append(objectNames, o.(string))
+		}
+		query += `
+    WHERE p.proname = ANY($3)`
+		args = append(args, pq.Array(objectNames))
+	}
+	query += `
     GROUP BY p.proname
 ) o ON true
 `
-	return query, []interface{}{role, schemaName}
+	return query, args
 }
 
 // readRolePrivileges reads the privileges granted to the role with a single
@@ -587,7 +604,7 @@ func readRolePrivileges(db *DBConnection, d *schema.ResourceData) error {
 		return readColumnRolePrivileges(db, d)
 
 	case "function", "procedure", "routine":
-		query, args = buildReadFunctionRolePrivilegesQuery(role, d.Get("schema").(string))
+		query, args = buildReadFunctionRolePrivilegesQuery(role, d.Get("schema").(string), objects)
 
 	default:
 		query, args = buildReadTableRolePrivilegesQuery(
@@ -633,10 +650,8 @@ func readRolePrivileges(db *DBConnection, d *schema.ResourceData) error {
 			continue
 		}
 
-		// For the table/sequence path this set is already filtered in SQL
-		// above; the check is kept because the function/procedure/routine path
-		// still fetches every object in the schema (its object names may carry
-		// argument signatures, so it is filtered here rather than in SQL).
+		// The objects filter already runs in SQL for every object type; this
+		// check only keeps the Read independent of the exact query shape.
 		if objects.Len() > 0 && !objects.Contains(objName.String) {
 			continue
 		}
