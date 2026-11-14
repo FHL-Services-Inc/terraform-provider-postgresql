@@ -167,7 +167,7 @@ func TestAccPostgresqlSubscription_Basic(t *testing.T) {
 
 	conninfo := getConnInfo(t, dbNamePub)
 
-	subName := "subscription"
+	subName := testUniqueName("subscription")
 	testAccPostgresqlSubscriptionDatabaseConfig := fmt.Sprintf(`
 	resource "postgresql_publication" "test_pub" {
 		name     	= "test_publication"
@@ -268,7 +268,7 @@ func TestAccPostgresqlSubscription_Disappears(t *testing.T) {
 
 	conninfo := getConnInfo(t, dbNamePub)
 
-	subName := "subscription"
+	subName := testUniqueName("subscription")
 	config := fmt.Sprintf(`
 	resource "postgresql_publication" "test_pub" {
 		name     	= "test_publication"
@@ -324,14 +324,15 @@ func TestAccPostgresqlSubscription_CustomSlotName(t *testing.T) {
 
 	conninfo := getConnInfo(t, dbNamePub)
 
-	subName := "subscription"
+	subName := testUniqueName("subscription")
+	slotName := testUniqueName("custom_slot_name")
 	testAccPostgresqlSubscriptionDatabaseConfig := fmt.Sprintf(`
 	resource "postgresql_publication" "test_pub" {
 		name		= "test_publication"
 		database	= "%s"
 	}
 	resource "postgresql_replication_slot" "test_replication_slot" {
-		name		= "custom_slot_name"
+		name		= "%s"
 		plugin		= "pgoutput"
 		database	= "%s"
 	}
@@ -341,11 +342,11 @@ func TestAccPostgresqlSubscription_CustomSlotName(t *testing.T) {
 		conninfo 		= "%s"
 		publications	= [ postgresql_publication.test_pub.name ]
 		create_slot		= false
-		slot_name		= "custom_slot_name"
+		slot_name		= "%s"
 
 		depends_on 		= [ postgresql_replication_slot.test_replication_slot ]
 	}
-	`, dbNamePub, dbNamePub, subName, dbNameSub, conninfo)
+	`, dbNamePub, slotName, dbNamePub, subName, dbNameSub, conninfo, slotName)
 	resource.Test(t, resource.TestCase{
 		PreCheck: func() {
 			testAccPreCheck(t)
@@ -386,7 +387,7 @@ func TestAccPostgresqlSubscription_CustomSlotName(t *testing.T) {
 					resource.TestCheckResourceAttr(
 						"postgresql_subscription.test_sub",
 						"slot_name",
-						"custom_slot_name"),
+						slotName),
 				),
 			},
 		},

@@ -91,17 +91,18 @@ func TestAccPostgresqlPublication_Database(t *testing.T) {
 	defer teardown()
 
 	dbName, _ := getTestDBNames(dbSuffix)
+	ownerName := testUniqueName("test")
 
 	testAccPostgresqlPublicationDatabaseConfig := fmt.Sprintf(`
 	resource "postgresql_role" "test" {
-		name = "test"
+		name = "%s"
 	}
 	resource "postgresql_publication" "test" {
 		name     = "publication"
 		database = "%s"
 		owner = postgresql_role.test.name
 	}
-	`, dbName)
+	`, ownerName, dbName)
 
 	resource.Test(t, resource.TestCase{
 		PreCheck: func() {
@@ -119,7 +120,7 @@ func TestAccPostgresqlPublication_Database(t *testing.T) {
 					resource.TestCheckResourceAttr(
 						"postgresql_publication.test", "name", "publication"),
 					resource.TestCheckResourceAttr(
-						"postgresql_publication.test", "owner", "test"),
+						"postgresql_publication.test", "owner", ownerName),
 					resource.TestCheckResourceAttr(
 						"postgresql_publication.test", "database", dbName),
 				),
@@ -355,7 +356,7 @@ func TestAccPostgresqlPublication_UpdateOwner(t *testing.T) {
 	defer teardown()
 
 	dbName, _ := getTestDBNames(dbSuffix)
-	testOwner := "test_owner"
+	testOwner := testUniqueName("test_owner")
 
 	testAccPostgresqlPublicationBaseConfig := fmt.Sprintf(`
 	resource "postgresql_publication" "test" {
@@ -504,9 +505,10 @@ func TestAccPostgresqlPublication_Basic(t *testing.T) {
 	createTestTables(t, dbSuffix, testTables, "")
 
 	dbName, _ := getTestDBNames(dbSuffix)
+	ownerName := testUniqueName("test_owner")
 	testAccPostgresqlPublicationBasicConfig := fmt.Sprintf(`
 resource "postgresql_role" "test_owner" {
-	name = "test_owner"
+	name = "%s"
 	login = true
 }
 
@@ -516,7 +518,7 @@ resource "postgresql_publication" "test" {
 	owner = "${postgresql_role.test_owner.name}"
 	all_tables = true
 }
-`, dbName)
+`, ownerName, dbName)
 
 	resource.Test(t, resource.TestCase{
 		PreCheck: func() {
@@ -539,7 +541,7 @@ resource "postgresql_publication" "test" {
 					resource.TestCheckResourceAttr(
 						"postgresql_publication.test", pubAllTablesAttr, "true"),
 					resource.TestCheckResourceAttr(
-						"postgresql_publication.test", pubOwnerAttr, "test_owner"),
+						"postgresql_publication.test", pubOwnerAttr, ownerName),
 					resource.TestCheckResourceAttr(
 						"postgresql_publication.test", fmt.Sprintf("%s.#", pubTablesAttr), "3"),
 					resource.TestCheckResourceAttr(
@@ -573,9 +575,10 @@ func TestAccPostgresqlPublication_BasicWithoutTruncate(t *testing.T) {
 	createTestTables(t, dbSuffix, testTables, "")
 
 	dbName, _ := getTestDBNames(dbSuffix)
+	ownerName := testUniqueName("test_owner")
 	testAccPostgresqlPublicationBasicConfig := fmt.Sprintf(`
 resource "postgresql_role" "test_owner" {
-	name = "test_owner"
+	name = "%s"
 	login = true
 }
 
@@ -585,7 +588,7 @@ resource "postgresql_publication" "test" {
 	owner = "${postgresql_role.test_owner.name}"
 	all_tables = true
 }
-`, dbName)
+`, ownerName, dbName)
 
 	resource.Test(t, resource.TestCase{
 		PreCheck: func() {
@@ -608,7 +611,7 @@ resource "postgresql_publication" "test" {
 					resource.TestCheckResourceAttr(
 						"postgresql_publication.test", pubAllTablesAttr, "true"),
 					resource.TestCheckResourceAttr(
-						"postgresql_publication.test", pubOwnerAttr, "test_owner"),
+						"postgresql_publication.test", pubOwnerAttr, ownerName),
 					resource.TestCheckResourceAttr(
 						"postgresql_publication.test", fmt.Sprintf("%s.#", pubTablesAttr), "3"),
 					resource.TestCheckResourceAttr(

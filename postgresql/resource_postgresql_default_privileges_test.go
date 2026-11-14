@@ -133,12 +133,13 @@ func TestAccPostgresqlDefaultPrivileges_GrantOwner(t *testing.T) {
 
 	config := getTestConfig(t)
 	dbName, roleName := getTestDBNames(dbSuffix)
+	ownerName := testUniqueName("test_owner")
 
 	// We set PGUSER as owner as he will create the test table
 	var stateConfig = fmt.Sprintf(`
 
 resource postgresql_role "test_owner" {
-    name = "test_owner"
+    name = "%s"
 }
 
 // From PostgreSQL 15, schema public is not wild open anymore
@@ -158,7 +159,7 @@ resource "postgresql_default_privileges" "test_ro" {
 	object_type = "table"
 	privileges  = ["SELECT"]
 }
-	`, dbName, dbName, roleName)
+	`, ownerName, dbName, dbName, roleName)
 
 	resource.Test(t, resource.TestCase{
 		PreCheck: func() {
@@ -174,7 +175,7 @@ resource "postgresql_default_privileges" "test_ro" {
 						tables := []string{"public.test_table"}
 						// To test default privileges, we need to create a table
 						// after having apply the state.
-						dropFunc := createTestTables(t, dbSuffix, tables, "test_owner")
+						dropFunc := createTestTables(t, dbSuffix, tables, ownerName)
 						defer dropFunc()
 
 						return testCheckTablesPrivileges(t, dbName, roleName, tables, []string{"SELECT"})
@@ -184,7 +185,7 @@ resource "postgresql_default_privileges" "test_ro" {
 					resource.TestCheckResourceAttr("postgresql_default_privileges.test_ro", "privileges.0", "SELECT"),
 
 					// check if connected user does not have test_owner granted anymore.
-					checkUserMembership(t, config.Username, "test_owner", false),
+					checkUserMembership(t, config.Username, ownerName, false),
 				),
 			},
 		},

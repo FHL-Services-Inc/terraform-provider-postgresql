@@ -26,9 +26,9 @@ func idleProviderFactories() map[string]func() (*schema.Provider, error) {
 // with "database is being accessed by other users" unless the pool to the old
 // name is evicted first.
 func TestAccPostgresqlDatabase_RenameWithIdleConnections(t *testing.T) {
-	const (
-		oldName = "tf_tests_idle_rename_old"
-		newName = "tf_tests_idle_rename_new"
+	var (
+		oldName = testUniqueName("tf_tests_idle_rename_old")
+		newName = testUniqueName("tf_tests_idle_rename_new")
 	)
 
 	providerBlock := `
@@ -84,9 +84,9 @@ resource "postgresql_schema" "schema" {
 // CREATE DATABASE ... TEMPLATE fails with "source database is being accessed
 // by other users" unless the template's pool is evicted first.
 func TestAccPostgresqlDatabase_TemplateWithIdleConnections(t *testing.T) {
-	const (
-		srcName = "tf_tests_idle_tpl_src"
-		dstName = "tf_tests_idle_tpl_dst"
+	var (
+		srcName = testUniqueName("tf_tests_idle_tpl_src")
+		dstName = testUniqueName("tf_tests_idle_tpl_dst")
 	)
 
 	src := fmt.Sprintf(`
