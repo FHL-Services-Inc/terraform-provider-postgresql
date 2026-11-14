@@ -91,13 +91,11 @@ func resourcePostgreSQLGrantRoleCreate(db *DBConnection, d *schema.ResourceData)
 		return err
 	}
 
-	// Revoke the granted roles before granting them again.
-	if err = revokeRole(txn, d); err != nil {
-		return err
-	}
-
-	if err = grantRole(txn, d); err != nil {
-		return err
+	// Revoke the granted roles before granting them again, in one round-trip:
+	// both statements are plain strings with quoted identifiers (no bind
+	// parameters), which lib/pq sends together over the simple query protocol.
+	if _, err = txn.Exec(createRevokeRoleQuery(d) + ";\n" + createGrantRoleQuery(d)); err != nil {
+		return fmt.Errorf("could not execute revoke/grant query: %w", err)
 	}
 
 	if err = txn.Commit(); err != nil {
@@ -204,14 +202,6 @@ func createRevokeRoleQuery(d *schema.ResourceData) string {
 		pq.QuoteIdentifier(grantRole),
 		pq.QuoteIdentifier(role),
 	)
-}
-
-func grantRole(txn *sql.Tx, d *schema.ResourceData) error {
-	query := createGrantRoleQuery(d)
-	if _, err := txn.Exec(query); err != nil {
-		return fmt.Errorf("could not execute grant query: %w", err)
-	}
-	return nil
 }
 
 func revokeRole(txn *sql.Tx, d *schema.ResourceData) error {

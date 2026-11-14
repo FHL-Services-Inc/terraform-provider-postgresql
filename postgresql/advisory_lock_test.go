@@ -230,6 +230,96 @@ resource "postgresql_grant" "test" {
 	})
 }
 
+// holdsAdvisoryLockOnRole reports whether the transaction's backend holds the
+// transaction-level advisory lock pgLockRole takes on the role OID.
+func holdsAdvisoryLockOnRole(t *testing.T, txn *sql.Tx, role string) bool {
+	t.Helper()
+	var n int
+	if err := txn.QueryRow(`
+SELECT count(*) FROM pg_locks
+WHERE locktype = 'advisory' AND pid = pg_backend_pid() AND granted
+  AND objsubid = 1 AND objid = (SELECT oid FROM pg_roles WHERE rolname = $1)`, role,
+	).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	return n > 0
+}
+
+func TestAccAdvisoryLockTimeoutRestoresTransactionValue(t *testing.T) {
+	skipIfNotAcc(t)
+
+	dbSuffix, teardown := setupTestDatabase(t, false, true)
+	defer teardown()
+	_, roleName := getTestDBNames(dbSuffix)
+
+	db := openSingleConnLockDB(t, 500)
+
+	txn, err := db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer deferredRollback(txn)
+
+	// A value set earlier in the same transaction differs from the session's
+	// default, so restoring "to DEFAULT" would not bring it back.
+	if _, err := txn.Exec("SET LOCAL lock_timeout = '7s'"); err != nil {
+		t.Fatal(err)
+	}
+	if err := pgLockRole(db, txn, roleName); err != nil {
+		t.Fatalf("pgLockRole on an uncontended role failed: %v", err)
+	}
+
+	var lockTimeout string
+	if err := txn.QueryRow("SELECT current_setting('lock_timeout')").Scan(&lockTimeout); err != nil {
+		t.Fatal(err)
+	}
+	if lockTimeout != "7s" {
+		t.Errorf("lock_timeout after acquiring the lock = %q, want the transaction's previous value 7s", lockTimeout)
+	}
+	if !holdsAdvisoryLockOnRole(t, txn, roleName) {
+		t.Errorf("advisory lock on role %s is not held after pgLockRole", roleName)
+	}
+}
+
+func TestAccAdvisoryLockQuotedRoleName(t *testing.T) {
+	skipIfNotAcc(t)
+
+	admin := openSingleConnLockDB(t, 0)
+	role := `tf_tests_lock_o'q\b`
+	member := `tf_tests_lock_member`
+	for _, r := range []string{role, member} {
+		if _, err := admin.Exec("CREATE ROLE " + pq.QuoteIdentifier(r)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Cleanup(func() {
+		for _, r := range []string{member, role} {
+			_, _ = admin.Exec("DROP ROLE IF EXISTS " + pq.QuoteIdentifier(r))
+		}
+	})
+	if _, err := admin.Exec("GRANT " + pq.QuoteIdentifier(role) + " TO " + pq.QuoteIdentifier(member)); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, timeoutMs := range []int{0, 500} {
+		db := openSingleConnLockDB(t, timeoutMs)
+		txn, err := db.Begin()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := pgLockRole(db, txn, role); err != nil {
+			t.Fatalf("timeout %d: pgLockRole(%q) failed: %v", timeoutMs, role, err)
+		}
+		if !holdsAdvisoryLockOnRole(t, txn, role) {
+			t.Errorf("timeout %d: advisory lock on role %q is not held", timeoutMs, role)
+		}
+		if !holdsAdvisoryLockOnRole(t, txn, member) {
+			t.Errorf("timeout %d: advisory lock on member %q is not held", timeoutMs, member)
+		}
+		deferredRollback(txn)
+	}
+}
+
 // lockRoleConn (session-level lock used by postgresql_database with an owner)
 // honours advisory_lock_timeout too, and restores the session lock_timeout
 // after an uncontended acquisition.

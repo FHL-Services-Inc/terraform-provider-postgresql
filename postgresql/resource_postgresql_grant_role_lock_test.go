@@ -123,9 +123,9 @@ func TestGrantRoleLocksMember(t *testing.T) {
 
 	lockPrefix := []string{
 		"BEGIN",
-		"SET LOCAL statement_timeout = 0",
-		"SELECT pg_advisory_xact_lock(oid::bigint) FROM pg_roles WHERE rolname = $1 [member_role]",
-		"SELECT pg_advisory_xact_lock(member::bigint) FROM pg_auth_members JOIN pg_roles ON roleid = pg_roles.oid WHERE rolname = $1 ORDER BY member [member_role]",
+		"SET LOCAL statement_timeout = 0; " +
+			"SELECT pg_advisory_xact_lock(oid::bigint) FROM pg_roles WHERE rolname = 'member_role'; " +
+			"SELECT pg_advisory_xact_lock(member::bigint) FROM pg_auth_members JOIN pg_roles ON roleid = pg_roles.oid WHERE rolname = 'member_role' ORDER BY member",
 	}
 
 	cases := []struct {
@@ -137,8 +137,7 @@ func TestGrantRoleLocksMember(t *testing.T) {
 			name: "create",
 			fn:   resourcePostgreSQLGrantRoleCreate,
 			want: append(append([]string{}, lockPrefix...),
-				`REVOKE "group_role" FROM "member_role"`,
-				`GRANT "group_role" TO "member_role"`,
+				`REVOKE "group_role" FROM "member_role"; GRANT "group_role" TO "member_role"`,
 				"COMMIT",
 			),
 		},
