@@ -2,6 +2,7 @@ package postgresql
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"strconv"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/resource"
+	"github.com/lib/pq"
 )
 
 const (
@@ -95,6 +97,50 @@ func dbExecute(t *testing.T, dsn, query string, args ...any) {
 	}
 }
 
+// dropTestDatabase drops dbName (if it exists) out-of-band, i.e. not through
+// the provider. With max_idle_connections > 0 the provider under test may still
+// hold idle connections to it, which a plain DROP DATABASE rejects with "being
+// accessed by other users". Those sessions are terminated first, and the drop
+// uses WITH (FORCE) on PostgreSQL 13+. Older servers retry while a backend
+// sneaks in between the terminate and the drop.
+func dropTestDatabase(t *testing.T, config Config, dbName string) {
+	t.Helper()
+
+	db, err := sql.Open("postgres", config.connStr("postgres"))
+	if err != nil {
+		t.Fatalf("could not create connection pool: %v", err)
+	}
+	defer closeDB(t, db)
+
+	var versionNum int
+	if err := db.QueryRow("SELECT current_setting('server_version_num')::int").Scan(&versionNum); err != nil {
+		t.Fatalf("could not read server version: %v", err)
+	}
+	drop := fmt.Sprintf("DROP DATABASE IF EXISTS %s", pq.QuoteIdentifier(dbName))
+	if versionNum >= 130000 {
+		drop += " WITH (FORCE)"
+	}
+
+	const attempts = 5
+	for i := 1; ; i++ {
+		if _, err := db.Exec(
+			"SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = $1 AND pid <> pg_backend_pid()",
+			dbName,
+		); err != nil {
+			t.Fatalf("could not terminate connections to database %s: %v", dbName, err)
+		}
+		_, err := db.Exec(drop)
+		if err == nil {
+			return
+		}
+		var pqErr *pq.Error
+		if i == attempts || !errors.As(err, &pqErr) || pqErr.Code != "55006" { // object_in_use
+			t.Fatalf("could not drop database %s: %v", dbName, err)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
 func getTestDBNames(dbSuffix string) (dbName string, roleName string) {
 	dbName = fmt.Sprintf("%s_%s", dbNamePrefix, dbSuffix)
 	roleName = fmt.Sprintf("%s_%s", roleNamePrefix, dbSuffix)
@@ -128,7 +174,7 @@ func setupTestDatabase(t *testing.T, createDB, createRole bool) (string, func())
 	}
 
 	return suffix, func() {
-		dbExecute(t, config.connStr("postgres"), fmt.Sprintf("DROP DATABASE IF EXISTS %s", dbName))
+		dropTestDatabase(t, config, dbName)
 		dbExecute(t, config.connStr("postgres"), fmt.Sprintf("DROP ROLE IF EXISTS %s", roleName))
 	}
 }
