@@ -229,6 +229,14 @@ The following arguments are supported:
   queue on these locks (e.g. every `postgresql_database` with an `owner` locks
   the provider's own role while it is created), so pick a value well above how
   long such operations take rather than a few hundred milliseconds.
+* `binary_parameters` - (Optional) If set to `true`, adds `binary_parameters=yes`
+  to the connection string. The driver then sends each statement that has bind
+  parameters (almost every query the provider runs) in a single round-trip
+  instead of two (a separate prepare step followed by the execution). This
+  mostly helps when the database is far from where Terraform runs. Only
+  `[]byte` parameters are sent in binary format, which the provider does not
+  use, and results are still read as text. Can also be set with the
+  `PGBINARYPARAMETERS` environment variable. The default is `false`.
 * `expected_version` - (Optional) Specify a hint to Terraform regarding the
   expected version that the provider will be talking with.  This is a required
   hint in order for Terraform to talk with an ancient version of PostgreSQL.

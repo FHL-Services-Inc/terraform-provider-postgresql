@@ -236,6 +236,12 @@ func Provider() *schema.Provider {
 				Description:  "Maximum lifetime of a connection, in seconds. Zero means unlimited.",
 				ValidateFunc: validation.IntAtLeast(0),
 			},
+			"binary_parameters": {
+				Type:        schema.TypeBool,
+				Optional:    true,
+				DefaultFunc: schema.EnvDefaultFunc("PGBINARYPARAMETERS", false),
+				Description: "Send statements with bind parameters in a single round-trip (lib/pq binary_parameters=yes) instead of a separate prepare round-trip.",
+			},
 			"expected_version": {
 				Type:         schema.TypeString,
 				Optional:     true,
@@ -478,6 +484,7 @@ func providerConfigure(d *schema.ResourceData) (any, error) {
 		GCPIAMImpersonateServiceAccount: d.Get("gcp_iam_impersonate_service_account").(string),
 		AdvisoryLockTimeout:             d.Get("advisory_lock_timeout").(int),
 		AuthTokens:                      authTokens,
+		BinaryParameters:                d.Get("binary_parameters").(bool),
 	}
 
 	if value, ok := d.GetOk("clientcert"); ok {
