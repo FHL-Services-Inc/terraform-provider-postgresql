@@ -22,6 +22,7 @@ import (
 	"gocloud.dev/postgres"
 	_ "gocloud.dev/postgres/awspostgres"
 	"gocloud.dev/postgres/gcppostgres"
+	"golang.org/x/sync/singleflight"
 	"google.golang.org/api/impersonate"
 )
 
@@ -69,6 +70,9 @@ const defaultConnMaxIdleTime = 30 * time.Second
 var (
 	dbRegistryLock sync.Mutex
 	dbRegistry     map[string]*DBConnection = make(map[string]*DBConnection, 1)
+
+	// connectGroup de-duplicates concurrent Connect() calls per DSN.
+	connectGroup singleflight.Group
 
 	// Mapping of feature flags to versions
 	featureSupported = map[featureName]semver.Range{
@@ -309,19 +313,65 @@ func (c *Config) getDatabaseUsername() string {
 // Callers must return their database resources. Use of QueryRow() or Exec() is encouraged.
 // Query() must have their rows.Close()'ed.
 func (c *Client) Connect() (*DBConnection, error) {
-	ctx := context.Background()
+	return c.connect(context.Background(), c.config.openPostgres)
+}
+
+// connect implements Connect. openPostgres opens the pool for the "postgres"
+// scheme (overridable by tests).
+func (c *Client) connect(ctx context.Context, openPostgres func(dsn string) (*sql.DB, error)) (*DBConnection, error) {
 	dsn := c.config.connStr(c.databaseName)
 
-	dbRegistryLock.Lock()
-	conn, found := dbRegistry[dsn]
-	dbRegistryLock.Unlock()
-	if found {
+	if conn, found := lookupDBConnection(dsn); found {
 		return conn, nil
 	}
 
-	// Dialing and retrying happen outside the lock so a slow/flaky connection
-	// to one DSN doesn't stall Connect() calls for other DSNs.
-	db, err := c.connectWithRetry(ctx, c.config.openPostgres, dsn)
+	// Concurrent first calls for the same DSN share one dial + ping +
+	// fingerprint: without this every caller that misses the registry opens
+	// its own handle and all but one close it again, which with -parallelism=N
+	// costs N-1 extra connections per pool and a startup spike of N
+	// connections that no pool setting caps. Errors are not cached: the next
+	// call after a failed one dials again.
+	v, err, _ := connectGroup.Do(dsn, func() (any, error) {
+		// A previous flight may have published the connection between the
+		// lookup above and this call.
+		if conn, found := lookupDBConnection(dsn); found {
+			return conn, nil
+		}
+
+		// Dialing and retrying happen outside dbRegistryLock so a slow/flaky
+		// connection to one DSN doesn't stall Connect() calls for other DSNs.
+		conn, err := c.newDBConnection(ctx, openPostgres, dsn)
+		if err != nil {
+			return nil, err
+		}
+
+		dbRegistryLock.Lock()
+		defer dbRegistryLock.Unlock()
+		if existing, found := dbRegistry[dsn]; found {
+			// Defensive: only flights publish, and there is one flight per DSN.
+			_ = conn.Close()
+			return existing, nil
+		}
+		dbRegistry[dsn] = conn
+		return conn, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return v.(*DBConnection), nil
+}
+
+func lookupDBConnection(dsn string) (*DBConnection, bool) {
+	dbRegistryLock.Lock()
+	defer dbRegistryLock.Unlock()
+	conn, found := dbRegistry[dsn]
+	return conn, found
+}
+
+// newDBConnection opens and checks a new pool for dsn and fingerprints the
+// server version if no expected_version is set.
+func (c *Client) newDBConnection(ctx context.Context, openPostgres func(dsn string) (*sql.DB, error), dsn string) (*DBConnection, error) {
+	db, err := c.connectWithRetry(ctx, openPostgres, dsn)
 	if err != nil {
 		return nil, err
 	}
@@ -339,22 +389,11 @@ func (c *Client) Connect() (*DBConnection, error) {
 		}
 	}
 
-	conn = &DBConnection{
+	return &DBConnection{
 		db,
 		c,
 		*version,
-	}
-
-	dbRegistryLock.Lock()
-	defer dbRegistryLock.Unlock()
-	if existing, found := dbRegistry[dsn]; found {
-		// Another goroutine won the race and already published a connection
-		// for this DSN; keep that one and discard ours.
-		_ = db.Close()
-		return existing, nil
-	}
-	dbRegistry[dsn] = conn
-	return conn, nil
+	}, nil
 }
 
 // configurePool applies the provider's pool settings to a freshly opened

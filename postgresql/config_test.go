@@ -8,8 +8,10 @@ import (
 	"reflect"
 	"sort"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/blang/semver"
 )
@@ -258,4 +260,124 @@ func TestConfigEvictDBConnection(t *testing.T) {
 // openDriver opens pools with the registered database/sql driver name.
 func openDriver(name string) func(string) (*sql.DB, error) {
 	return func(dsn string) (*sql.DB, error) { return sql.Open(name, dsn) }
+}
+
+// gatedDialDriver is a fake driver that counts physical dials and blocks every
+// Ping until release is closed, so concurrent Connect() calls overlap.
+type gatedDialDriver struct {
+	dials   atomic.Int32
+	release chan struct{}
+}
+
+func (d *gatedDialDriver) Open(name string) (driver.Conn, error) {
+	d.dials.Add(1)
+	return &gatedDialConn{driver: d}, nil
+}
+
+type gatedDialConn struct {
+	driver *gatedDialDriver
+}
+
+func (c *gatedDialConn) Prepare(query string) (driver.Stmt, error) { return nil, driver.ErrSkip }
+func (c *gatedDialConn) Close() error                              { return nil }
+func (c *gatedDialConn) Begin() (driver.Tx, error)                 { return nil, driver.ErrSkip }
+
+func (c *gatedDialConn) Ping(ctx context.Context) error {
+	<-c.driver.release
+	return nil
+}
+
+func TestConnectConcurrentCallsDialOnce(t *testing.T) {
+	drv := &gatedDialDriver{release: make(chan struct{})}
+	sql.Register("connect-singleflight-test", drv)
+
+	config := Config{
+		Scheme:                        "postgres",
+		Host:                          "singleflight-test",
+		Port:                          5432,
+		SSLMode:                       "disable",
+		MaxConns:                      20,
+		MaxIdleConns:                  10,
+		ConnectionRetryTimeoutSeconds: 5,
+		// Not the default version, so Connect() skips the fingerprint query
+		// the fake driver can't answer.
+		ExpectedVersion: semver.MustParse("16.0.0"),
+	}
+	dsn := config.connStr("db")
+	t.Cleanup(func() {
+		dbRegistryLock.Lock()
+		conn := dbRegistry[dsn]
+		delete(dbRegistry, dsn)
+		dbRegistryLock.Unlock()
+		if conn != nil {
+			_ = conn.Close()
+		}
+	})
+
+	const callers = 10
+	conns := make([]*DBConnection, callers)
+	errs := make([]error, callers)
+	var wg sync.WaitGroup
+	for i := range callers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			conns[i], errs[i] = config.NewClient("db").connect(context.Background(), openDriver("connect-singleflight-test"))
+		}()
+	}
+
+	// Give every caller time to reach the dial before the first Ping returns.
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for drv.dials.Load() < callers && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	close(drv.release)
+	wg.Wait()
+
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("connect() #%d returned unexpected error: %v", i, err)
+		}
+		if conns[i] != conns[0] {
+			t.Errorf("connect() #%d returned a different *DBConnection than #0", i)
+		}
+	}
+	if got := drv.dials.Load(); got != 1 {
+		t.Errorf("expected %d concurrent connect() calls for one DSN to dial once, got %d dials", callers, got)
+	}
+}
+
+func TestConnectDoesNotCacheErrors(t *testing.T) {
+	drv := &flakyPingDriver{failuresBeforeSuccess: 1}
+	sql.Register("connect-no-error-cache-test", drv)
+
+	config := Config{
+		Scheme:                        "postgres",
+		Host:                          "no-error-cache-test",
+		Port:                          5432,
+		SSLMode:                       "disable",
+		MaxConns:                      20,
+		ConnectionRetryTimeoutSeconds: 5,
+		ExpectedVersion:               semver.MustParse("16.0.0"),
+	}
+	dsn := config.connStr("db")
+	t.Cleanup(func() {
+		dbRegistryLock.Lock()
+		conn := dbRegistry[dsn]
+		delete(dbRegistry, dsn)
+		dbRegistryLock.Unlock()
+		if conn != nil {
+			_ = conn.Close()
+		}
+	})
+
+	if _, err := config.NewClient("db").connect(context.Background(), openDriver("connect-no-error-cache-test")); err == nil {
+		t.Fatal("first connect() expected an error, got nil")
+	}
+	if _, err := config.NewClient("db").connect(context.Background(), openDriver("connect-no-error-cache-test")); err != nil {
+		t.Fatalf("second connect() returned unexpected error, the first error was cached: %v", err)
+	}
+	if got := drv.attempts.Load(); got != 2 {
+		t.Errorf("expected 2 connection attempts, got %d", got)
+	}
 }
