@@ -852,7 +852,17 @@ func getRolesToGrant(txn *sql.Tx, d *schema.ResourceData) ([]string, error) {
 	owners := []string{}
 	objectType := d.Get("object_type")
 
-	if objectType == "database" || objectType == "foreign_data_wrapper" || objectType == "foreign_server" {
+	if objectType == "database" {
+		// GRANT/REVOKE ON DATABASE by a role that is neither the owner nor a
+		// member of it is a no-op with only a WARNING, so take the owner too.
+		dbOwner, err := getDatabaseOwner(txn, d.Get("database").(string))
+		if err != nil {
+			return nil, err
+		}
+		return []string{dbOwner}, nil
+	}
+
+	if objectType == "foreign_data_wrapper" || objectType == "foreign_server" {
 		return owners, nil
 	}
 
