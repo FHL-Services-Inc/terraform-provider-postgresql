@@ -350,15 +350,14 @@ func quoteIdentifyIdent(ident string) string {
 	// https://en.wikipedia.org/wiki/Function_overloading
 	// https://stackoverflow.com/a/48640797
 
-	s := strings.Split(ident, "(")
-
-	functionArgTypes := ""
-
-	if len(s) > 1 {
-		functionArgTypes = "(" + s[1]
+	// Split on the first "(" only: the argument list may itself contain
+	// parentheses (e.g. "f(numeric(10,2))").
+	name, args, hasArgs := strings.Cut(ident, "(")
+	if !hasArgs {
+		return pq.QuoteIdentifier(name)
 	}
 
-	return fmt.Sprintf("%s%s", pq.QuoteIdentifier(s[0]), functionArgTypes)
+	return pq.QuoteIdentifier(name) + "(" + args
 }
 
 func setToPgIdentList(schema string, idents *schema.Set) string {
