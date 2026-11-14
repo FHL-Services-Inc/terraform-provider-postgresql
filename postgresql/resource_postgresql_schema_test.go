@@ -7,7 +7,6 @@ import (
 
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/resource"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/terraform"
-	"github.com/lib/pq"
 )
 
 func TestAccPostgresqlSchema_Basic(t *testing.T) {
@@ -643,16 +642,10 @@ resource "postgresql_schema" "test" {
 	})
 }
 
-// testAccDropDatabase drops a database out-of-band. It terminates any lingering
-// backends first so the drop succeeds on all supported server versions, which
-// predate `DROP DATABASE ... WITH (FORCE)`.
+// testAccDropDatabase drops a database out-of-band (see dropTestDatabase).
 func testAccDropDatabase(t *testing.T, dbName string) resource.TestCheckFunc {
 	return func(*terraform.State) error {
-		config := getTestConfig(t)
-		dbExecute(t, config.connStr("postgres"),
-			"SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = $1 AND pid <> pg_backend_pid()",
-			dbName)
-		dbExecute(t, config.connStr("postgres"), fmt.Sprintf("DROP DATABASE %s", pq.QuoteIdentifier(dbName)))
+		dropTestDatabase(t, getTestConfig(t), dbName)
 		return nil
 	}
 }
