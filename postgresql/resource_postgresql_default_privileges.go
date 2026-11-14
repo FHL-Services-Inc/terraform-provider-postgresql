@@ -15,10 +15,10 @@ import (
 
 func resourcePostgreSQLDefaultPrivileges() *schema.Resource {
 	return &schema.Resource{
-		Create: PGResourceFunc(resourcePostgreSQLDefaultPrivilegesCreate),
-		Update: PGResourceFunc(resourcePostgreSQLDefaultPrivilegesCreate),
+		Create: PGResourceFunc(retryOnConcurrentCatalogUpdate(resourcePostgreSQLDefaultPrivilegesCreate)),
+		Update: PGResourceFunc(retryOnConcurrentCatalogUpdate(resourcePostgreSQLDefaultPrivilegesCreate)),
 		Read:   PGResourceFunc(resourcePostgreSQLDefaultPrivilegesRead),
-		Delete: PGResourceFunc(resourcePostgreSQLDefaultPrivilegesDelete),
+		Delete: PGResourceFunc(retryOnConcurrentCatalogUpdate(resourcePostgreSQLDefaultPrivilegesDelete)),
 		Importer: &schema.ResourceImporter{
 			StateContext: resourcePostgreSQLDefaultPrivilegesImport,
 		},
@@ -139,7 +139,7 @@ func resourcePostgreSQLDefaultPrivilegesCreate(db *DBConnection, d *schema.Resou
 	}
 	defer deferredRollback(txn)
 
-	if err := pgLockRole(txn, owner); err != nil {
+	if err := lockDefaultPrivileges(txn, d); err != nil {
 		return err
 	}
 
@@ -188,7 +188,7 @@ func resourcePostgreSQLDefaultPrivilegesDelete(db *DBConnection, d *schema.Resou
 	}
 	defer deferredRollback(txn)
 
-	if err := pgLockRole(txn, owner); err != nil {
+	if err := lockDefaultPrivileges(txn, d); err != nil {
 		return err
 	}
 
@@ -204,6 +204,14 @@ func resourcePostgreSQLDefaultPrivilegesDelete(db *DBConnection, d *schema.Resou
 	}
 
 	return nil
+}
+
+// lockDefaultPrivileges locks the owner role (not its members: default
+// privileges change no membership), then the pg_default_acl row of the
+// resource (see grant_locks.go).
+func lockDefaultPrivileges(txn *sql.Tx, d *schema.ResourceData) error {
+	return pgLockGranteeAndObjects(txn, d.Get("owner").(string), "",
+		[]advisoryLockKey{defaultPrivilegesLockKey(d)})
 }
 
 // buildReadRoleDefaultPrivilegesQuery builds the default privileges Read query.

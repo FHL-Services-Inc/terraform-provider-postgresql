@@ -59,8 +59,8 @@ func (k *keyedMutex) lock(keys ...string) (unlock func()) {
 // membership changes withRolesGranted makes, per role name.
 //
 // pg_auth_members is a cluster-wide catalog, while the advisory locks taken
-// before withRolesGranted (pgLockRole, pgLockDatabase) only exist in the
-// database of the resource. Two resources in different databases with the
+// before withRolesGranted (pgLockRole, pgLockGranteeAndObjects) only exist in
+// the database of the resource. Two resources in different databases with the
 // same owner therefore both revoke, grant and restore the same membership rows
 // at the same time; when one of them revokes a row the other one deleted and
 // re-created in a transaction that is not committed yet, PostgreSQL (up to 15)
@@ -68,9 +68,9 @@ func (k *keyedMutex) lock(keys ...string) (unlock func()) {
 //
 // Invariants:
 //   - advisory locks are taken before these mutexes, never while holding one:
-//     every caller takes its pgLockRole/pgLockDatabase before withRolesGranted,
-//     and nothing between withRolesGranted and the end of its transaction takes
-//     an advisory lock or calls withRolesGranted again;
+//     every caller takes its pgLockRole/pgLockGranteeAndObjects before
+//     withRolesGranted, and nothing between withRolesGranted and the end of
+//     its transaction takes an advisory lock or calls withRolesGranted again;
 //   - the mutexes are held from before the first membership change until the
 //     transaction that made the changes commits or rolls back (commitTxn,
 //     deferredRollback), so anything waiting on those rows in PostgreSQL is a

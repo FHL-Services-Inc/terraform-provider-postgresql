@@ -39,10 +39,10 @@ type ResourceSchemeGetter func(string) any
 
 func resourcePostgreSQLGrant() *schema.Resource {
 	return &schema.Resource{
-		Create: PGResourceFunc(resourcePostgreSQLGrantCreate),
-		Update: PGResourceFunc(resourcePostgreSQLGrantUpdate),
+		Create: PGResourceFunc(retryOnConcurrentCatalogUpdate(resourcePostgreSQLGrantCreate)),
+		Update: PGResourceFunc(retryOnConcurrentCatalogUpdate(resourcePostgreSQLGrantUpdate)),
 		Read:   PGResourceFunc(resourcePostgreSQLGrantRead),
-		Delete: PGResourceFunc(resourcePostgreSQLGrantDelete),
+		Delete: PGResourceFunc(retryOnConcurrentCatalogUpdate(resourcePostgreSQLGrantDelete)),
 		Importer: &schema.ResourceImporter{
 			StateContext: resourcePostgreSQLGrantImport,
 		},
@@ -163,15 +163,8 @@ func resourcePostgreSQLGrantCreateOrUpdate(db *DBConnection, d *schema.ResourceD
 	}
 	defer deferredRollback(txn)
 
-	role := d.Get("role").(string)
-	if err := pgLockRole(txn, role); err != nil {
+	if err := lockGrantTargets(txn, d); err != nil {
 		return err
-	}
-
-	if objectType == "database" {
-		if err := pgLockDatabase(txn, database); err != nil {
-			return err
-		}
 	}
 
 	owners, err := getRolesToGrant(txn, d)
@@ -214,16 +207,8 @@ func resourcePostgreSQLGrantDelete(db *DBConnection, d *schema.ResourceData) err
 	}
 	defer deferredRollback(txn)
 
-	role := d.Get("role").(string)
-	if err := pgLockRole(txn, role); err != nil {
+	if err := lockGrantTargets(txn, d); err != nil {
 		return err
-	}
-
-	objectType := d.Get("object_type").(string)
-	if objectType == "database" {
-		if err := pgLockDatabase(txn, database); err != nil {
-			return err
-		}
 	}
 
 	owners, err := getRolesToGrant(txn, d)
@@ -242,6 +227,18 @@ func resourcePostgreSQLGrantDelete(db *DBConnection, d *schema.ResourceData) err
 	}
 
 	return nil
+}
+
+// lockGrantTargets takes the advisory locks of a grant write: the grantee
+// role (not its members: a grant changes no membership) and, for a database
+// grant, the database, in one statement ordered by OID; then the objects whose
+// ACL the grant changes (see grant_locks.go for the keys and the lock order).
+func lockGrantTargets(txn *sql.Tx, d *schema.ResourceData) error {
+	var database string
+	if d.Get("object_type").(string) == "database" {
+		database = d.Get("database").(string)
+	}
+	return pgLockGranteeAndObjects(txn, d.Get("role").(string), database, grantLockKeys(d.Get))
 }
 
 // grantReadRoleCTE resolves the grantee inside the Read query instead of with a
