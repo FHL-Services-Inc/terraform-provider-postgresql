@@ -23,13 +23,15 @@ func TestRoleRolesStatements(t *testing.T) {
 	cases := []struct {
 		name     string
 		old, new *schema.Set
+		current  []string
 		want     []string
 	}{
 		{
-			name: "add one, remove one, keep one",
-			old:  set("keep", "drop"),
-			new:  set("keep", "add"),
-			want: []string{`REVOKE "drop" FROM "member"`, `GRANT "add" TO "member"`},
+			name:    "add one, remove one, keep one",
+			old:     set("keep", "drop"),
+			new:     set("keep", "add"),
+			current: []string{"keep", "drop"},
+			want:    []string{`REVOKE "drop" FROM "member"`, `GRANT "add" TO "member"`},
 		},
 		{
 			name: "unchanged",
@@ -38,10 +40,20 @@ func TestRoleRolesStatements(t *testing.T) {
 			want: nil,
 		},
 		{
-			name: "remove all",
-			old:  set("b", "a"),
-			new:  set(),
-			want: []string{`REVOKE "a" FROM "member"`, `REVOKE "b" FROM "member"`},
+			name:    "remove all",
+			old:     set("b", "a"),
+			new:     set(),
+			current: []string{"a", "b"},
+			want:    []string{`REVOKE "a" FROM "member"`, `REVOKE "b" FROM "member"`},
+		},
+		{
+			// "gone" was dropped (e.g. its postgresql_role destroyed in the
+			// same apply), which removed the membership with it
+			name:    "removed role no longer a membership",
+			old:     set("gone", "kept"),
+			new:     set("kept"),
+			current: []string{"kept"},
+			want:    nil,
 		},
 		{
 			name: "from empty, sorted",
@@ -53,7 +65,11 @@ func TestRoleRolesStatements(t *testing.T) {
 
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			got := roleRolesStatements("member", c.old, c.new)
+			current := map[string]bool{}
+			for _, r := range c.current {
+				current[r] = true
+			}
+			got := roleRolesStatements("member", c.old, c.new, current)
 			if !reflect.DeepEqual(got, c.want) {
 				t.Fatalf("got %q, want %q", got, c.want)
 			}
@@ -231,6 +247,64 @@ resource "postgresql_grant_role" "d" {
 				// remove the grant_role before the roles are destroyed
 				Config:             tfConfig("postgresql_role.b.name", false),
 				ExpectNonEmptyPlan: false,
+			},
+		},
+	})
+}
+
+// TestAccPostgresqlRole_RolesRemoveDroppedRole removes a role from roles and
+// destroys that role in the same apply. DROP ROLE takes the membership with
+// it, so the update must not try to REVOKE a role that no longer exists.
+func TestAccPostgresqlRole_RolesRemoveDroppedRole(t *testing.T) {
+	skipIfNotAcc(t)
+
+	dbSuffix, teardown := setupTestDatabase(t, false, false)
+	defer teardown()
+	_, prefix := getTestDBNames(dbSuffix)
+
+	config := getTestConfig(t)
+	dsn := config.connStr("postgres")
+	member := prefix + "_member"
+
+	withGone := fmt.Sprintf(`
+resource "postgresql_role" "kept" {
+  name = "%[1]s_kept"
+}
+resource "postgresql_role" "gone" {
+  name = "%[1]s_gone"
+}
+resource "postgresql_role" "member" {
+  name  = "%[1]s_member"
+  roles = [postgresql_role.kept.name, postgresql_role.gone.name]
+}
+`, prefix)
+	withoutGone := fmt.Sprintf(`
+resource "postgresql_role" "kept" {
+  name = "%[1]s_kept"
+}
+resource "postgresql_role" "member" {
+  name  = "%[1]s_member"
+  roles = [postgresql_role.kept.name]
+}
+`, prefix)
+
+	resource.Test(t, resource.TestCase{
+		PreCheck: func() {
+			testAccPreCheck(t)
+			testCheckCompatibleVersion(t, featurePrivileges)
+		},
+		Providers: testAccProviders,
+		Steps: []resource.TestStep{
+			{
+				Config: withGone,
+				Check: resource.ComposeTestCheckFunc(
+					checkMembership(t, dsn, member, prefix+"_kept", true, false),
+					checkMembership(t, dsn, member, prefix+"_gone", true, false),
+				),
+			},
+			{
+				Config: withoutGone,
+				Check:  checkMembership(t, dsn, member, prefix+"_kept", true, false),
 			},
 		},
 	})

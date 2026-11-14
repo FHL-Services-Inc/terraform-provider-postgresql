@@ -975,12 +975,18 @@ func setRoleValidUntil(txn *sql.Tx, d *schema.ResourceData) error {
 }
 
 // roleRolesStatements returns the REVOKE statements for the roles in old but
-// not in new, then the GRANT statements for the roles in new but not in old,
-// each sorted by role name.
-func roleRolesStatements(role string, old, new *schema.Set) []string {
+// not in new that the role is currently a member of, then the GRANT
+// statements for the roles in new but not in old, each sorted by role name.
+//
+// Revokes are limited to current memberships because a removed role may
+// already be gone: when its postgresql_role is destroyed in the same apply,
+// DROP ROLE has removed the membership with it and REVOKE would fail.
+func roleRolesStatements(role string, old, new *schema.Set, current map[string]bool) []string {
 	var stmts []string
 	for _, r := range sortedSetStrings(old.Difference(new)) {
-		stmts = append(stmts, fmt.Sprintf("REVOKE %s FROM %s", pq.QuoteIdentifier(r), pq.QuoteIdentifier(role)))
+		if current[r] {
+			stmts = append(stmts, fmt.Sprintf("REVOKE %s FROM %s", pq.QuoteIdentifier(r), pq.QuoteIdentifier(role)))
+		}
 	}
 	for _, r := range sortedSetStrings(new.Difference(old)) {
 		stmts = append(stmts, fmt.Sprintf("GRANT %s TO %s", pq.QuoteIdentifier(r), pq.QuoteIdentifier(role)))
@@ -997,13 +1003,44 @@ func sortedSetStrings(s *schema.Set) []string {
 	return out
 }
 
+// currentRoleRoles returns the roles the role is currently a member of.
+func currentRoleRoles(txn *sql.Tx, role string) (map[string]bool, error) {
+	rows, err := txn.Query(`SELECT pg_get_userbyid(roleid)
+		FROM pg_catalog.pg_auth_members members
+		JOIN pg_catalog.pg_roles ON members.member = pg_roles.oid
+		WHERE rolname = $1`, role)
+	if err != nil {
+		return nil, fmt.Errorf("could not get roles list for role %s: %w", role, err)
+	}
+	defer func() {
+		if err := rows.Close(); err != nil {
+			log.Printf("error closing rows: %v", err)
+		}
+	}()
+
+	current := map[string]bool{}
+	for rows.Next() {
+		var grantedRole string
+		if err := rows.Scan(&grantedRole); err != nil {
+			return nil, fmt.Errorf("could not scan role name for role %s: %w", role, err)
+		}
+		current[grantedRole] = true
+	}
+	return current, rows.Err()
+}
+
 // updateRoleRoles applies the change of roles (from the prior state to the
 // plan) to the role's memberships.
 func updateRoleRoles(txn *sql.Tx, d *schema.ResourceData) error {
 	role := d.Get(roleNameAttr).(string)
 	oldRoles, newRoles := d.GetChange(roleRolesAttr)
 
-	for _, stmt := range roleRolesStatements(role, oldRoles.(*schema.Set), newRoles.(*schema.Set)) {
+	current, err := currentRoleRoles(txn, role)
+	if err != nil {
+		return err
+	}
+
+	for _, stmt := range roleRolesStatements(role, oldRoles.(*schema.Set), newRoles.(*schema.Set), current) {
 		if _, err := txn.Exec(stmt); err != nil {
 			return fmt.Errorf("could not update roles of role %s (%s): %w", role, stmt, err)
 		}
