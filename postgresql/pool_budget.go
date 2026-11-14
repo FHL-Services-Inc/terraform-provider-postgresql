@@ -68,9 +68,12 @@ type endpointBudget struct {
 	// used counts the slots taken.
 	used atomic.Int32
 
-	// waiting counts dials of pools without any connection that are blocked
-	// on the semaphore.
+	// waiting counts dials that are blocked on the semaphore to take a slot
+	// from another pool.
 	waiting atomic.Int32
+
+	// dialTime is a moving average of how long a physical dial takes (ns).
+	dialTime atomic.Int64
 
 	mu        sync.Mutex
 	pools     map[*budgetConnector]struct{}
@@ -165,6 +168,10 @@ type budgetConnector struct {
 	// waiting counts dials of this pool blocked on the budget.
 	waiting atomic.Int32
 
+	// queueWait is a moving average of how long the pool's queries wait in
+	// database/sql's queue (ns), updated by the balancer.
+	queueWait atomic.Int64
+
 	// applyMu serializes changes of the pool's limits.
 	applyMu sync.Mutex
 
@@ -192,11 +199,13 @@ func (c *budgetConnector) Connect(ctx context.Context) (driver.Conn, error) {
 		case budgetTaken:
 		}
 	}
+	start := time.Now()
 	conn, err := c.inner.Connect(ctx)
 	if err != nil {
 		b.give()
 		return nil, err
 	}
+	b.recordDial(time.Since(start))
 	bc := &budgetConn{Conn: conn, pool: c}
 	b.mu.Lock()
 	c.open++
@@ -225,14 +234,16 @@ const (
 // budgetGrace for a slot instead of returning ErrBadConn again.
 //
 // A pool without connections has nothing to wait for and takes a slot from
-// another pool (budgetTransfer).
+// another pool (budgetTransfer). So does a pool whose queries recently waited
+// longer in its queue than a new connection takes to open: then closing a
+// connection elsewhere and dialing is the faster way to serve the query.
 func (c *budgetConnector) onBudgetFull(ctx context.Context) budgetFullAction {
 	b := c.budget
 	b.mu.Lock()
 	open := c.open
 	inGrace := time.Since(c.raisedAt) < budgetGrace
 	b.mu.Unlock()
-	if open == 0 {
+	if open == 0 || c.queueWait.Load() > b.dialTime.Load() {
 		return budgetTransfer
 	}
 	if inGrace {
@@ -325,6 +336,16 @@ func (b *endpointBudget) tryTake() bool {
 	}
 	b.used.Add(1)
 	return true
+}
+
+// recordDial updates the moving average of the dial time.
+func (b *endpointBudget) recordDial(d time.Duration) {
+	old := b.dialTime.Load()
+	if old == 0 {
+		b.dialTime.Store(int64(d))
+		return
+	}
+	b.dialTime.Store((3*old + int64(d)) / 4)
 }
 
 // give returns a slot.
@@ -457,6 +478,9 @@ func (b *endpointBudget) balance() {
 			}
 			c.lastWaitCount, c.lastWaitDuration = st.WaitCount, st.WaitDuration
 			b.mu.Unlock()
+			// Halve the average every round without waits, so a pool that
+			// stopped waiting goes back to queueing.
+			c.queueWait.Store((c.queueWait.Load() + int64(w.avg)) / 2)
 			waits = append(waits, w)
 		}
 

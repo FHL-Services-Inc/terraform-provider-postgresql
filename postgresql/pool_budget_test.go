@@ -654,3 +654,39 @@ func TestEndpointBudgetStressNoErrors(t *testing.T) {
 		t.Errorf("peak open connections = %d, want <= %d", got, budget)
 	}
 }
+
+// TestBudgetOnBudgetFullChoosesQueueOrTransfer checks the decision a dial
+// makes when the budget is full: wait in its own pool's queue while that is
+// cheaper than opening a connection, take a slot from another pool when the
+// pool holds nothing or its queries wait longer than a dial takes.
+func TestBudgetOnBudgetFullChoosesQueueOrTransfer(t *testing.T) {
+	b := newEndpointBudget("test-decision", 1)
+	inner := &countingConnector{}
+	db := newBudgetTestPool(t, inner, b, 1, time.Second)
+	if err := db.Ping(); err != nil {
+		t.Fatalf("Ping(): %v", err)
+	}
+	var pool *budgetConnector
+	for c := range b.pools {
+		pool = c
+	}
+	b.dialTime.Store(int64(40 * time.Millisecond))
+
+	pool.queueWait.Store(int64(10 * time.Millisecond))
+	if got := pool.onBudgetFull(context.Background()); got != budgetQueue {
+		t.Errorf("short queue wait: action = %d, want budgetQueue", got)
+	}
+	pool.queueWait.Store(int64(100 * time.Millisecond))
+	if got := pool.onBudgetFull(context.Background()); got != budgetTransfer {
+		t.Errorf("queue wait longer than a dial: action = %d, want budgetTransfer", got)
+	}
+
+	newBudgetTestPool(t, inner, b, 1, time.Second)
+	for c := range b.pools {
+		if c != pool {
+			if got := c.onBudgetFull(context.Background()); got != budgetTransfer {
+				t.Errorf("pool without connections: action = %d, want budgetTransfer", got)
+			}
+		}
+	}
+}
