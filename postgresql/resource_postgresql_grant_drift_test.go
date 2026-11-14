@@ -245,3 +245,103 @@ resource "postgresql_grant" "all_tables" {
 		},
 	})
 }
+
+// TestAccPostgresqlGrantTableDriftRefreshesSettle is the reproduction from
+// #76: three tables changed out of band in three different ways (t1 loses
+// INSERT, t2 gains UPDATE, t3 loses SELECT). Before, consecutive
+// `terraform apply -refresh-only` runs alternated between the privileges of
+// t1 and t2 and never showed t3. Now every refresh stores the same value,
+// which reflects all three tables, and the plan stays non-empty.
+func TestAccPostgresqlGrantTableDriftRefreshesSettle(t *testing.T) {
+	skipIfNotAcc(t)
+
+	dbSuffix, teardown := setupTestDatabase(t, true, true)
+	defer teardown()
+
+	config := getTestConfig(t)
+	dbName, roleName := getTestDBNames(dbSuffix)
+	dsn := config.connStr(dbName)
+
+	for _, stmt := range []string{
+		"CREATE TABLE test_schema.t1 (id int)",
+		"CREATE TABLE test_schema.t2 (id int)",
+		"CREATE TABLE test_schema.t3 (id int)",
+	} {
+		dbExecute(t, dsn, stmt)
+	}
+
+	role := pq.QuoteIdentifier(roleName)
+	tfConfig := fmt.Sprintf(`
+resource "postgresql_grant" "g" {
+	database    = "%[1]s"
+	role        = "%[2]s"
+	schema      = "test_schema"
+	object_type = "table"
+	objects     = ["t1", "t2", "t3"]
+	privileges  = ["SELECT", "INSERT"]
+}
+`, dbName, roleName)
+
+	// t1 = {SELECT}, t2 = {SELECT, INSERT, UPDATE}, t3 = {INSERT}: no
+	// privilege is held by all three, so each one is stored marked.
+	settled := resource.ComposeTestCheckFunc(
+		resource.TestCheckResourceAttr("postgresql_grant.g", "privileges.#", "3"),
+		resource.TestCheckTypeSetElemAttr("postgresql_grant.g", "privileges.*", "SELECT"+partialPrivilegeSuffix),
+		resource.TestCheckTypeSetElemAttr("postgresql_grant.g", "privileges.*", "INSERT"+partialPrivilegeSuffix),
+		resource.TestCheckTypeSetElemAttr("postgresql_grant.g", "privileges.*", "UPDATE"+partialPrivilegeSuffix),
+	)
+	refresh := resource.TestStep{RefreshState: true, Check: settled, ExpectNonEmptyPlan: true}
+
+	resource.Test(t, resource.TestCase{
+		PreCheck: func() {
+			testAccPreCheck(t)
+			testCheckCompatibleVersion(t, featurePrivileges)
+		},
+		Providers: testAccProviders,
+		Steps: []resource.TestStep{
+			{Config: tfConfig},
+			{
+				PreConfig: func() {
+					for _, stmt := range []string{
+						fmt.Sprintf("REVOKE INSERT ON test_schema.t1 FROM %s", role),
+						fmt.Sprintf("GRANT UPDATE ON test_schema.t2 TO %s", role),
+						fmt.Sprintf("REVOKE SELECT ON test_schema.t3 FROM %s", role),
+					} {
+						dbExecute(t, dsn, stmt)
+					}
+				},
+				RefreshState:       true,
+				Check:              settled,
+				ExpectNonEmptyPlan: true,
+			},
+			refresh,
+			refresh,
+			refresh,
+			{
+				// Apply restores SELECT, INSERT on every table and revokes UPDATE.
+				Config: tfConfig,
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr("postgresql_grant.g", "privileges.#", "2"),
+					func(*terraform.State) error {
+						db, err := sql.Open("postgres", dsn)
+						if err != nil {
+							return err
+						}
+						defer closeDB(t, db)
+						var ok bool
+						if err := db.QueryRow(`
+SELECT bool_and(has_table_privilege($1, t, 'SELECT') AND has_table_privilege($1, t, 'INSERT')
+                AND NOT has_table_privilege($1, t, 'UPDATE'))
+FROM unnest(ARRAY['test_schema.t1', 'test_schema.t2', 'test_schema.t3']) AS t`, roleName).Scan(&ok); err != nil {
+							return err
+						}
+						if !ok {
+							return fmt.Errorf("privileges of %s not restored on t1/t2/t3", roleName)
+						}
+						return nil
+					},
+				),
+			},
+		},
+	})
+}
