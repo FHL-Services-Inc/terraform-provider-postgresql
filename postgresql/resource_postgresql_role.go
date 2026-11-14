@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -710,16 +711,12 @@ func resourcePostgreSQLRoleUpdate(db *DBConnection, d *schema.ResourceData) erro
 		return err
 	}
 
-	// applying roles: let's revoke all / grant the right ones.
-	// Only when roles changed: re-applying an unchanged list would also revoke
-	// memberships granted by postgresql_grant_role since the last refresh (or
-	// drop their ADMIN OPTION), e.g. when roles is in ignore_changes.
+	// applying roles: revoke the removed ones / grant the added ones.
+	// Memberships kept in roles are left alone, so they keep their ADMIN
+	// OPTION, and memberships granted by postgresql_grant_role since the last
+	// refresh are not revoked.
 	if d.HasChange(roleRolesAttr) {
-		if err = revokeRoles(txn, d); err != nil {
-			return err
-		}
-
-		if err = grantRoles(txn, d); err != nil {
+		if err = updateRoleRoles(txn, d); err != nil {
 			return err
 		}
 	}
@@ -977,45 +974,40 @@ func setRoleValidUntil(txn *sql.Tx, d *schema.ResourceData) error {
 	return nil
 }
 
-func revokeRoles(txn *sql.Tx, d *schema.ResourceData) error {
+// roleRolesStatements returns the REVOKE statements for the roles in old but
+// not in new, then the GRANT statements for the roles in new but not in old,
+// each sorted by role name.
+func roleRolesStatements(role string, old, new *schema.Set) []string {
+	var stmts []string
+	for _, r := range sortedSetStrings(old.Difference(new)) {
+		stmts = append(stmts, fmt.Sprintf("REVOKE %s FROM %s", pq.QuoteIdentifier(r), pq.QuoteIdentifier(role)))
+	}
+	for _, r := range sortedSetStrings(new.Difference(old)) {
+		stmts = append(stmts, fmt.Sprintf("GRANT %s TO %s", pq.QuoteIdentifier(r), pq.QuoteIdentifier(role)))
+	}
+	return stmts
+}
+
+func sortedSetStrings(s *schema.Set) []string {
+	out := make([]string, 0, s.Len())
+	for _, v := range s.List() {
+		out = append(out, v.(string))
+	}
+	sort.Strings(out)
+	return out
+}
+
+// updateRoleRoles applies the change of roles (from the prior state to the
+// plan) to the role's memberships.
+func updateRoleRoles(txn *sql.Tx, d *schema.ResourceData) error {
 	role := d.Get(roleNameAttr).(string)
+	oldRoles, newRoles := d.GetChange(roleRolesAttr)
 
-	query := `SELECT pg_get_userbyid(roleid)
-		FROM pg_catalog.pg_auth_members members
-		JOIN pg_catalog.pg_roles ON members.member = pg_roles.oid
-		WHERE rolname = $1`
-
-	rows, err := txn.Query(query, role)
-	if err != nil {
-		return fmt.Errorf("could not get roles list for role %s: %w", role, err)
-	}
-	defer func() {
-		if err := rows.Close(); err != nil {
-			log.Printf("error closing rows: %v", err)
-		}
-	}()
-
-	grantedRoles := []string{}
-	for rows.Next() {
-		var grantedRole string
-
-		if err = rows.Scan(&grantedRole); err != nil {
-			return fmt.Errorf("could not scan role name for role %s: %w", role, err)
-		}
-		// We cannot revoke directly here as it shares the same cursor (with Tx)
-		// and rows.Next seems to retrieve result row by row.
-		// see: https://github.com/lib/pq/issues/81
-		grantedRoles = append(grantedRoles, grantedRole)
-	}
-
-	for _, grantedRole := range grantedRoles {
-		query = fmt.Sprintf("REVOKE %s FROM %s", pq.QuoteIdentifier(grantedRole), pq.QuoteIdentifier(role))
-
-		if _, err := txn.Exec(query); err != nil {
-			return fmt.Errorf("could not revoke role %s from %s: %w", string(grantedRole), role, err)
+	for _, stmt := range roleRolesStatements(role, oldRoles.(*schema.Set), newRoles.(*schema.Set)) {
+		if _, err := txn.Exec(stmt); err != nil {
+			return fmt.Errorf("could not update roles of role %s (%s): %w", role, stmt, err)
 		}
 	}
-
 	return nil
 }
 
