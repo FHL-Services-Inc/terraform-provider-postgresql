@@ -167,7 +167,16 @@ func TestAccPostgresqlGrantReadDefaultACL(t *testing.T) {
 		t.Errorf("PUBLIC on all functions: got %v, want %v", got, want)
 	}
 
+	// Every table privilege of the server: PostgreSQL 17 added MAINTAIN.
 	allTable := []string{"DELETE", "INSERT", "REFERENCES", "SELECT", "TRIGGER", "TRUNCATE", "UPDATE"}
+	var serverVersion int
+	if err := db.QueryRow("SELECT current_setting('server_version_num')::int").Scan(&serverVersion); err != nil {
+		t.Fatal(err)
+	}
+	if serverVersion >= 170000 {
+		allTable = append(allTable, "MAINTAIN")
+		sort.Strings(allTable)
+	}
 	if got := tablePrivilegesForTest(t, db, owner, "r", "t")["t"]; !reflect.DeepEqual(got, allTable) {
 		t.Errorf("owner on table: got %v, want %v", got, allTable)
 	}
