@@ -96,18 +96,17 @@ func dataSourcePostgreSQLDatabaseTables() *schema.Resource {
 func dataSourcePostgreSQLTablesRead(db *DBConnection, d *schema.ResourceData) error {
 	database := d.Get("database").(string)
 
-	txn, err := startTransaction(db.client, database)
+	dbc, err := initConnection(db.client, database)
 	if err != nil {
 		return err
 	}
-	defer deferredRollback(txn)
 
 	query := tableQuery
 	queryConcatKeyword := queryConcatKeywordWhere
 
 	query = applyTableDataSourceQueryFilters(query, queryConcatKeyword, d)
 
-	rows, err := txn.Query(query)
+	rows, err := dbc.Query(query)
 	if err != nil {
 		return err
 	}
