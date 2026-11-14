@@ -15,10 +15,10 @@ import (
 
 func resourcePostgreSQLDefaultPrivileges() *schema.Resource {
 	return &schema.Resource{
-		Create: PGResourceFunc(resourcePostgreSQLDefaultPrivilegesCreate),
-		Update: PGResourceFunc(resourcePostgreSQLDefaultPrivilegesCreate),
+		Create: PGResourceWriteFunc(resourcePostgreSQLDefaultPrivilegesCreate),
+		Update: PGResourceWriteFunc(resourcePostgreSQLDefaultPrivilegesCreate),
 		Read:   PGResourceFunc(resourcePostgreSQLDefaultPrivilegesRead),
-		Delete: PGResourceFunc(resourcePostgreSQLDefaultPrivilegesDelete),
+		Delete: PGResourceWriteFunc(resourcePostgreSQLDefaultPrivilegesDelete),
 
 		Schema: map[string]*schema.Schema{
 			"role": {
@@ -93,6 +93,20 @@ func resourcePostgreSQLDefaultPrivilegesRead(db *DBConnection, d *schema.Resourc
 			"object type ROUTINE is not supported for this Postgres version (%s)",
 			db.version,
 		)
+	}
+
+	// With catalog_snapshot the Read is served from the snapshot of the
+	// database; Create and Update read directly after their write.
+	snap, gone := grantReadSnapshot(db, d)
+	if gone {
+		return nil
+	}
+	if snap != nil {
+		err := readRoleDefaultPrivilegesFromSnapshot(snap, db, d)
+		if err == nil {
+			return nil
+		}
+		log.Printf("[WARN] could not read %s from the catalog snapshot, reading directly: %v", d.Id(), err)
 	}
 
 	return readRoleDefaultPrivileges(db, d)
@@ -297,6 +311,58 @@ func readRoleDefaultPrivileges(db *DBConnection, d *schema.ResourceData) error {
 	privilegesEqual := resourcePrivilegesEqual(privilegesSet, db, d)
 
 	if !privilegesEqual {
+		d.Set("privileges", privilegesSet)
+	}
+	d.SetId(generateDefaultPrivilegesID(d))
+
+	return nil
+}
+
+// readRoleDefaultPrivilegesFromSnapshot is readRoleDefaultPrivileges served
+// from the catalog snapshot, with the same outcome: the pg_default_acl entry
+// is the one keyed by the owner's OID, the schema's OID (0 without a schema)
+// and the object type; a missing role or schema removes the resource from
+// state; a missing owner or entry reads as no privileges.
+func readRoleDefaultPrivilegesFromSnapshot(snap *catalogSnapshot, db *DBConnection, d *schema.ResourceData) error {
+	role := d.Get("role").(string)
+	pgSchema := d.Get("schema").(string)
+	privilegesInput := d.Get("privileges").(*schema.Set).List()
+
+	grantee, roleExists := snap.granteeOf(role)
+	schemaExists := true
+	var namespace uint32
+	if pgSchema != "" {
+		ns, ok := snap.namespaces[pgSchema]
+		schemaExists = ok
+		namespace = ns.oid
+	}
+
+	var privileges []string
+	if owner, ok := snap.roles[d.Get("owner").(string)]; ok {
+		key := defaultACLKey{owner: owner, namespace: namespace, objType: objectTypes[d.Get("object_type").(string)]}
+		if acl, ok := snap.defaultACL[key]; ok {
+			var err error
+			if privileges, err = aclPrivilegesGrantedTo(acl, grantee); err != nil {
+				return err
+			}
+		}
+	}
+
+	if grantTargetGone(d, roleExists, schemaExists) {
+		return nil
+	}
+
+	// We consider no privileges as "not exists" unless no privileges were provided as input
+	if len(privileges) == 0 {
+		log.Printf("[DEBUG] no default privileges for role %s in schema %s", role, pgSchema)
+		if len(privilegesInput) != 0 {
+			d.SetId("")
+			return nil
+		}
+	}
+
+	privilegesSet := stringSliceToSet(privileges)
+	if !resourcePrivilegesEqual(privilegesSet, db, d) {
 		d.Set("privileges", privilegesSet)
 	}
 	d.SetId(generateDefaultPrivilegesID(d))

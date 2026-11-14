@@ -185,6 +185,22 @@ The following arguments are supported:
   Version](https://www.postgresql.org/support/versioning/) or `current`.  Once a
   connection has been established, Terraform will fingerprint the actual
   version.  Default: `9.0.0`.
+* `catalog_snapshot` - (Optional) If set to `true`, `postgresql_grant` (all object
+  types but `column`, `foreign_data_wrapper` and `foreign_server`) and
+  `postgresql_default_privileges` are read from one snapshot of the catalogs per
+  database (`pg_roles`, `pg_namespace`, `pg_class`, `pg_proc`, `pg_default_acl`,
+  `pg_database`), taken by one statement the first time a resource of that database
+  is read and shared by every other read of that database, instead of one catalog
+  query per resource. The snapshot is dropped after every write this provider makes
+  to that database (roles, memberships and databases drop every snapshot), after
+  `catalog_snapshot_ttl_seconds`, and the reads that follow a create or update
+  always query the database. Changes made out-of-band while a Terraform run is in
+  progress are seen by the next run. Can also be set with the `PGCATALOGSNAPSHOT`
+  environment variable. The default is `false`.
+* `catalog_snapshot_ttl_seconds` - (Optional) Maximum age, in seconds, of a catalog
+  snapshot before it is taken again; also how long reads go direct after the
+  snapshot of a database could not be taken. Can also be set with the
+  `PGCATALOGSNAPSHOTTTL` environment variable. The default is `30`.
 * `aws_rds_iam_auth` - (Optional) If set to `true`, call the AWS RDS API to grab a temporary password, using AWS Credentials
   from the environment (or the given profile, see `aws_rds_iam_profile`)
 * `aws_rds_iam_profile` - (Optional) The AWS IAM Profile to use while using AWS RDS IAM Auth.

@@ -39,10 +39,10 @@ type ResourceSchemeGetter func(string) any
 
 func resourcePostgreSQLGrant() *schema.Resource {
 	return &schema.Resource{
-		Create: PGResourceFunc(resourcePostgreSQLGrantCreate),
-		Update: PGResourceFunc(resourcePostgreSQLGrantUpdate),
+		Create: PGResourceWriteFunc(resourcePostgreSQLGrantCreate),
+		Update: PGResourceWriteFunc(resourcePostgreSQLGrantUpdate),
 		Read:   PGResourceFunc(resourcePostgreSQLGrantRead),
-		Delete: PGResourceFunc(resourcePostgreSQLGrantDelete),
+		Delete: PGResourceWriteFunc(resourcePostgreSQLGrantDelete),
 
 		Schema: map[string]*schema.Schema{
 			"role": {
@@ -107,6 +107,25 @@ func resourcePostgreSQLGrant() *schema.Resource {
 func resourcePostgreSQLGrantRead(db *DBConnection, d *schema.ResourceData) error {
 	if err := validateFeatureSupport(db, d); err != nil {
 		return fmt.Errorf("feature is not supported: %v", err)
+	}
+
+	// With catalog_snapshot, the object types the snapshot covers are read
+	// from it; the others, and any Read the snapshot cannot serve, query the
+	// database as before. Create and Update read directly after their write.
+	switch d.Get("object_type").(string) {
+	case "column", "foreign_data_wrapper", "foreign_server":
+	default:
+		snap, gone := grantReadSnapshot(db, d)
+		if gone {
+			return nil
+		}
+		if snap != nil {
+			err := readRolePrivilegesFromSnapshot(snap, db, d)
+			if err == nil {
+				return nil
+			}
+			log.Printf("[WARN] could not read %s from the catalog snapshot, reading directly: %v", d.Id(), err)
+		}
 	}
 
 	return readRolePrivileges(db, d)
@@ -675,6 +694,113 @@ func readRolePrivileges(db *DBConnection, d *schema.ResourceData) error {
 		return fmt.Errorf("could not read privileges: query returned no row")
 	}
 
+	return nil
+}
+
+// readRolePrivilegesFromSnapshot is readRolePrivileges (and the single-object
+// Read of schema and database grants) served from the catalog snapshot, with
+// the same outcome for every input: a missing role or schema removes the
+// resource from state, objects are matched by name, routine overloads are
+// merged by name, and the privileges of the first object (by name) whose
+// privileges differ from the configured ones are written to state. Nothing is
+// written to d before every ACL it needs has been parsed, so on an error the
+// caller can fall back to the direct Read.
+func readRolePrivilegesFromSnapshot(snap *catalogSnapshot, db *DBConnection, d *schema.ResourceData) error {
+	objectType := d.Get("object_type").(string)
+	schemaName := d.Get("schema").(string)
+	objects := d.Get("objects").(*schema.Set)
+	grantee, roleExists := snap.granteeOf(d.Get("role").(string))
+
+	// drift is the privilege set to write to state, nil when every object
+	// has the configured privileges.
+	var drift *schema.Set
+	schemaExists := true
+
+	single := func(acl sql.NullString) error {
+		granted, err := privilegesOf(acl, grantee)
+		if err != nil {
+			return err
+		}
+		if !resourcePrivilegesEqual(granted, db, d) {
+			drift = granted
+		}
+		return nil
+	}
+
+	switch objectType {
+	case "database":
+		if err := single(snap.datACL); err != nil {
+			return err
+		}
+
+	case "schema":
+		ns, ok := snap.namespaces[schemaName]
+		schemaExists = ok
+		if ok {
+			if err := single(ns.acl); err != nil {
+				return err
+			}
+		}
+
+	default:
+		ns, ok := snap.namespaces[schemaName]
+		schemaExists = ok
+		var candidates []catalogObject
+		if ok {
+			switch objectType {
+			case "function", "procedure", "routine":
+				var err error
+				if candidates, err = snap.routinesOf(ns.oid); err != nil {
+					return err
+				}
+			default:
+				candidates = snap.relations[ns.oid]
+			}
+		}
+
+		relkind := objectTypes[objectType]
+		for i := 0; i < len(candidates); i++ {
+			object := candidates[i]
+			if relkind != "" && object.kind != relkind {
+				continue
+			}
+			if objects.Len() > 0 && !objects.Contains(object.name) {
+				continue
+			}
+
+			// The direct Read aggregates the privileges of every routine
+			// with this name: a name reads as granted when any overload is.
+			granted, err := privilegesOf(object.acl, grantee)
+			if err != nil {
+				return err
+			}
+			for i+1 < len(candidates) && candidates[i+1].name == object.name {
+				i++
+				more, err := privilegesOf(candidates[i].acl, grantee)
+				if err != nil {
+					return err
+				}
+				granted = granted.Union(more)
+			}
+
+			if !resourcePrivilegesEqual(granted, db, d) {
+				log.Printf(
+					"[DEBUG] %s %s has not the expected privileges %v for role %s",
+					strings.ToTitle(objectType), object.name, granted.List(), d.Get("role"),
+				)
+				drift = granted
+				break
+			}
+		}
+	}
+
+	if grantTargetGone(d, roleExists, schemaExists) {
+		return nil
+	}
+	d.SetId(generateGrantID(d))
+	if drift != nil {
+		return d.Set("privileges", drift)
+	}
 	return nil
 }
 

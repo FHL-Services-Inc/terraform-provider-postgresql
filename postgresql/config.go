@@ -193,6 +193,12 @@ type Config struct {
 	SSLClientCert                   *ClientCertificateConfig
 	SSLRootCertPath                 string
 	GCPIAMImpersonateServiceAccount string
+
+	// CatalogSnapshot lets grant and default privileges Reads share one
+	// per-database catalog snapshot (see catalog_snapshot.go) instead of each
+	// querying the catalogs; CatalogSnapshotTTLSeconds bounds its age.
+	CatalogSnapshot           bool
+	CatalogSnapshotTTLSeconds int
 }
 
 // Client struct holding connection string

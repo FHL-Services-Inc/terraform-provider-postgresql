@@ -224,6 +224,19 @@ func Provider() *schema.Provider {
 				Description:  "Specify the expected version of PostgreSQL.",
 				ValidateFunc: validateExpectedVersion,
 			},
+			"catalog_snapshot": {
+				Type:        schema.TypeBool,
+				Optional:    true,
+				DefaultFunc: schema.EnvDefaultFunc("PGCATALOGSNAPSHOT", false),
+				Description: "Read postgresql_grant and postgresql_default_privileges from one catalog snapshot per database, built once per plan and dropped after any write by this provider, instead of one catalog query per resource.",
+			},
+			"catalog_snapshot_ttl_seconds": {
+				Type:         schema.TypeInt,
+				Optional:     true,
+				DefaultFunc:  schema.EnvDefaultFunc("PGCATALOGSNAPSHOTTTL", defaultCatalogSnapshotTTLSeconds),
+				Description:  "Maximum age, in seconds, of a catalog snapshot before it is rebuilt. Only used with catalog_snapshot.",
+				ValidateFunc: validation.IntAtLeast(1),
+			},
 		},
 
 		ResourcesMap: map[string]*schema.Resource{
@@ -414,6 +427,8 @@ func providerConfigure(d *schema.ResourceData) (any, error) {
 		ExpectedVersion:                 version,
 		SSLRootCertPath:                 d.Get("sslrootcert").(string),
 		GCPIAMImpersonateServiceAccount: d.Get("gcp_iam_impersonate_service_account").(string),
+		CatalogSnapshot:                 d.Get("catalog_snapshot").(bool),
+		CatalogSnapshotTTLSeconds:       d.Get("catalog_snapshot_ttl_seconds").(int),
 	}
 
 	if value, ok := d.GetOk("clientcert"); ok {

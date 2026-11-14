@@ -41,6 +41,31 @@ func PGResourceFunc(fn func(*DBConnection, *schema.ResourceData) error) func(*sc
 	}
 }
 
+// PGResourceWriteFunc wraps the Create/Update/Delete function of a resource
+// that writes to the database named by its `database` attribute (the provider
+// database when unset). After fn returns, whatever its outcome, the catalog
+// snapshot of that database is dropped, so no later Read is served privileges
+// from before the write. Resources whose writes touch none of the snapshot's
+// catalogs (publications, subscriptions, replication slots, servers, user
+// mappings, security labels) keep using PGResourceFunc.
+func PGResourceWriteFunc(fn func(*DBConnection, *schema.ResourceData) error) func(*schema.ResourceData, any) error {
+	return func(d *schema.ResourceData, meta any) error {
+		client := meta.(*Client)
+		defer invalidateCatalogSnapshot(client, getDatabase(d, client.databaseName))
+		return PGResourceFunc(fn)(d, meta)
+	}
+}
+
+// PGResourceClusterWriteFunc is PGResourceWriteFunc for resources that write
+// cluster-wide catalogs (roles, memberships, databases): every catalog
+// snapshot is dropped after fn returns.
+func PGResourceClusterWriteFunc(fn func(*DBConnection, *schema.ResourceData) error) func(*schema.ResourceData, any) error {
+	return func(d *schema.ResourceData, meta any) error {
+		defer invalidateCatalogSnapshots()
+		return PGResourceFunc(fn)(d, meta)
+	}
+}
+
 // QueryAble is a DB connection (sql.DB/Tx)
 type QueryAble interface {
 	Exec(query string, args ...any) (sql.Result, error)

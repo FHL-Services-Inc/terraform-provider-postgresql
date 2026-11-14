@@ -45,10 +45,10 @@ const (
 
 func resourcePostgreSQLRole() *schema.Resource {
 	return &schema.Resource{
-		Create: PGResourceFunc(resourcePostgreSQLRoleCreate),
+		Create: PGResourceClusterWriteFunc(resourcePostgreSQLRoleCreate),
 		Read:   PGResourceFunc(resourcePostgreSQLRoleRead),
-		Update: PGResourceFunc(resourcePostgreSQLRoleUpdate),
-		Delete: PGResourceFunc(resourcePostgreSQLRoleDelete),
+		Update: PGResourceClusterWriteFunc(resourcePostgreSQLRoleUpdate),
+		Delete: PGResourceClusterWriteFunc(resourcePostgreSQLRoleDelete),
 		Importer: &schema.ResourceImporter{
 			StateContext: schema.ImportStatePassthroughContext,
 		},
