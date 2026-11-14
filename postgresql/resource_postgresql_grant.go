@@ -310,6 +310,23 @@ func grantTargetGone(d *schema.ResourceData, roleExists, schemaExists bool) bool
 	return false
 }
 
+// relationACLType returns the acldefault object type of a relkind: sequences
+// have their own default privileges, every other relation those of a table.
+//
+// Default ACLs in the grant Read queries: an object whose ACL column is NULL was never granted or revoked on explicitly
+// and carries its default privileges: everything for the owner, plus EXECUTE
+// for PUBLIC on functions and CONNECT/TEMPORARY for PUBLIC on databases. The
+// Read queries explode COALESCE(acl, acldefault(type, owner)) instead of the
+// ACL column, so a NULL ACL reads like the explicit ACL a first GRANT or REVOKE
+// writes (which starts from the same defaults). Column ACLs need no default:
+// columns have no default privileges.
+func relationACLType(relkind string) string {
+	if relkind == "S" {
+		return "s"
+	}
+	return "r"
+}
+
 // buildReadSingleObjectRolePrivilegesQuery builds the Read query for the object
 // types granted on one named object (database, schema, foreign data wrapper,
 // foreign server). It returns one row: role_exists, schema_exists (always true
@@ -321,32 +338,32 @@ func buildReadSingleObjectRolePrivilegesQuery(d *schema.ResourceData) (string, [
 	if d.Get("object_type").(string) == "schema" {
 		return grantReadRoleCTE + `
 SELECT r.oid IS NOT NULL, n.oid IS NOT NULL,
-    (SELECT array_agg(a.privilege_type) FROM aclexplode(n.nspacl) a WHERE a.grantee = r.oid)
+    (SELECT array_agg(a.privilege_type) FROM aclexplode(COALESCE(n.nspacl, acldefault('n', n.nspowner))) a WHERE a.grantee = r.oid)
 FROM r
 LEFT JOIN pg_namespace n ON n.nspname = $2
 `, []any{role, d.Get("schema").(string)}
 	}
 
-	var catalog, acl, nameColumn, name string
+	var catalog, acl, aclType, owner, nameColumn, name string
 	switch d.Get("object_type").(string) {
 	case "database":
-		catalog, acl, nameColumn = "pg_database", "datacl", "datname"
+		catalog, acl, aclType, owner, nameColumn = "pg_database", "datacl", "d", "datdba", "datname"
 		name = d.Get("database").(string)
 	case "foreign_data_wrapper":
-		catalog, acl, nameColumn = "pg_foreign_data_wrapper", "fdwacl", "fdwname"
+		catalog, acl, aclType, owner, nameColumn = "pg_foreign_data_wrapper", "fdwacl", "F", "fdwowner", "fdwname"
 		name = d.Get("objects").(*schema.Set).List()[0].(string)
 	case "foreign_server":
-		catalog, acl, nameColumn = "pg_foreign_server", "srvacl", "srvname"
+		catalog, acl, aclType, owner, nameColumn = "pg_foreign_server", "srvacl", "S", "srvowner", "srvname"
 		name = d.Get("objects").(*schema.Set).List()[0].(string)
 	}
 
 	return grantReadRoleCTE + fmt.Sprintf(`
 SELECT r.oid IS NOT NULL, true,
     (SELECT pg_catalog.array_agg(a.privilege_type)
-     FROM pg_catalog.%s o, pg_catalog.aclexplode(o.%s) a
+     FROM pg_catalog.%s o, pg_catalog.aclexplode(COALESCE(o.%s, pg_catalog.acldefault('%s', o.%s))) a
      WHERE o.%s = $2 AND a.grantee = r.oid)
 FROM r
-`, catalog, acl, nameColumn), []any{role, name}
+`, catalog, acl, aclType, owner, nameColumn), []any{role, name}
 }
 
 func readSingleObjectRolePrivileges(db *DBConnection, d *schema.ResourceData) error {
@@ -512,8 +529,9 @@ func readColumnRolePrivileges(db *DBConnection, d *schema.ResourceData) error {
 // than in a subquery over the whole pg_class joined back by name: with the
 // relname filter the planner turned that join into a nested loop that re-ran
 // aclexplode over every relation in the catalog once per matched object.
-// Relations without an ACL entry for the role (including a NULL relacl) still
-// produce a row with an empty privilege array.
+// A NULL relacl stands for the default privileges (see relationACLType);
+// relations without an ACL entry for the role still produce a row with an empty
+// privilege array.
 func buildReadTableRolePrivilegesQuery(role, schemaName, relkind string, objects *schema.Set) (string, []interface{}) {
 	query := grantReadRoleCTE + grantReadSchemaCTE + `
 SELECT r.oid IS NOT NULL, EXISTS (SELECT 1 FROM n), o.relname, o.privileges
@@ -523,7 +541,7 @@ LEFT JOIN LATERAL (
     FROM pg_class c
     JOIN n ON n.oid = c.relnamespace
     LEFT JOIN LATERAL (
-        SELECT privilege_type FROM aclexplode(c.relacl) WHERE grantee = r.oid
+        SELECT privilege_type FROM aclexplode(COALESCE(c.relacl, acldefault('` + relationACLType(relkind) + `', c.relowner))) WHERE grantee = r.oid
     ) a ON true
     WHERE c.relkind = $3`
 	args := []interface{}{role, schemaName, relkind}
@@ -622,7 +640,7 @@ func buildReadFunctionRolePrivilegesQuery(
 	var routines string
 	if objects.Len() == 0 {
 		routines = `
-        SELECT p.proname AS name, p.oid, p.proacl
+        SELECT p.proname AS name, p.oid, p.proacl, p.proowner
         FROM pg_proc p
         JOIN n ON n.oid = p.pronamespace` + where(prokindFilter)
 	} else {
@@ -640,7 +658,7 @@ func buildReadFunctionRolePrivilegesQuery(
 
 		args = append(args, pq.Array(bare))
 		routines = `
-        SELECT p.proname AS name, p.oid, p.proacl
+        SELECT p.proname AS name, p.oid, p.proacl, p.proowner
         FROM pg_proc p
         JOIN n ON n.oid = p.pronamespace` + where("p.proname = ANY($3)", prokindFilter)
 
@@ -648,7 +666,7 @@ func buildReadFunctionRolePrivilegesQuery(
 			args = append(args, pq.Array(sigEntries), pq.Array(signatures))
 			routines += `
         UNION ALL
-        SELECT e.entry, p.oid, p.proacl
+        SELECT e.entry, p.oid, p.proacl, p.proowner
         FROM unnest($4::text[], $5::text[]) AS e(entry, signature)
         JOIN pg_proc p ON p.oid = to_regprocedure(e.signature)
         JOIN n ON n.oid = p.pronamespace` + where(prokindFilter)
@@ -663,7 +681,7 @@ LEFT JOIN LATERAL (
     FROM (` + routines + `
     ) o
     LEFT JOIN LATERAL (
-        SELECT privilege_type FROM aclexplode(o.proacl) WHERE grantee = r.oid
+        SELECT privilege_type FROM aclexplode(COALESCE(o.proacl, acldefault('f', o.proowner))) WHERE grantee = r.oid
     ) a ON true
     GROUP BY o.name, o.oid
 ) o ON true

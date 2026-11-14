@@ -59,7 +59,7 @@ func TestBuildReadFunctionRolePrivilegesQuery(t *testing.T) {
 		"SELECT r.oid IS NOT NULL, EXISTS (SELECT 1 FROM n), o.name, o.privileges",
 		"WHEN $1::name = 'public' THEN 0::oid",
 		"SELECT oid FROM pg_namespace WHERE nspname = $2",
-		"SELECT privilege_type FROM aclexplode(o.proacl) WHERE grantee = r.oid",
+		"SELECT privilege_type FROM aclexplode(COALESCE(o.proacl, acldefault('f', o.proowner))) WHERE grantee = r.oid",
 		"GROUP BY o.name, o.oid",
 	}
 	checkCommon := func(t *testing.T, q string) {
