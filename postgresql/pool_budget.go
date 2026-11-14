@@ -29,7 +29,7 @@ const (
 	// budgetColdIdle is how long a connection must have been idle before
 	// it is closed to give its slot to a pool whose queries are waiting.
 	// Connections of a busy pool are reused within milliseconds.
-	budgetColdIdle = 50 * time.Millisecond
+	budgetColdIdle = 250 * time.Millisecond
 
 	// budgetFairWait: when the queries of a pool wait longer than this on
 	// average, and at least twice as long as those of another pool, that
@@ -341,6 +341,7 @@ func (b *endpointBudget) acquire(ctx context.Context, pool *budgetConnector) err
 		return nil
 	}
 
+	log.Printf("[DEBUG] connection budget %s full: a pool without connections waits for a slot", b.key)
 	b.waiting.Add(1)
 	pool.waiting.Add(1)
 	defer func() {
@@ -493,6 +494,7 @@ func (b *endpointBudget) balance() {
 			continue
 		}
 		if victim := b.coldIdlePool(needy.c); victim != nil && b.reapIdle(victim) {
+			log.Printf("[DEBUG] connection budget %s: closed a connection idle for %s for a pool with waiting queries", b.key, budgetColdIdle)
 			raise()
 			continue
 		}
@@ -511,6 +513,7 @@ func (b *endpointBudget) balance() {
 				}
 			}
 			if donor != nil {
+				log.Printf("[DEBUG] connection budget %s: queries of one pool wait %s on average, another pool gives up a connection", b.key, needy.avg)
 				b.mu.Lock()
 				donor.c.evict++
 				b.mu.Unlock()
@@ -633,6 +636,7 @@ func (c *budgetConn) IsValid() bool {
 	}
 	p := c.pool
 	if p.budget.waiting.Load()-p.waiting.Load() > 0 || p.takeEvict() {
+		log.Printf("[DEBUG] connection budget %s: closing a returned connection to give its slot to another pool", p.budget.key)
 		p.setLimit(func(open int) int { return open - 1 })
 		return false
 	}
