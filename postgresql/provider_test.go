@@ -42,6 +42,8 @@ func testAccPreCheck(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
+	testAccCheckNoDefaultACLs(t)
 }
 
 func TestProviderMaxIdleConnectionsEnvDefault(t *testing.T) {
