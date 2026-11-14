@@ -21,6 +21,20 @@ testacc_cleanup: fmtcheck
 testacc: fmtcheck
 	@sh -c "'$(CURDIR)/tests/testacc_full.sh'"
 
+# Same as testacc_setup/testacc/testacc_cleanup, but with a stock postgres
+# image and Apple's `container` CLI by default (CONTAINER_CLI=docker also
+# works). See tests/container_acc.sh for the settings.
+testacc_container_setup:
+	@'$(CURDIR)/tests/container_acc.sh' start $(PROFILE)
+
+testacc_container_cleanup:
+	@'$(CURDIR)/tests/container_acc.sh' stop
+
+testacc_container: fmtcheck
+	@'$(CURDIR)/tests/container_acc.sh' run $(TESTARGS)
+
+.PHONY: testacc_container testacc_container_setup testacc_container_cleanup
+
 vet:
 	@echo "go vet ."
 	@go vet $$(go list ./...) ; if [ $$? -eq 1 ]; then \
