@@ -3,7 +3,8 @@
 A reproducible benchmark for large `terraform plan` runs against this provider. It
 times `terraform plan -refresh=true`, the hot path: Terraform calls `Read` for every
 resource in state on every plan and apply. It also counts the SQL statements and
-PostgreSQL connections each plan uses.
+PostgreSQL connections each plan uses, and samples how many connections the provider
+holds at the same time.
 
 Use it to compare provider builds (before/after a change). It can also add network
 latency, because most of the cost of a large plan is round trips. A local PostgreSQL
@@ -16,6 +17,8 @@ has close to zero latency and hides that cost.
 | `run.sh` | Runs everything: builds the providers, loads the fixture, applies once, runs the timed plans, writes the summary |
 | `genfixture/` | Generates `fixture.sql` (database, schemas, tables), `main.tf` (Terraform resources) and `cleanup.sql` |
 | `latencyproxy/` | TCP proxy that delays each direction by a fixed amount (RTT = 2 x delay) |
+| `connsampler/` | Polls `pg_stat_activity` during each plan for the concurrent-connections columns |
+| `smallpool.sh` | Small-pool matrix: databases with an owner under `max_connections` 1/2/4/8 x `-parallelism` 1/2/10, with a timeout per phase so a deadlock shows up as a hang |
 
 ### Generated workload (defaults)
 
@@ -37,6 +40,12 @@ You can change the sizes through `GEN_ARGS`. For example, use
 `GEN_ARGS="-roles 400 -tables 2000"` to get about 2300 resources. Run
 `go run ./tests/bench/genfixture -h` to see every flag.
 
+`GEN_ARGS="-fixture-dbs 4"` spreads the 10 schemas round-robin over 4 databases
+(`bench`, `bench_1`, `bench_2`, `bench_3`), together with the grants, default
+privileges and Terraform-managed schemas on them. The resource count stays the same.
+The provider keeps one connection pool per database, so this is the setup where idle
+connections of several pools add up.
+
 ## Running it
 
 You need Go, Terraform 1.x, `psql` and `perl`. `perl` is used for sub-second timestamps.
@@ -50,8 +59,11 @@ You need Go, Terraform 1.x, `psql` and `perl`. `perl` is used for sub-second tim
      postgres -c max_connections=300 -c shared_preload_libraries=pg_stat_statements
    ```
 
-   The same arguments work with `docker run` if you use Docker. Connection counts come
-   from `pg_stat_database.sessions`, which needs PostgreSQL 14 or later.
+   Check that it accepts connections with `container ls` and
+   `psql -h 127.0.0.1 -p 25445 -U postgres -c 'select 1'`. Connection counts come from
+   `pg_stat_database.sessions`, which needs PostgreSQL 14 or later. Since macOS 27,
+   connect through the published `127.0.0.1` port, not the container's own IP: Local
+   Network privacy blocks freshly built binaries from the container subnet.
 
 2. Run the matrix. Each `-p label=path` takes either a provider source checkout, which
    is built for you, or a directory that already contains a `terraform-provider-postgresql`
@@ -102,7 +114,36 @@ range, and the plan then fails with `connect: can't assign requested address`. T
 sooner. As a rough guide, each plan takes about 50 s including the cooldown. For example,
 4 providers x 3 latencies x 3 runs took 32 minutes on an M-series Mac.
 
-To clean up, run `psql -f <workdir>/tf/cleanup.sql` and `container stop pg-tf-bench`.
+To clean up, run `psql -f <workdir>/tf/cleanup.sql` and `container stop pg-tf-bench`
+(the container was started with `--rm`, so stopping it also removes it).
+
+## Small-pool matrix
+
+`smallpool.sh` checks that the provider never deadlocks on a small pool. For every
+label, `max_connections` value (`-c`, default `1 2 4 8`) and `-parallelism` value (`-P`,
+default `1 2 10`) it starts from an empty cluster and runs three phases on 4 databases
+(`-d`), each with an owner role and a schema inside:
+
+1. `create`: `terraform apply`
+2. `reown`: `terraform apply` with every database and schema moved to the other owner
+3. `destroy`: `terraform destroy`
+
+Each phase runs under `timeout` (`-t`, default 120 s). A phase that runs out of time is a
+**hang**, a non-zero exit is a **fail**, and the rest of that cell is skipped. Between
+cells the script kills leftover provider processes, terminates their backends (a hung
+provider may still hold advisory locks) and drops the databases and roles. It needs GNU
+`timeout` (`brew install coreutils` on macOS).
+
+```sh
+tests/bench/smallpool.sh -p main=/tmp/provider-main -p branch=.
+tests/bench/smallpool.sh -p pooled=. -a 'pooled=max_idle_connections = 2' -c "1 2" -P "1 10"
+```
+
+The matrix takes a few minutes when nothing hangs; each hang adds the timeout. The table
+goes to `<workdir>/summary.md` (default work dir `${TMPDIR:-/tmp}/pg-tf-smallpool`), the
+per-phase rows to `results.csv`, and the Terraform output to `logs/`. It uses the same
+PostgreSQL as `run.sh` and its own names (`smallpool_db_*`, `smallpool_owner_*`), so it
+does not touch the plan fixture.
 
 ## Reading the numbers
 
@@ -113,6 +154,22 @@ To clean up, run `psql -f <workdir>/tf/cleanup.sql` and `container stop pg-tf-be
   are not included.
 - **connections**: backends started during the plan. With `SetMaxIdleConns(0)`, almost
   every statement outside a transaction opens a new connection.
+- **peak conns (max)**, **p95 conns**: connections the provider holds at the same time.
+  `connsampler` counts client backends with `application_name = 'Terraform provider'`
+  (the provider sets it as `fallback_application_name`) every 100 ms
+  (`SAMPLE_INTERVAL`) during the plan. Its own connection is excluded, and it connects
+  directly, not through the latency proxy. Peak is the largest sample of a run, and the
+  table shows the median over runs with the highest run in parentheses. p95 is over all
+  samples of a run, including the few seconds of Terraform startup with no connections.
+  Sampling misses connections that live shorter than the interval, so with
+  `max_idle_connections = 0` the peak is a lower bound.
+- **peak idle**: the largest number of those connections in state `idle` in one
+  sample: parked in the pool, or waiting for the client's next statement (at higher
+  RTT a busy connection spends most of its time like that).
+
+The raw samples are in `logs/conns-<label>-<rtt>-<run>.tsv`: time, connections, idle
+connections, and connections per database, for example `bench:10,postgres:4`. With
+`-fixture-dbs` this shows how much each pool holds.
 
 The proxy also delays the first client packet of each connection by one RTT, to stand
 in for the TCP handshake. It does not emulate TLS. Against a real server with
