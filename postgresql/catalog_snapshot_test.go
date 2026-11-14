@@ -143,6 +143,7 @@ func catalogProcFixture() [][]driver.Value {
 		{int64(20), "f", "{o=X/o,r=X*/o}"},
 		{int64(20), "f", "{o=X/o}"},
 		{int64(20), "p", "{o=X/o,r=X/o}"},
+		{int64(21), "nogrant", "{o=X/o}"},
 	}
 }
 
@@ -312,6 +313,18 @@ func TestCatalogSnapshotDetectsDrift(t *testing.T) {
 	d = readCase(t, client, cases[3], nil)
 	if got := privilegesOfData(d); fmt.Sprint(got) != "[EXECUTE]" {
 		t.Errorf("function grant on f: privileges = %v, want [EXECUTE]", got)
+	}
+
+	// A routine without a grant to the role is drift, for every routine type.
+	for _, objectType := range []string{"function", "procedure", "routine"} {
+		d = readCase(t, client, cases[3], map[string]any{"schema": "empty", "object_type": objectType, "objects": []any{"nogrant"}})
+		if got := privilegesOfData(d); fmt.Sprint(got) != "[]" {
+			t.Errorf("%s grant on nogrant: privileges = %v, want []", objectType, got)
+		}
+		d = readCase(t, client, cases[3], map[string]any{"schema": "empty", "object_type": objectType, "objects": []any{}})
+		if got := privilegesOfData(d); fmt.Sprint(got) != "[]" {
+			t.Errorf("%s grant on all routines: privileges = %v, want [] (nogrant)", objectType, got)
+		}
 	}
 
 	// Database grant: PUBLIC has TEMPORARY and CONNECT, the role only CONNECT.
@@ -564,32 +577,33 @@ func TestCatalogSnapshotOffKeepsDirectReads(t *testing.T) {
 
 // --- acceptance ---------------------------------------------------------
 
-// aclFixtureRoles are roles whose names exercise aclitem quoting: a space, a
-// double quote, a backslash and a non-ASCII character. They are created on
-// the cluster and dropped with the test database.
-var aclFixtureRoles = []string{`tf acl space`, `tf_acl"q"`, `tf_acl\b`, `tf_acl_ü`}
+// aclFixtureRoleNames returns roles whose names exercise aclitem quoting: a
+// space, a double quote, a backslash and a non-ASCII character, unique to
+// one test run so a failed teardown never collides with the next run.
+func aclFixtureRoleNames(dbSuffix string) []string {
+	return []string{"tf acl space " + dbSuffix, `tf_acl"q"` + dbSuffix, `tf_acl\b` + dbSuffix, "tf_acl_ü" + dbSuffix}
+}
 
 // setupACLFixture fills the test database with ACLs of every shape the
 // snapshot reads: grants to the role, to PUBLIC, with grant option, to roles
 // with quoted names, a table without ACL, overloaded functions, default ACLs
 // with and without schema, schema and database ACLs. It returns the test
 // database and role names and the owner of the fixture objects.
-func setupACLFixture(t *testing.T) (dbName, roleName, owner string, teardown func()) {
+func setupACLFixture(t *testing.T) (dbName, roleName string, aclRoles []string, teardown func()) {
 	t.Helper()
 	config := getTestConfig(t)
-	owner = config.getDatabaseUsername()
 
 	dbSuffix, teardownDB := setupTestDatabase(t, true, true)
 	dbName, roleName = getTestDBNames(dbSuffix)
-	for _, r := range aclFixtureRoles {
+	aclRoles = aclFixtureRoleNames(dbSuffix)
+	for _, r := range aclRoles {
 		dbExecute(t, config.connStr("postgres"), fmt.Sprintf("CREATE ROLE %s", pq.QuoteIdentifier(r)))
 	}
 	teardown = func() {
-		for _, r := range aclFixtureRoles {
-			dbExecute(t, config.connStr(dbName), fmt.Sprintf("DROP OWNED BY %s", pq.QuoteIdentifier(r)))
-		}
+		// Every privilege of the fixture roles is in the test database;
+		// dropping it first leaves nothing that blocks DROP ROLE.
 		teardownDB()
-		for _, r := range aclFixtureRoles {
+		for _, r := range aclRoles {
 			dbExecute(t, config.connStr("postgres"), fmt.Sprintf("DROP ROLE IF EXISTS %s", pq.QuoteIdentifier(r)))
 		}
 	}
@@ -603,7 +617,8 @@ func setupACLFixture(t *testing.T) (dbName, roleName, owner string, teardown fun
 		"CREATE FUNCTION test_schema.f(integer) RETURNS integer LANGUAGE sql AS 'SELECT $1'",
 		"CREATE FUNCTION test_schema.f(text) RETURNS text LANGUAGE sql AS 'SELECT $1'",
 		"CREATE PROCEDURE test_schema.p() LANGUAGE sql AS 'SELECT 1'",
-		"REVOKE ALL ON FUNCTION test_schema.f(integer), test_schema.f(text) FROM PUBLIC",
+		"CREATE FUNCTION test_schema.h() RETURNS integer LANGUAGE sql AS 'SELECT 1'",
+		"REVOKE ALL ON FUNCTION test_schema.f(integer), test_schema.f(text), test_schema.h() FROM PUBLIC",
 		"REVOKE ALL ON PROCEDURE test_schema.p() FROM PUBLIC",
 		"GRANT SELECT, INSERT ON test_schema.t1 TO " + role,
 		"GRANT SELECT ON test_schema.t1 TO PUBLIC",
@@ -621,12 +636,12 @@ func setupACLFixture(t *testing.T) (dbName, roleName, owner string, teardown fun
 	} {
 		dbExecute(t, config.connStr(dbName), stmt)
 	}
-	for _, r := range aclFixtureRoles {
+	for _, r := range aclRoles {
 		dbExecute(t, config.connStr(dbName), fmt.Sprintf("GRANT SELECT ON test_schema.t1 TO %s WITH GRANT OPTION", pq.QuoteIdentifier(r)))
 		dbExecute(t, config.connStr(dbName), fmt.Sprintf("GRANT UPDATE ON test_schema.t2 TO %s", pq.QuoteIdentifier(r)))
 		dbExecute(t, config.connStr(dbName), fmt.Sprintf("GRANT USAGE ON SCHEMA test_schema TO %s", pq.QuoteIdentifier(r)))
 	}
-	return dbName, roleName, owner, teardown
+	return dbName, roleName, aclRoles, teardown
 }
 
 // TestAccCatalogSnapshotACLParserMatchesAclexplode cross-checks parseACL
@@ -711,8 +726,10 @@ func TestAccCatalogSnapshotACLParserMatchesAclexplode(t *testing.T) {
 // same attributes, including the privileges written back on drift.
 func TestAccCatalogSnapshotEquivalence(t *testing.T) {
 	skipIfNotAcc(t)
-	dbName, roleName, owner, teardown := setupACLFixture(t)
+	dbName, roleName, aclRoles, teardown := setupACLFixture(t)
 	defer teardown()
+	config := getTestConfig(t)
+	owner := config.getDatabaseUsername()
 
 	// The provider's client, as the Reads use it; the snapshot is taken through
 	// the cache, as grantReadSnapshot does, whatever the flag says.
@@ -754,22 +771,25 @@ func TestAccCatalogSnapshotEquivalence(t *testing.T) {
 		grant("table_missing_object", map[string]any{"schema": "test_schema", "object_type": "table", "objects": []any{"nope"}, "privileges": []any{"SELECT"}}),
 		grant("table_public", map[string]any{"role": "public", "schema": "test_schema", "object_type": "table", "objects": []any{"t1"}, "privileges": []any{"SELECT"}}),
 		grant("table_all_public_drift", map[string]any{"role": "public", "schema": "test_schema", "object_type": "table", "privileges": []any{"SELECT"}}),
-		grant("table_quoted_role", map[string]any{"role": aclFixtureRoles[1], "schema": "test_schema", "object_type": "table", "objects": []any{"t1"}, "privileges": []any{"SELECT"}}),
-		grant("table_space_role_all", map[string]any{"role": aclFixtureRoles[0], "schema": "test_schema", "object_type": "table", "privileges": []any{"SELECT"}}),
-		grant("table_backslash_role", map[string]any{"role": aclFixtureRoles[2], "schema": "test_schema", "object_type": "table", "objects": []any{"t2"}, "privileges": []any{"UPDATE"}}),
-		grant("table_unicode_role", map[string]any{"role": aclFixtureRoles[3], "schema": "test_schema", "object_type": "table", "objects": []any{"t2"}, "privileges": []any{"UPDATE"}}),
+		grant("table_quoted_role", map[string]any{"role": aclRoles[1], "schema": "test_schema", "object_type": "table", "objects": []any{"t1"}, "privileges": []any{"SELECT"}}),
+		grant("table_space_role_all", map[string]any{"role": aclRoles[0], "schema": "test_schema", "object_type": "table", "privileges": []any{"SELECT"}}),
+		grant("table_backslash_role", map[string]any{"role": aclRoles[2], "schema": "test_schema", "object_type": "table", "objects": []any{"t2"}, "privileges": []any{"UPDATE"}}),
+		grant("table_unicode_role", map[string]any{"role": aclRoles[3], "schema": "test_schema", "object_type": "table", "objects": []any{"t2"}, "privileges": []any{"UPDATE"}}),
 		grant("table_all_privileges", map[string]any{"schema": "test_schema", "object_type": "table", "objects": []any{"t1"}, "privileges": []any{"ALL"}}),
 		grant("sequence", map[string]any{"schema": "test_schema", "object_type": "sequence", "privileges": []any{"USAGE"}}),
 		grant("sequence_s1", map[string]any{"schema": "test_schema", "object_type": "sequence", "objects": []any{"s1"}, "privileges": []any{"USAGE"}}),
 		grant("function_f", map[string]any{"schema": "test_schema", "object_type": "function", "objects": []any{"f"}, "privileges": []any{"EXECUTE"}}),
 		grant("function_f_signature", map[string]any{"schema": "test_schema", "object_type": "function", "objects": []any{"f(text)"}, "privileges": []any{"EXECUTE"}}),
-		grant("function_all", map[string]any{"schema": "test_schema", "object_type": "function", "privileges": []any{"EXECUTE"}}),
+		grant("function_all_drift", map[string]any{"schema": "test_schema", "object_type": "function", "privileges": []any{"EXECUTE"}}),
+		grant("function_h_no_grant", map[string]any{"schema": "test_schema", "object_type": "function", "objects": []any{"h"}, "privileges": []any{"EXECUTE"}}),
+		grant("routine_h_no_grant", map[string]any{"schema": "test_schema", "object_type": "routine", "objects": []any{"h"}, "privileges": []any{"EXECUTE"}}),
+		grant("procedure_h_no_grant", map[string]any{"schema": "test_schema", "object_type": "procedure", "objects": []any{"h"}, "privileges": []any{"EXECUTE"}}),
 		grant("procedure_all", map[string]any{"schema": "test_schema", "object_type": "procedure", "privileges": []any{"EXECUTE"}}),
 		grant("routine_p", map[string]any{"schema": "test_schema", "object_type": "routine", "objects": []any{"p"}, "privileges": []any{"EXECUTE"}}),
 		grant("schema", map[string]any{"schema": "test_schema", "object_type": "schema", "privileges": []any{"USAGE", "CREATE"}}),
 		grant("schema_drift", map[string]any{"schema": "test_schema", "object_type": "schema", "privileges": []any{"USAGE"}}),
 		grant("schema_public", map[string]any{"role": "public", "schema": "test_schema", "object_type": "schema", "privileges": []any{"USAGE"}}),
-		grant("schema_quoted_role", map[string]any{"role": aclFixtureRoles[1], "schema": "test_schema", "object_type": "schema", "privileges": []any{"USAGE"}}),
+		grant("schema_quoted_role", map[string]any{"role": aclRoles[1], "schema": "test_schema", "object_type": "schema", "privileges": []any{"USAGE"}}),
 		grant("database", map[string]any{"object_type": "database", "privileges": []any{"CONNECT", "TEMPORARY"}}),
 		grant("database_drift", map[string]any{"object_type": "database", "privileges": []any{"CONNECT"}}),
 		grant("database_public", map[string]any{"role": "public", "object_type": "database", "privileges": []any{"CONNECT"}}),
@@ -961,12 +981,11 @@ func TestAccPostgresqlGrantSnapshot_Lifecycle(t *testing.T) {
 				),
 			},
 			{
-				// An out-of-band revoke is drift for the next run (a new
-				// process starts without snapshots).
+				// An out-of-band revoke is drift for the next command: the
+				// provider is configured again and starts without snapshots.
 				PreConfig: func() {
 					dbExecute(t, config.connStr(dbName), fmt.Sprintf("REVOKE INSERT ON ALL TABLES IN SCHEMA test_schema FROM %s", pq.QuoteIdentifier(roleName)))
 					dbExecute(t, config.connStr(dbName), fmt.Sprintf("ALTER DEFAULT PRIVILEGES FOR ROLE %s IN SCHEMA test_schema REVOKE SELECT ON TABLES FROM %s", pq.QuoteIdentifier(config.Username), pq.QuoteIdentifier(roleName)))
-					clearCatalogSnapshots()
 				},
 				Config:             catalogSnapshotLifecycleConfig(dbName, roleName, config.Username, `"SELECT", "INSERT"`),
 				PlanOnly:           true,

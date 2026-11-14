@@ -745,7 +745,10 @@ func readRolePrivilegesFromSnapshot(snap *catalogSnapshot, db *DBConnection, d *
 	default:
 		ns, ok := snap.namespaces[schemaName]
 		schemaExists = ok
+		// candidates are the routines of the schema (no prokind filter, as
+		// the direct Read) or its relations, filtered by relkind.
 		var candidates []catalogObject
+		var relkind string
 		if ok {
 			switch objectType {
 			case "function", "procedure", "routine":
@@ -755,10 +758,10 @@ func readRolePrivilegesFromSnapshot(snap *catalogSnapshot, db *DBConnection, d *
 				}
 			default:
 				candidates = snap.relations[ns.oid]
+				relkind = objectTypes[objectType]
 			}
 		}
 
-		relkind := objectTypes[objectType]
 		for i := 0; i < len(candidates); i++ {
 			object := candidates[i]
 			if relkind != "" && object.kind != relkind {

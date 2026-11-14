@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -259,6 +260,9 @@ func (c *Config) connParams() []string {
 	for key, value := range params {
 		paramsArray = append(paramsArray, fmt.Sprintf("%s=%s", key, url.QueryEscape(value)))
 	}
+	// The connection string is the key of dbRegistry and of the catalog
+	// snapshots; map iteration order would make it differ between calls.
+	sort.Strings(paramsArray)
 
 	return paramsArray
 }

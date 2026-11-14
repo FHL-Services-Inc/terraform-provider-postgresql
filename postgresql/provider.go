@@ -447,6 +447,10 @@ func providerConfigure(d *schema.ResourceData) (any, error) {
 		}
 	}
 
+	// Terraform configures the provider at the start of every command, so a
+	// run never reads a catalog snapshot taken by a previous one.
+	invalidateCatalogSnapshots()
+
 	client := config.NewClient(d.Get("database").(string))
 	return client, nil
 }
