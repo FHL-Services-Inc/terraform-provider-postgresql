@@ -136,7 +136,7 @@ func resourcePostgreSQLDefaultPrivilegesCreate(db *DBConnection, d *schema.Resou
 	}
 	defer deferredRollback(txn)
 
-	if err := pgLockRole(txn, owner); err != nil {
+	if err := pgLockRole(db, txn, owner); err != nil {
 		return err
 	}
 
@@ -185,7 +185,7 @@ func resourcePostgreSQLDefaultPrivilegesDelete(db *DBConnection, d *schema.Resou
 	}
 	defer deferredRollback(txn)
 
-	if err := pgLockRole(txn, owner); err != nil {
+	if err := pgLockRole(db, txn, owner); err != nil {
 		return err
 	}
 

@@ -123,9 +123,9 @@ func TestGrantRoleLocksMember(t *testing.T) {
 
 	lockPrefix := []string{
 		"BEGIN",
-		"SET statement_timeout = 0",
+		"SET LOCAL statement_timeout = 0",
 		"SELECT pg_advisory_xact_lock(oid::bigint) FROM pg_roles WHERE rolname = $1 [member_role]",
-		"SELECT pg_advisory_xact_lock(member::bigint) FROM pg_auth_members JOIN pg_roles ON roleid = pg_roles.oid WHERE rolname = $1 [member_role]",
+		"SELECT pg_advisory_xact_lock(member::bigint) FROM pg_auth_members JOIN pg_roles ON roleid = pg_roles.oid WHERE rolname = $1 ORDER BY member [member_role]",
 	}
 
 	cases := []struct {

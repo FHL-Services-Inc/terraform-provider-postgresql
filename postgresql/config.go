@@ -253,6 +253,7 @@ type Config struct {
 	SSLClientCert                   *ClientCertificateConfig
 	SSLRootCertPath                 string
 	GCPIAMImpersonateServiceAccount string
+	AdvisoryLockTimeout             int
 }
 
 // Client struct holding connection string
