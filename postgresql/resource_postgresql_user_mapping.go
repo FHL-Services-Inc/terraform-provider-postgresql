@@ -105,20 +105,18 @@ func resourcePostgreSQLUserMappingReadImpl(db *DBConnection, d *schema.ResourceD
 	username := d.Get(userMappingUserNameAttr).(string)
 	serverName := d.Get(userMappingServerNameAttr).(string)
 
-	txn, err := startTransaction(db.client, "")
-	if err != nil {
-		return err
-	}
-	defer deferredRollback(txn)
-
 	var userMappingOptions []string
 	query := "SELECT umoptions FROM information_schema._pg_user_mappings WHERE authorization_identifier = $1 and foreign_server_name = $2"
-	err = txn.QueryRow(query, username, serverName).Scan(pq.Array(&userMappingOptions))
+	err := db.QueryRow(query, username, serverName).Scan(pq.Array(&userMappingOptions))
 
+	// pg_user_mappings shows umoptions only to the mapped role itself or to a
+	// superuser; anyone else gets NULL, even the owner of the server.
+	optionsMasked := false
 	if err != sql.ErrNoRows && err != nil {
 		// Fallback to pg_user_mappings table if information_schema._pg_user_mappings is not available
 		query := "SELECT umoptions FROM pg_user_mappings WHERE usename = $1 and srvname = $2"
-		err = txn.QueryRow(query, username, serverName).Scan(pq.Array(&userMappingOptions))
+		err = db.QueryRow(query, username, serverName).Scan(pq.Array(&userMappingOptions))
+		optionsMasked = err == nil && userMappingOptions == nil
 	}
 
 	switch {
@@ -130,15 +128,21 @@ func resourcePostgreSQLUserMappingReadImpl(db *DBConnection, d *schema.ResourceD
 		return fmt.Errorf("error reading user mapping: %w", err)
 	}
 
-	mappedOptions := make(map[string]any)
-	for _, v := range userMappingOptions {
-		pair := strings.SplitN(v, "=", 2)
-		mappedOptions[pair[0]] = pair[1]
-	}
-
 	d.Set(userMappingUserNameAttr, username)
 	d.Set(userMappingServerNameAttr, serverName)
-	d.Set(userMappingOptionsAttr, mappedOptions)
+	if optionsMasked {
+		// The options can't be read back, so keep the ones in state instead
+		// of reporting a permanent diff. Out-of-band changes to the options
+		// are not detected in this case.
+		log.Printf("[DEBUG] PostgreSQL user mapping (%s) for server (%s): options are not visible to the current user, keeping them from state", username, serverName)
+	} else {
+		mappedOptions := make(map[string]any)
+		for _, v := range userMappingOptions {
+			pair := strings.SplitN(v, "=", 2)
+			mappedOptions[pair[0]] = pair[1]
+		}
+		d.Set(userMappingOptionsAttr, mappedOptions)
+	}
 	d.SetId(generateUserMappingID(d))
 
 	return nil

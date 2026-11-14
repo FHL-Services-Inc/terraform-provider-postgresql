@@ -80,6 +80,87 @@ func TestAccPostgresqlUserMapping_Update(t *testing.T) {
 	})
 }
 
+// testUserMappingMaskedPreCheck skips unless the provider connects as a
+// non-superuser that may use the postgres_fdw wrapper. tests/switch_rds.sh and
+// tests/container_acc.sh (rds profile) set that up.
+func testUserMappingMaskedPreCheck(t *testing.T) {
+	client := testAccProvider.Meta().(*Client)
+	if client.config.Superuser {
+		t.Skip("Skip test: needs a non-superuser provider connection")
+	}
+	db, err := client.Connect()
+	if err != nil {
+		t.Fatalf("could not connect to database: %v", err)
+	}
+	var usable bool
+	if err := db.QueryRow(
+		"SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_foreign_data_wrapper WHERE fdwname = 'postgres_fdw' AND has_foreign_data_wrapper_privilege(oid, 'USAGE'))",
+	).Scan(&usable); err != nil {
+		t.Fatalf("could not check postgres_fdw: %v", err)
+	}
+	if !usable {
+		t.Skip("Skip test: postgres_fdw is not installed or not usable by the provider user")
+	}
+}
+
+// TestAccPostgresqlUserMapping_NonSuperuser covers a non-superuser provider
+// that owns the foreign server and manages the mapping of another role
+// (issue #43). information_schema._pg_user_mappings is not readable there and
+// pg_user_mappings hides the options, so Read must neither fail nor report a
+// permanent diff on options (each step's follow-up plan must be empty).
+func TestAccPostgresqlUserMapping_NonSuperuser(t *testing.T) {
+	resource.Test(t, resource.TestCase{
+		PreCheck: func() {
+			testAccPreCheck(t)
+			testCheckCompatibleVersion(t, featureServer)
+			testUserMappingMaskedPreCheck(t)
+		},
+		Providers:    testAccProviders,
+		CheckDestroy: testAccCheckPostgresqlUserMappingDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config: fmt.Sprintf(testAccPostgresqlUserMappingNonSuperuserConfig, "pass"),
+				Check: resource.ComposeTestCheckFunc(
+					testAccCheckPostgresqlUserMappingExists("postgresql_user_mapping.masked"),
+					resource.TestCheckResourceAttr("postgresql_user_mapping.masked", "options.%", "2"),
+					resource.TestCheckResourceAttr("postgresql_user_mapping.masked", "options.password", "pass"),
+				),
+			},
+			{
+				Config: fmt.Sprintf(testAccPostgresqlUserMappingNonSuperuserConfig, "passUpdated"),
+				Check: resource.ComposeTestCheckFunc(
+					testAccCheckPostgresqlUserMappingExists("postgresql_user_mapping.masked"),
+					resource.TestCheckResourceAttr("postgresql_user_mapping.masked", "options.password", "passUpdated"),
+				),
+			},
+		},
+	})
+}
+
+var testAccPostgresqlUserMappingNonSuperuserConfig = `
+resource "postgresql_server" "masked" {
+  server_name = "tf_tests_um_masked_srv"
+  fdw_name    = "postgres_fdw"
+  options = {
+    host   = "foo"
+    dbname = "foodb"
+  }
+}
+
+resource "postgresql_role" "masked" {
+  name = "tf_tests_um_masked_role"
+}
+
+resource "postgresql_user_mapping" "masked" {
+  server_name = postgresql_server.masked.server_name
+  user_name   = postgresql_role.masked.name
+  options = {
+    user     = "remote"
+    password = "%s"
+  }
+}
+`
+
 func checkUserMappingExists(txn *sql.Tx, username string, serverName string) (bool, error) {
 	var _rez bool
 	err := txn.QueryRow("SELECT TRUE FROM pg_user_mappings WHERE usename = $1 AND srvname = $2", username, serverName).Scan(&_rez)

@@ -55,3 +55,9 @@ Changing this value
   will force the creation of a new resource as this value can only be set
   when the user mapping is created.
 * `options` - (Optional) This clause specifies the options of the user mapping. The options typically define the actual user name and password of the mapping. Option names must be unique. The allowed option names and values are specific to the server's foreign-data wrapper.
+
+  When the provider connects as a non-superuser (e.g. the master user on AWS
+  RDS or Cloud SQL), PostgreSQL does not show the options of another role's
+  user mapping, even to the owner of the server. In that case the provider
+  keeps the options from the Terraform state, so changes made to them outside
+  of Terraform are not detected.
