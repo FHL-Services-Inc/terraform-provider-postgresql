@@ -25,11 +25,11 @@ import (
 // the ACL must be exploded per selected relation (LEFT JOIN LATERAL), not for
 // every relation of pg_class in a subquery that is then joined back: with
 // objects listed the planner re-ran that subquery once per matched relation.
+// The role and the schema are resolved in the same statement, which reports
+// whether each of them exists.
 func TestBuildReadTableRolePrivilegesQuery(t *testing.T) {
-	roleOID := uint32(1234)
-
 	emptyQuery, emptyArgs := buildReadTableRolePrivilegesQuery(
-		roleOID, "test_schema", ownerRelkinds["table"], schema.NewSet(schema.HashString, nil),
+		"test_role", "test_schema", ownerRelkinds["table"], schema.NewSet(schema.HashString, nil),
 	)
 	if strings.Contains(emptyQuery, "relname = ANY(") {
 		t.Fatalf("empty objects must not push a relname filter, got: %q", emptyQuery)
@@ -39,7 +39,7 @@ func TestBuildReadTableRolePrivilegesQuery(t *testing.T) {
 	}
 
 	objects := schema.NewSet(schema.HashString, []interface{}{"test_table", "test_table2"})
-	query, args := buildReadTableRolePrivilegesQuery(roleOID, "test_schema", ownerRelkinds["table"], objects)
+	query, args := buildReadTableRolePrivilegesQuery("test_role", "test_schema", ownerRelkinds["table"], objects)
 	if !strings.Contains(query, "AND c.relname = ANY($4)") {
 		t.Fatalf("explicit objects must push relname = ANY($4), got: %q", query)
 	}
@@ -48,20 +48,21 @@ func TestBuildReadTableRolePrivilegesQuery(t *testing.T) {
 	}
 
 	for _, q := range []string{emptyQuery, query} {
-		if !strings.Contains(q, "SELECT c.relname, array_remove(array_agg(a.privilege_type), NULL)") {
-			t.Fatalf("query changed its selected columns: %q", q)
-		}
-		if !strings.Contains(q, "LEFT JOIN LATERAL (\n    SELECT privilege_type FROM aclexplode(c.relacl) WHERE grantee = $1\n) a ON true") {
-			t.Fatalf("ACL must be exploded per selected relation: %q", q)
+		for _, want := range []string{
+			"SELECT r.oid IS NOT NULL, EXISTS (SELECT 1 FROM n), o.relname, o.privileges",
+			"WHEN $1::name = 'public' THEN 0::oid",
+			"SELECT oid FROM pg_namespace WHERE nspname = $2",
+			"SELECT c.relname, array_remove(array_agg(a.privilege_type), NULL) AS privileges",
+			"LEFT JOIN LATERAL (\n        SELECT privilege_type FROM aclexplode(c.relacl) WHERE grantee = r.oid\n    ) a ON true",
+			"WHERE c.relkind = ANY($3)",
+			"GROUP BY c.relname",
+		} {
+			if !strings.Contains(q, want) {
+				t.Fatalf("query missing %q:\n%s", want, q)
+			}
 		}
 		if strings.Count(q, "pg_class") != 1 {
 			t.Fatalf("query must scan pg_class once: %q", q)
-		}
-		if !strings.Contains(q, "WHERE n.nspname = $2 AND c.relkind = ANY($3)") {
-			t.Fatalf("query missing schema/relkind filter: %q", q)
-		}
-		if !strings.Contains(q, "GROUP BY c.relname") {
-			t.Fatalf("query missing GROUP BY c.relname: %q", q)
 		}
 	}
 }
@@ -72,6 +73,8 @@ func TestBuildReadTableRolePrivilegesQuery(t *testing.T) {
 // "table" that includes views, materialized views and partitioned tables), with the
 // privileges granted to the role, and an empty array for relations with a NULL
 // ACL or an ACL without an entry for the role. PUBLIC is read with grantee 0.
+// Every row carries the role_exists/schema_exists flags; with no matching
+// relation a single row with a NULL relation is returned.
 func TestAccPostgresqlGrantReadTablePrivilegesQuery(t *testing.T) {
 	skipIfNotAcc(t)
 
@@ -112,72 +115,84 @@ func TestAccPostgresqlGrantReadTablePrivilegesQuery(t *testing.T) {
 		}
 	}
 
-	roleOID, err := getRoleOID(db, roleName)
-	if err != nil {
-		t.Fatal(err)
-	}
-
 	cases := []struct {
-		name     string
-		roleOID  uint32
-		schema   string
-		relkinds []string
-		objects  []any
-		expected map[string][]string
+		name         string
+		role         string
+		schema       string
+		relkinds     []string
+		objects      []any
+		roleExists   bool
+		schemaExists bool
+		expected     map[string][]string
 	}{
 		{
-			name: "all tables", roleOID: roleOID, schema: "test_schema", relkinds: ownerRelkinds["table"],
+			name: "all tables", role: roleName, schema: "test_schema", relkinds: ownerRelkinds["table"], roleExists: true, schemaExists: true,
 			expected: map[string][]string{
 				"t_default": {}, "t_granted": {"INSERT", "SELECT"}, "t_public": {}, "t_revoked": {},
 				"v_granted": {"SELECT"}, "m_default": {}, "p_granted": {"SELECT", "UPDATE"},
 			},
 		},
 		{
-			name: "listed tables", roleOID: roleOID, schema: "test_schema", relkinds: ownerRelkinds["table"],
+			name: "listed tables", role: roleName, schema: "test_schema", relkinds: ownerRelkinds["table"], roleExists: true, schemaExists: true,
 			objects:  []any{"t_granted", "t_default", "t_missing"},
 			expected: map[string][]string{"t_default": {}, "t_granted": {"INSERT", "SELECT"}},
 		},
 		{
-			name: "listed view and partitioned table", roleOID: roleOID, schema: "test_schema", relkinds: ownerRelkinds["table"],
+			name: "listed view and partitioned table", role: roleName, schema: "test_schema", relkinds: ownerRelkinds["table"], roleExists: true, schemaExists: true,
 			objects:  []any{"v_granted", "p_granted"},
 			expected: map[string][]string{"v_granted": {"SELECT"}, "p_granted": {"SELECT", "UPDATE"}},
 		},
 		{
-			name: "listed table with ACL but no entry for the role", roleOID: roleOID, schema: "test_schema", relkinds: ownerRelkinds["table"],
+			name: "listed table with ACL but no entry for the role", role: roleName, schema: "test_schema", relkinds: ownerRelkinds["table"],
+			roleExists: true, schemaExists: true,
 			objects:  []any{"t_revoked"},
 			expected: map[string][]string{"t_revoked": {}},
 		},
 		{
-			name: "public", roleOID: 0, schema: "test_schema", relkinds: ownerRelkinds["table"],
+			name: "public", role: "public", schema: "test_schema", relkinds: ownerRelkinds["table"], roleExists: true, schemaExists: true,
 			expected: map[string][]string{
 				"t_default": {}, "t_granted": {}, "t_public": {"SELECT"}, "t_revoked": {},
 				"v_granted": {}, "m_default": {}, "p_granted": {},
 			},
 		},
 		{
-			name: "listed public", roleOID: 0, schema: "test_schema", relkinds: ownerRelkinds["table"],
+			name: "listed public", role: "public", schema: "test_schema", relkinds: ownerRelkinds["table"], roleExists: true, schemaExists: true,
 			objects:  []any{"t_public"},
 			expected: map[string][]string{"t_public": {"SELECT"}},
 		},
 		{
-			name: "all sequences", roleOID: roleOID, schema: "test_schema", relkinds: ownerRelkinds["sequence"],
+			name: "all sequences", role: roleName, schema: "test_schema", relkinds: ownerRelkinds["sequence"], roleExists: true, schemaExists: true,
 			expected: map[string][]string{"s_default": {}, "s_granted": {"USAGE"}},
 		},
 		{
-			name: "listed sequences", roleOID: roleOID, schema: "test_schema", relkinds: ownerRelkinds["sequence"],
+			name: "listed sequences", role: roleName, schema: "test_schema", relkinds: ownerRelkinds["sequence"], roleExists: true, schemaExists: true,
 			objects:  []any{"s_granted"},
 			expected: map[string][]string{"s_granted": {"USAGE"}},
 		},
 		{
-			name: "other schema", roleOID: roleOID, schema: "dev_schema", relkinds: ownerRelkinds["table"],
+			name: "other schema", role: roleName, schema: "dev_schema", relkinds: ownerRelkinds["table"], roleExists: true, schemaExists: true,
 			expected: map[string][]string{"t_granted": {"UPDATE"}},
+		},
+		{
+			name: "only missing objects listed", role: roleName, schema: "test_schema", relkinds: ownerRelkinds["table"], roleExists: true, schemaExists: true,
+			objects:  []any{"t_missing"},
+			expected: map[string][]string{},
+		},
+		{
+			name: "missing role", role: roleName + "_missing", schema: "test_schema", relkinds: ownerRelkinds["table"], roleExists: false, schemaExists: true,
+			objects:  []any{"t_granted"},
+			expected: map[string][]string{"t_granted": {}},
+		},
+		{
+			name: "missing schema", role: roleName, schema: "missing_schema", relkinds: ownerRelkinds["table"], roleExists: true, schemaExists: false,
+			expected: map[string][]string{},
 		},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			query, args := buildReadTableRolePrivilegesQuery(
-				tc.roleOID, tc.schema, tc.relkinds, schema.NewSet(schema.HashString, tc.objects),
+				tc.role, tc.schema, tc.relkinds, schema.NewSet(schema.HashString, tc.objects),
 			)
 			rows, err := db.Query(query, args...)
 			if err != nil {
@@ -190,21 +205,33 @@ func TestAccPostgresqlGrantReadTablePrivilegesQuery(t *testing.T) {
 			}()
 
 			got := map[string][]string{}
+			nRows := 0
 			for rows.Next() {
-				var objName string
+				nRows++
+				var roleExists, schemaExists bool
+				var objName sql.NullString
 				var privileges pq.ByteaArray
-				if err := rows.Scan(&objName, &privileges); err != nil {
+				if err := rows.Scan(&roleExists, &schemaExists, &objName, &privileges); err != nil {
 					t.Fatalf("could not scan row: %v", err)
+				}
+				if roleExists != tc.roleExists || schemaExists != tc.schemaExists {
+					t.Fatalf("role_exists, schema_exists = %t, %t; want %t, %t", roleExists, schemaExists, tc.roleExists, tc.schemaExists)
+				}
+				if !objName.Valid {
+					continue
 				}
 				privs := make([]string, 0, len(privileges))
 				for _, p := range privileges {
 					privs = append(privs, string(p))
 				}
 				sort.Strings(privs)
-				got[objName] = privs
+				got[objName.String] = privs
 			}
 			if err := rows.Err(); err != nil {
 				t.Fatalf("could not read rows: %v", err)
+			}
+			if nRows == 0 {
+				t.Fatalf("query must always return at least one row (the existence flags)")
 			}
 
 			if !reflect.DeepEqual(got, tc.expected) {
