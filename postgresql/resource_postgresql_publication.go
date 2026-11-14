@@ -274,17 +274,18 @@ func resourcePostgreSQLPublicationReadImpl(db *DBConnection, d *schema.ResourceD
 		return fmt.Errorf("could not get publication name: %w", err)
 	}
 
-	txn, err := startTransaction(db.client, database)
+	// Both SELECTs run directly on the database connection: under READ
+	// COMMITTED a read-only transaction gives them no common snapshot and
+	// only costs BEGIN/ROLLBACK round-trips.
+	dbc, err := initConnection(db.client, database)
 	if err != nil {
 		if isDatabaseDoesNotExistError(err) {
 			log.Printf("[WARN] PostgreSQL database (%s) not found, removing publication (%s) from state", database, PublicationName)
 			d.SetId("")
 			return nil
 		}
-		// startTransaction already provides context; avoid double-wrapping.
 		return err
 	}
-	defer deferredRollback(txn)
 
 	var tables []string
 	var publishParams []string
@@ -309,11 +310,15 @@ func resourcePostgreSQLPublicationReadImpl(db *DBConnection, d *schema.ResourceD
 	}
 
 	query := fmt.Sprintf("SELECT %s FROM pg_catalog.pg_publication as p join pg_catalog.pg_roles as r on p.pubowner = r.oid WHERE pubname = $1", strings.Join(columns, ", "))
-	err = txn.QueryRow(query, PublicationName).Scan(values...)
+	err = dbc.QueryRow(query, PublicationName).Scan(values...)
 
 	switch {
 	case err == sql.ErrNoRows:
 		log.Printf("[WARN] PostgreSQL Publication (%s) not found for database %s", PublicationName, database)
+		d.SetId("")
+		return nil
+	case isDatabaseDoesNotExistError(err):
+		log.Printf("[WARN] PostgreSQL database (%s) not found, removing publication (%s) from state", database, PublicationName)
 		d.SetId("")
 		return nil
 	case err != nil:
@@ -324,7 +329,7 @@ func resourcePostgreSQLPublicationReadImpl(db *DBConnection, d *schema.ResourceD
 		`FROM pg_catalog.pg_publication_tables ` +
 		`WHERE pubname = $1`
 
-	rows, err := txn.Query(query, PublicationName)
+	rows, err := dbc.Query(query, PublicationName)
 	if err != nil {
 		return fmt.Errorf("could not get publication tables: %w", err)
 	}
