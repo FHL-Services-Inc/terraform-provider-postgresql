@@ -208,6 +208,12 @@ type Config struct {
 	SSLClientCert                   *ClientCertificateConfig
 	SSLRootCertPath                 string
 	GCPIAMImpersonateServiceAccount string
+
+	// AuthTokens, when set, supplies the password of every new connection
+	// for the "postgres" scheme (AWS RDS IAM and Azure AD tokens), and
+	// Password is left empty, so the DSN and the dbRegistry key carry no
+	// token. It is a pointer: all Clients of a provider share the cache.
+	AuthTokens *authTokenSource
 }
 
 // Client struct holding connection string
@@ -412,7 +418,9 @@ func (c *Client) connectWithRetry(ctx context.Context, postgresDriverName, dsn s
 
 	connectRetryTimeout := time.Duration(c.config.ConnectionRetryTimeoutSeconds) * time.Second
 	retryError := retry.RetryContext(ctx, connectRetryTimeout, func() *retry.RetryError {
-		if c.config.Scheme == "postgres" {
+		if c.config.Scheme == "postgres" && c.config.AuthTokens != nil {
+			db, err = c.config.openTokenAuthDB(dsn)
+		} else if c.config.Scheme == "postgres" {
 			db, err = sql.Open(postgresDriverName, dsn)
 		} else if c.config.Scheme == "gcppostgres" && c.config.GCPIAMImpersonateServiceAccount != "" {
 			db, err = openImpersonatedGCPDBConnection(ctx, dsn, c.config.GCPIAMImpersonateServiceAccount)
@@ -445,7 +453,12 @@ func (c *Client) connectWithRetry(ctx context.Context, postgresDriverName, dsn s
 		if _, ok := errors.AsType[*pq.Error](retryError); ok {
 			return nil, fmt.Errorf("error connecting to PostgreSQL server %s (scheme: %s): %w", c.config.Host, c.config.Scheme, retryError)
 		}
-		errString := strings.Replace(retryError.Error(), c.config.Password, "XXXX", 2)
+		// On the auth token path Password is empty and the connector has
+		// already redacted the token.
+		errString := retryError.Error()
+		if c.config.Password != "" {
+			errString = strings.Replace(errString, c.config.Password, "XXXX", 2)
+		}
 		return nil, fmt.Errorf("error connecting to PostgreSQL server %s (scheme: %s): %s", c.config.Host, c.config.Scheme, errString)
 	}
 
