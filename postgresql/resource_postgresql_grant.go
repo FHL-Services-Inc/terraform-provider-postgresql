@@ -38,7 +38,7 @@ var objectTypes = map[string]string{
 type ResourceSchemeGetter func(string) any
 
 func resourcePostgreSQLGrant() *schema.Resource {
-	return &schema.Resource{
+	r := &schema.Resource{
 		Create: PGResourceFunc(resourcePostgreSQLGrantCreate),
 		Update: PGResourceFunc(resourcePostgreSQLGrantUpdate),
 		Read:   PGResourceFunc(resourcePostgreSQLGrantRead),
@@ -105,6 +105,15 @@ func resourcePostgreSQLGrant() *schema.Resource {
 			},
 		},
 	}
+
+	// Version 1 changed the ID of column grants to carry the privilege.
+	r.SchemaVersion = 1
+	r.StateUpgraders = []schema.StateUpgrader{{
+		Version: 0,
+		Type:    (&schema.Resource{Schema: r.Schema}).CoreConfigSchema().ImpliedType(),
+		Upgrade: upgradeGrantStateV0,
+	}}
+	return r
 }
 
 func resourcePostgreSQLGrantRead(db *DBConnection, d *schema.ResourceData) error {
@@ -809,6 +818,10 @@ func checkRoleDBSchemaExists(db *DBConnection, d *schema.ResourceData) (bool, er
 }
 
 func generateGrantID(d *schema.ResourceData) string {
+	if d.Get("object_type").(string) == "column" {
+		return generateColumnGrantID(d)
+	}
+
 	parts := []string{d.Get("role").(string), d.Get("database").(string)}
 
 	objectType := d.Get("object_type").(string)

@@ -17,6 +17,8 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"net/url"
+	"sort"
 	"strings"
 
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
@@ -34,6 +36,7 @@ type importCatalog interface {
 	existingDatabases(names []string) (map[string]bool, error)
 	existingSchemas(database string, names []string) (map[string]bool, error)
 	existingObjects(database, pgSchema, objectType string, names []string) (map[string]bool, error)
+	existingColumns(database, pgSchema, table string, names []string) (map[string]bool, error)
 }
 
 func joinIDTokens(tokens []string) string {
@@ -115,6 +118,9 @@ var grantImportSchemaLevelTypes = []string{"schema", "table", "sequence", "funct
 type grantImportID struct {
 	role, database, schema, objectType string
 	objects                            []string
+	// column grants only
+	columns   []string
+	privilege string
 }
 
 func (g grantImportID) String() string {
@@ -267,7 +273,7 @@ func parseGrantImportID(id string, cat importCatalog) (grantImportID, error) {
 		}
 		return fail(ambiguousImportError(descr))
 	case sawColumn:
-		return fail(fmt.Errorf("importing grants with object_type column is not supported: the ID does not identify the privilege"))
+		return fail(fmt.Errorf("column grants are imported with the ID %s", columnGrantImportFormat))
 	default:
 		return fail(errImportNoMatch)
 	}
@@ -280,7 +286,13 @@ func resourcePostgreSQLGrantImport(ctx context.Context, d *schema.ResourceData, 
 		return nil, err
 	}
 
-	g, err := parseGrantImportID(d.Id(), &sqlImportCatalog{db: db})
+	cat := &sqlImportCatalog{db: db}
+	var g grantImportID
+	if isColumnGrantID(d.Id()) {
+		g, err = parseColumnGrantImportID(d.Id(), cat)
+	} else {
+		g, err = parseGrantImportID(d.Id(), cat)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -309,6 +321,19 @@ func resourcePostgreSQLGrantImport(ctx context.Context, d *schema.ResourceData, 
 		}
 		if err := d.Set(k, v); err != nil {
 			return nil, fmt.Errorf("could not set %s: %w", k, err)
+		}
+	}
+	if g.objectType == "column" {
+		// Read needs the privilege of a column grant; it is part of the ID.
+		columns := make([]any, 0, len(g.columns))
+		for _, c := range g.columns {
+			columns = append(columns, c)
+		}
+		if err := d.Set("columns", columns); err != nil {
+			return nil, fmt.Errorf("could not set columns: %w", err)
+		}
+		if err := d.Set("privileges", []any{g.privilege}); err != nil {
+			return nil, fmt.Errorf("could not set privileges: %w", err)
 		}
 	}
 	d.SetId(generateGrantID(d))
@@ -342,6 +367,10 @@ func readImportedGrantOption(db *DBConnection, g grantImportID) (bool, error) {
 	case "foreign_server":
 		query = `FROM pg_foreign_server s, aclexplode(s.srvacl) a WHERE s.srvname = $2`
 		args = append(args, g.objects[0])
+	case "column":
+		query = `FROM pg_attribute at JOIN pg_class c ON c.oid = at.attrelid JOIN pg_namespace n ON n.oid = c.relnamespace, aclexplode(at.attacl) a
+WHERE n.nspname = $2 AND c.relname = $3 AND at.attname = ANY($4) AND a.privilege_type = $5`
+		args = append(args, g.schema, g.objects[0], pq.Array(g.columns), g.privilege)
 	case "function", "procedure", "routine":
 		query = `FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace, aclexplode(p.proacl) a WHERE n.nspname = $2`
 		args = append(args, g.schema)
@@ -707,6 +736,21 @@ func (c *sqlImportCatalog) existingSchemas(database string, names []string) (map
 	return out, nil
 }
 
+func (c *sqlImportCatalog) existingColumns(database, pgSchema, table string, names []string) (map[string]bool, error) {
+	conn, err := initConnection(c.db.client, database)
+	if err != nil {
+		return nil, err
+	}
+	out, err := queryExistingNames(conn, `
+SELECT attname FROM pg_attribute
+JOIN pg_class c ON c.oid = attrelid JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE nspname = $1 AND relname = $2 AND attnum > 0 AND NOT attisdropped AND attname = ANY($3)`, pgSchema, table, pq.Array(names))
+	if err != nil {
+		return nil, fmt.Errorf("could not look up columns of %s.%s in database %s: %w", pgSchema, table, database, err)
+	}
+	return out, nil
+}
+
 func (c *sqlImportCatalog) existingObjects(database, pgSchema, objectType string, names []string) (map[string]bool, error) {
 	conn, err := initConnection(c.db.client, database)
 	if err != nil {
@@ -747,4 +791,170 @@ WHERE nspname = $1 AND relkind::text = ANY($2) AND relname = ANY($3)`, pgSchema,
 		return nil, fmt.Errorf("could not look up %s objects in database %s: %w", objectType, database, err)
 	}
 	return out, nil
+}
+
+// Column grants
+//
+// A column grant is one privilege on some columns of one table, so two column
+// grants on the same columns can differ only by privilege. Their ID carries
+// the privilege and uses "/" and "," as separators, with "%", "/" and ","
+// percent-escaped in names, so it can be parsed without the catalog.
+
+const columnGrantImportFormat = "<role>/<database>/<schema>/column/<table>/<column>[,<column>...]/<privilege>"
+
+var columnGrantPrivileges = []string{"SELECT", "INSERT", "UPDATE", "REFERENCES"}
+
+var columnGrantIDEscaper = strings.NewReplacer("%", "%25", "/", "%2F", ",", "%2C")
+
+// columnGrantID builds the ID of a column grant. Columns are sorted so the ID
+// doesn't depend on their order.
+func columnGrantID(role, database, pgSchema, table string, columns []string, privilege string) string {
+	escaped := make([]string, 0, len(columns))
+	for _, c := range columns {
+		escaped = append(escaped, columnGrantIDEscaper.Replace(c))
+	}
+	sort.Strings(escaped)
+	return strings.Join([]string{
+		columnGrantIDEscaper.Replace(role),
+		columnGrantIDEscaper.Replace(database),
+		columnGrantIDEscaper.Replace(pgSchema),
+		"column",
+		columnGrantIDEscaper.Replace(table),
+		strings.Join(escaped, ","),
+		privilege,
+	}, "/")
+}
+
+func generateColumnGrantID(d *schema.ResourceData) string {
+	table := ""
+	if objects := d.Get("objects").(*schema.Set).List(); len(objects) > 0 {
+		table = objects[0].(string)
+	}
+	privilege := ""
+	if privileges := d.Get("privileges").(*schema.Set).List(); len(privileges) > 0 {
+		privilege = privileges[0].(string)
+	}
+	columns := []string{}
+	for _, c := range d.Get("columns").(*schema.Set).List() {
+		columns = append(columns, c.(string))
+	}
+	return columnGrantID(d.Get("role").(string), d.Get("database").(string), d.Get("schema").(string), table, columns, privilege)
+}
+
+// isColumnGrantID reports whether id has the shape of a column grant ID.
+func isColumnGrantID(id string) bool {
+	parts := strings.Split(id, "/")
+	return len(parts) == 7 && parts[3] == "column"
+}
+
+func parseColumnGrantImportID(id string, cat importCatalog) (grantImportID, error) {
+	fail := func(err error) (grantImportID, error) {
+		return grantImportID{}, importParseError("postgresql_grant", id, columnGrantImportFormat, err)
+	}
+
+	parts := strings.Split(id, "/")
+	if !isColumnGrantID(id) {
+		return fail(fmt.Errorf("not a column grant ID"))
+	}
+	unescape := func(s string) (string, error) {
+		v, err := url.PathUnescape(s)
+		if err != nil {
+			return "", fmt.Errorf("invalid escape in %q: %w", s, err)
+		}
+		return v, nil
+	}
+
+	var fields [5]string
+	for i, p := range []int{0, 1, 2, 4} {
+		v, err := unescape(parts[p])
+		if err != nil {
+			return fail(err)
+		}
+		fields[i] = v
+	}
+	role, database, pgSchema, table := fields[0], fields[1], fields[2], fields[3]
+
+	if parts[5] == "" {
+		return fail(fmt.Errorf("no columns"))
+	}
+	columns := []string{}
+	for _, c := range strings.Split(parts[5], ",") {
+		v, err := unescape(c)
+		if err != nil {
+			return fail(err)
+		}
+		columns = append(columns, v)
+	}
+	sort.Strings(columns)
+
+	privilege := strings.ToUpper(parts[6])
+	if !sliceContainsStr(columnGrantPrivileges, privilege) {
+		return fail(fmt.Errorf("unknown column privilege %q (one of %s)", parts[6], strings.Join(columnGrantPrivileges, ", ")))
+	}
+
+	if ok, err := cat.existingRoles([]string{role}); err != nil {
+		return fail(err)
+	} else if !ok[role] {
+		return fail(fmt.Errorf("role %q does not exist", role))
+	}
+	if ok, err := cat.existingDatabases([]string{database}); err != nil {
+		return fail(err)
+	} else if !ok[database] {
+		return fail(fmt.Errorf("database %q does not exist", database))
+	}
+	if ok, err := cat.existingSchemas(database, []string{pgSchema}); err != nil {
+		return fail(err)
+	} else if !ok[pgSchema] {
+		return fail(fmt.Errorf("schema %q does not exist in database %q", pgSchema, database))
+	}
+	if ok, err := cat.existingObjects(database, pgSchema, "table", []string{table}); err != nil {
+		return fail(err)
+	} else if !ok[table] {
+		return fail(fmt.Errorf("table %q does not exist in schema %q", table, pgSchema))
+	}
+	existing, err := cat.existingColumns(database, pgSchema, table, columns)
+	if err != nil {
+		return fail(err)
+	}
+	for _, c := range columns {
+		if !existing[c] {
+			return fail(fmt.Errorf("column %q does not exist in table %s.%s", c, pgSchema, table))
+		}
+	}
+
+	return grantImportID{
+		role: role, database: database, schema: pgSchema, objectType: "column",
+		objects: []string{table}, columns: columns, privilege: privilege,
+	}, nil
+}
+
+// upgradeGrantStateV0 rewrites the ID of column grants to the column grant
+// ID format, which carries the privilege. Other grants keep their ID.
+func upgradeGrantStateV0(_ context.Context, rawState map[string]any, _ any) (map[string]any, error) {
+	if rawState == nil || rawState["object_type"] != "column" {
+		return rawState, nil
+	}
+	strs := func(key string) []string {
+		out := []string{}
+		if list, ok := rawState[key].([]any); ok {
+			for _, v := range list {
+				if s, ok := v.(string); ok {
+					out = append(out, s)
+				}
+			}
+		}
+		return out
+	}
+	str := func(key string) string {
+		s, _ := rawState[key].(string)
+		return s
+	}
+	objects, privileges := strs("objects"), strs("privileges")
+	if len(objects) != 1 || len(privileges) != 1 {
+		// not a valid column grant (Create enforces exactly one of each);
+		// leave it to Read
+		return rawState, nil
+	}
+	rawState["id"] = columnGrantID(str("role"), str("database"), str("schema"), objects[0], strs("columns"), privileges[0])
+	return rawState, nil
 }

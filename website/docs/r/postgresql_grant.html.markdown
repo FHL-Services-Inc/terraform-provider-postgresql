@@ -83,8 +83,15 @@ Use `public` as the role for grants to `PUBLIC`. As names may contain `_`
 themselves, the provider resolves the ID against the roles, databases, schemas
 and objects that exist on the server; the import fails if no split of the ID
 matches, or if more than one does (e.g. both `a_b` and `a` + `b` are tables of
-the schema). Grants with `object_type = "column"` cannot be imported: their ID
-does not identify the privilege.
+the schema).
+
+Grants with `object_type = "column"` have their own ID, which includes the
+privilege (two column grants on the same columns differ only by it):
+`<role>/<database>/<schema>/column/<table>/<column>[,<column>...]/<privilege>`.
+Columns can be listed in any order; `%`, `/` and `,` in names are written as
+`%25`, `%2F` and `%2C`. Column grants created with an earlier provider version
+had an `_`-joined ID without the privilege; their state is upgraded to the new
+ID automatically.
 
 `privileges` and `with_grant_option` are read from the server. For a grant
 without `objects`, `privileges` is read from the objects of the schema the
@@ -105,6 +112,11 @@ import {
 import {
   to = postgresql_grant.connect_db
   id = "readonly_role_test_db_database"
+}
+
+import {
+  to = postgresql_grant.insert_columns
+  id = "test_role/test_db/public/column/table1/col1,col2/INSERT"
 }
 ```
 
