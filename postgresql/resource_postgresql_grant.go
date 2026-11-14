@@ -195,13 +195,7 @@ func resourcePostgreSQLGrantCreateOrUpdate(db *DBConnection, d *schema.ResourceD
 		// Revoke all privileges before granting otherwise reducing privileges will not work.
 		// We just have to revoke them in the same transaction so the role will not lose its
 		// privileges between the revoke and grant statements.
-		if err := revokeRolePrivileges(txn, d, usePrevious); err != nil {
-			return err
-		}
-		if err := grantRolePrivileges(txn, d); err != nil {
-			return err
-		}
-		return nil
+		return revokeAndGrantRolePrivileges(txn, d, usePrevious)
 	}); err != nil {
 		return err
 	}
@@ -716,38 +710,58 @@ func createRevokeQuery(getter ResourceSchemeGetter) string {
 	return query
 }
 
-func grantRolePrivileges(txn *sql.Tx, d *schema.ResourceData) error {
+// revokeAndGrantRolePrivileges runs the REVOKE and then the GRANT of the
+// resource in one round-trip. Both are plain strings with every name quoted
+// (no bind parameters), so lib/pq sends them together over the simple query
+// protocol; PostgreSQL runs them in order inside the caller's transaction and
+// stops at the first failing one.
+func revokeAndGrantRolePrivileges(txn *sql.Tx, d *schema.ResourceData, usePrevious bool) error {
+	var stmts []string
+	if query := createRevokeQuery(revokeGetter(d, usePrevious)); len(query) > 0 {
+		stmts = append(stmts, query)
+	}
+	if privileges := grantPrivileges(d); len(privileges) > 0 {
+		stmts = append(stmts, createGrantQuery(d, privileges))
+	} else {
+		log.Printf("[DEBUG] no privileges to grant for role %s in database: %s,", d.Get("role").(string), d.Get("database"))
+	}
+	if len(stmts) == 0 {
+		return nil
+	}
+
+	if _, err := txn.Exec(strings.Join(stmts, ";\n")); err != nil {
+		return fmt.Errorf("could not execute revoke/grant query: %w", err)
+	}
+	return nil
+}
+
+func grantPrivileges(d *schema.ResourceData) []string {
 	privileges := []string{}
 	for _, priv := range d.Get("privileges").(*schema.Set).List() {
 		privileges = append(privileges, priv.(string))
 	}
+	return privileges
+}
 
-	if len(privileges) == 0 {
-		log.Printf("[DEBUG] no privileges to grant for role %s in database: %s,", d.Get("role").(string), d.Get("database"))
-		return nil
+// revokeGetter returns the attribute getter for the REVOKE: with usePrevious
+// it reads the previous value of changed attributes, so an update revokes
+// what was granted before.
+func revokeGetter(d *schema.ResourceData, usePrevious bool) ResourceSchemeGetter {
+	if !usePrevious {
+		return d.Get
 	}
+	return func(name string) any {
+		if d.HasChange(name) {
+			old, _ := d.GetChange(name)
+			return old
+		}
 
-	query := createGrantQuery(d, privileges)
-
-	_, err := txn.Exec(query)
-	return err
+		return d.Get(name)
+	}
 }
 
 func revokeRolePrivileges(txn *sql.Tx, d *schema.ResourceData, usePrevious bool) error {
-	getter := d.Get
-
-	if usePrevious {
-		getter = func(name string) any {
-			if d.HasChange(name) {
-				old, _ := d.GetChange(name)
-				return old
-			}
-
-			return d.Get(name)
-		}
-	}
-
-	query := createRevokeQuery(getter)
+	query := createRevokeQuery(revokeGetter(d, usePrevious))
 	if len(query) == 0 {
 		// Query is empty, don't run anything
 		return nil

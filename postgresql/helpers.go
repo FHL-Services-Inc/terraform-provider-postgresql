@@ -602,78 +602,76 @@ func getRoleOID(db QueryAble, role string) (uint32, error) {
 
 // Lock a role and all his members to avoid concurrent updates on some resources
 func pgLockRole(db *DBConnection, txn *sql.Tx, role string) error {
-	return withAdvisoryLockTimeout(db, txn, "role", role, func() error {
-		if _, err := txn.Exec("SELECT pg_advisory_xact_lock(oid::bigint) FROM pg_roles WHERE rolname = $1", role); err != nil {
-			return fmt.Errorf("could not get advisory lock for role %s: %w", role, err)
-		}
-
+	literal := pq.QuoteLiteral(role)
+	return execAdvisoryLock(db, txn, "role", role,
+		fmt.Sprintf("could not get advisory lock for role %s", role),
+		"SELECT pg_advisory_xact_lock(oid::bigint) FROM pg_roles WHERE rolname = "+literal,
 		// Members are locked in OID order so that concurrent transactions
 		// touching overlapping member sets acquire them in the same order.
-		if _, err := txn.Exec(
-			"SELECT pg_advisory_xact_lock(member::bigint) FROM pg_auth_members JOIN pg_roles ON roleid = pg_roles.oid WHERE rolname = $1 ORDER BY member",
-			role,
-		); err != nil {
-			return fmt.Errorf("could not get advisory lock for members of role %s: %w", role, err)
-		}
-		return nil
-	})
+		"SELECT pg_advisory_xact_lock(member::bigint) FROM pg_auth_members JOIN pg_roles ON roleid = pg_roles.oid WHERE rolname = "+literal+" ORDER BY member",
+	)
 }
 
 // Lock a database and all his members to avoid concurrent updates on some resources
 func pgLockDatabase(db *DBConnection, txn *sql.Tx, database string) error {
-	return withAdvisoryLockTimeout(db, txn, "database", database, func() error {
-		if _, err := txn.Exec("SELECT pg_advisory_xact_lock(oid::bigint) FROM pg_database WHERE datname = $1", database); err != nil {
-			return fmt.Errorf("could not get advisory lock for database %s: %w", database, err)
-		}
-		return nil
-	})
+	return execAdvisoryLock(db, txn, "database", database,
+		fmt.Sprintf("could not get advisory lock for database %s", database),
+		"SELECT pg_advisory_xact_lock(oid::bigint) FROM pg_database WHERE datname = "+pq.QuoteLiteral(database),
+	)
 }
 
-// withAdvisoryLockTimeout runs acquire (which takes transaction-scoped advisory
-// locks) with statement_timeout disabled for the rest of the transaction.
+// savedLockTimeoutSetting is a custom (placeholder) setting used to carry the
+// caller's lock_timeout across the advisory lock statements, so it can be
+// restored without a round-trip to read it first.
+const savedLockTimeoutSetting = "terraform_provider_postgresql.saved_lock_timeout"
+
+// execAdvisoryLock takes the transaction-scoped advisory locks of lockStmts
+// with statement_timeout disabled for the rest of the transaction.
 //
 // When the provider's advisory_lock_timeout is > 0, lock_timeout is set to that
-// value only while acquire runs and the previous value is restored afterwards,
-// so the statements executed later in the transaction keep their usual lock
-// waits. A lock wait that exceeds the limit is reported as a clear error naming
-// the contended object. With the default of 0 the wait is unbounded, as before.
+// value only while the locks are acquired and the previous value (whatever it
+// was in this transaction, session or role) is restored afterwards, so the
+// statements executed later in the transaction keep their usual lock waits.
+// A lock wait that exceeds the limit is reported as a clear error naming the
+// contended object. With the default of 0 the wait is unbounded, as before.
 //
-// Both settings use SET LOCAL so they never outlive the transaction on a
-// pooled connection.
-func withAdvisoryLockTimeout(db *DBConnection, txn *sql.Tx, kind, name string, acquire func() error) error {
-	// Disable statement timeout for this transaction otherwise the lock could fail
-	if _, err := txn.Exec("SET LOCAL statement_timeout = 0"); err != nil {
-		return fmt.Errorf("could not disable statement_timeout: %w", err)
-	}
-
+// All settings use SET LOCAL / set_config(..., true) so they never outlive
+// the transaction on a pooled connection.
+//
+// Everything is sent as a single multi-statement string, which lib/pq runs
+// over the simple query protocol in one round-trip. That protocol takes no
+// bind parameters, so callers must pass statements with names already quoted
+// as literals (pq.QuoteLiteral). If a statement fails, PostgreSQL skips the
+// rest and the error of the failing statement is returned; the transaction is
+// aborted either way, so nothing needs to be restored.
+func execAdvisoryLock(db *DBConnection, txn *sql.Tx, kind, name, errPrefix string, lockStmts ...string) error {
 	timeoutMs := db.client.config.AdvisoryLockTimeout
-	if timeoutMs <= 0 {
-		return acquire()
+
+	// Disable statement timeout for this transaction otherwise the lock could fail
+	stmts := []string{"SET LOCAL statement_timeout = 0"}
+	if timeoutMs > 0 {
+		stmts = append(stmts,
+			fmt.Sprintf("SELECT set_config('%s', current_setting('lock_timeout'), true)", savedLockTimeoutSetting),
+			// timeoutMs is an int validated >= 0 by the provider schema.
+			fmt.Sprintf("SET LOCAL lock_timeout = %d", timeoutMs),
+		)
+	}
+	stmts = append(stmts, lockStmts...)
+	if timeoutMs > 0 {
+		stmts = append(stmts,
+			fmt.Sprintf("SELECT set_config('lock_timeout', current_setting('%s'), true)", savedLockTimeoutSetting),
+		)
 	}
 
-	var previous string
-	if err := txn.QueryRow("SELECT current_setting('lock_timeout')").Scan(&previous); err != nil {
-		return fmt.Errorf("could not read lock_timeout: %w", err)
-	}
-	// timeoutMs is an int validated >= 0 by the provider schema, SET does not
-	// accept bind parameters.
-	if _, err := txn.Exec(fmt.Sprintf("SET LOCAL lock_timeout = %d", timeoutMs)); err != nil {
-		return fmt.Errorf("could not set lock_timeout: %w", err)
-	}
-
-	if err := acquire(); err != nil {
-		if isLockTimeoutError(err) {
+	if _, err := txn.Exec(strings.Join(stmts, ";\n")); err != nil {
+		if timeoutMs > 0 && isLockTimeoutError(err) {
 			return fmt.Errorf(
 				"timed out after %dms waiting for advisory lock on %s %q: another Terraform run or session holds it; "+
 					"retry, serialize the applies, or raise the provider advisory_lock_timeout (0 waits indefinitely): %w",
 				timeoutMs, kind, name, err,
 			)
 		}
-		return err
-	}
-
-	if _, err := txn.Exec("SELECT set_config('lock_timeout', $1, true)", previous); err != nil {
-		return fmt.Errorf("could not restore lock_timeout: %w", err)
+		return fmt.Errorf("%s: %w", errPrefix, err)
 	}
 	return nil
 }
