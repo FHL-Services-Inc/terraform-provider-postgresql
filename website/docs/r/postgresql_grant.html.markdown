@@ -28,15 +28,26 @@ resource "postgresql_grant" "readonly_tables" {
   privileges  = ["SELECT"]
 }
 
-# Grant SELECT & INSERT privileges on 2 columns in 1 table
-resource "postgresql_grant" "read_insert_column" {
+# Grant UPDATE and INSERT on 2 columns in 1 table
+# (a column grant takes exactly one privilege)
+resource "postgresql_grant" "update_columns" {
   database    = "test_db"
   role        = "test_role"
   schema      = "public"
   object_type = "column"
   objects     = ["table1"]
   columns     = ["col1", "col2"]
-  privileges  = ["UPDATE", "INSERT"]
+  privileges  = ["UPDATE"]
+}
+
+resource "postgresql_grant" "insert_columns" {
+  database    = "test_db"
+  role        = "test_role"
+  schema      = "public"
+  object_type = "column"
+  objects     = ["table1"]
+  columns     = ["col1", "col2"]
+  privileges  = ["INSERT"]
 }
 ```
 
