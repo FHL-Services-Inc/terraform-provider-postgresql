@@ -50,6 +50,7 @@ const (
 	featureCreateRoleSelfGrant
 	featureSecurityLabel
 	featureMaintainPrivilege
+	featureAuthMembersSetOption
 )
 
 var (
@@ -129,6 +130,9 @@ var (
 
 		// MAINTAIN privilege on tables (PG 17+)
 		featureMaintainPrivilege: semver.MustParseRange(">=17.0.0"),
+
+		// pg_auth_members has a set_option column (PG 16+)
+		featureAuthMembersSetOption: semver.MustParseRange(">=16.0.0"),
 	}
 )
 
@@ -140,6 +144,57 @@ type DBConnection struct {
 	// version is the version number of the database as determined by parsing the
 	// output of `SELECT VERSION()`.x
 	version semver.Version
+
+	// sessionRole memoizes the login role of this pool and its rolsuper
+	// attribute; see sessionRoleMemo.
+	sessionRole sessionRoleMemo
+}
+
+// sessionRoleMemo caches CURRENT_USER and its rolsuper attribute for one
+// DBConnection. A DBConnection is keyed by DSN, so its login role is fixed
+// for its whole lifetime; only successful lookups are stored, and a lookup
+// racing with another one just stores the same value twice.
+type sessionRoleMemo struct {
+	mu             sync.Mutex
+	user           string
+	userKnown      bool
+	superuser      bool
+	superuserKnown bool
+}
+
+// currentUser returns the session user, querying it on q the first time.
+// q should be the transaction the caller already holds, so the first lookup
+// does not need a second connection from the pool.
+func (db *DBConnection) currentUser(q QueryAble) (string, error) {
+	db.sessionRole.mu.Lock()
+	user, known := db.sessionRole.user, db.sessionRole.userKnown
+	db.sessionRole.mu.Unlock()
+	if known {
+		return user, nil
+	}
+
+	user, err := getCurrentUser(q)
+	if err != nil {
+		return "", err
+	}
+
+	db.sessionRole.mu.Lock()
+	db.sessionRole.user, db.sessionRole.userKnown = user, true
+	db.sessionRole.mu.Unlock()
+	return user, nil
+}
+
+// cachedSuperuser returns the memoized rolsuper of the session user, if known.
+func (db *DBConnection) cachedSuperuser() (superuser, known bool) {
+	db.sessionRole.mu.Lock()
+	defer db.sessionRole.mu.Unlock()
+	return db.sessionRole.superuser, db.sessionRole.superuserKnown
+}
+
+func (db *DBConnection) storeSuperuser(superuser bool) {
+	db.sessionRole.mu.Lock()
+	defer db.sessionRole.mu.Unlock()
+	db.sessionRole.superuser, db.sessionRole.superuserKnown = superuser, true
 }
 
 // featureSupported returns true if a given feature is supported or not. This is
@@ -157,12 +212,17 @@ func (db *DBConnection) featureSupported(name featureName) bool {
 
 // isSuperuser returns true if connected user is a Postgres SUPERUSER
 func (db *DBConnection) isSuperuser() (bool, error) {
+	if superuser, known := db.cachedSuperuser(); known {
+		return superuser, nil
+	}
+
 	var superuser bool
 
 	if err := db.QueryRow("SELECT rolsuper FROM pg_roles WHERE rolname = CURRENT_USER").Scan(&superuser); err != nil {
 		return false, fmt.Errorf("could not check if current user is superuser: %w", err)
 	}
 
+	db.storeSuperuser(superuser)
 	return superuser, nil
 }
 
@@ -326,9 +386,9 @@ func (c *Client) Connect() (*DBConnection, error) {
 	}
 
 	conn = &DBConnection{
-		db,
-		c,
-		*version,
+		DB:      db,
+		client:  c,
+		version: *version,
 	}
 
 	dbRegistryLock.Lock()

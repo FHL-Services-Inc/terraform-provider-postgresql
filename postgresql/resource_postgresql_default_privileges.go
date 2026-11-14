@@ -156,7 +156,7 @@ func resourcePostgreSQLDefaultPrivilegesCreate(db *DBConnection, d *schema.Resou
 	}
 
 	// Needed in order to set the owner of the db if the connection user is not a superuser
-	if err := withRolesGranted(txn, []string{owner}, func() error {
+	if err := withRolesGranted(db, txn, []string{owner}, func() error {
 
 		// Revoke all privileges before granting otherwise reducing privileges will not work.
 		// We just have to revoke them in the same transaction so role will not lose its privileges
@@ -211,7 +211,7 @@ func resourcePostgreSQLDefaultPrivilegesDelete(db *DBConnection, d *schema.Resou
 	}
 
 	// Needed in order to set the owner of the db if the connection user is not a superuser
-	if err := withRolesGranted(txn, []string{owner}, func() error {
+	if err := withRolesGranted(db, txn, []string{owner}, func() error {
 		return revokeRoleDefaultPrivileges(txn, d)
 	}); err != nil {
 		return err
