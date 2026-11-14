@@ -6,9 +6,6 @@ import (
 	"os"
 	"time"
 
-	"github.com/aws/aws-sdk-go-v2/credentials"
-	"github.com/aws/aws-sdk-go-v2/service/sts"
-
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
 
@@ -16,10 +13,6 @@ import (
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/validation"
 	"golang.org/x/oauth2/google"
-
-	"github.com/aws/aws-sdk-go-v2/aws"
-	awsConfig "github.com/aws/aws-sdk-go-v2/config"
-	"github.com/aws/aws-sdk-go-v2/feature/rds/auth"
 )
 
 const (
@@ -270,73 +263,6 @@ func validateExpectedVersion(v any, key string) (warnings []string, errors []err
 	return
 }
 
-// getRDSAuthToken builds an RDS IAM auth token and returns it with its expiry:
-// the presigned URL's own expiry, or earlier if the signing credentials expire
-// first (the token stops working with them).
-func getRDSAuthToken(ctx context.Context, region string, profile string, role string, username string, host string, port int) (string, time.Time, error) {
-	endpoint := fmt.Sprintf("%s:%d", host, port)
-
-	var awscfg aws.Config
-	var err error
-	// sessionExpiry is when the assumed role session ends: the static
-	// credentials provider built from it doesn't know.
-	var sessionExpiry *time.Time
-
-	if profile != "" {
-		awscfg, err = awsConfig.LoadDefaultConfig(ctx, awsConfig.WithSharedConfigProfile(profile))
-	} else if region != "" {
-		awscfg, err = awsConfig.LoadDefaultConfig(ctx, awsConfig.WithRegion(region))
-	} else {
-		awscfg, err = awsConfig.LoadDefaultConfig(ctx)
-	}
-	if err != nil {
-		return "", time.Time{}, err
-	}
-
-	if role != "" {
-		stsClient := sts.NewFromConfig(awscfg)
-		roleInput := &sts.AssumeRoleInput{
-			RoleArn:         aws.String(role),
-			RoleSessionName: aws.String("TerraformPostgresqlProvider"),
-		}
-
-		roleOutput, err := stsClient.AssumeRole(ctx, roleInput)
-		if err != nil {
-			return "", time.Time{}, fmt.Errorf("could not assume AWS role: %w", err)
-		}
-
-		awscfg, err = awsConfig.LoadDefaultConfig(ctx,
-			awsConfig.WithCredentialsProvider(
-				aws.NewCredentialsCache(credentials.NewStaticCredentialsProvider(
-					*roleOutput.Credentials.AccessKeyId,
-					*roleOutput.Credentials.SecretAccessKey,
-					*roleOutput.Credentials.SessionToken,
-				)),
-			),
-		)
-		if err != nil {
-			return "", time.Time{}, fmt.Errorf("could not load AWS default config: %w", err)
-		}
-		sessionExpiry = roleOutput.Credentials.Expiration
-	}
-
-	issuedAt := time.Now()
-	token, err := auth.BuildAuthToken(ctx, endpoint, awscfg.Region, username, awscfg.Credentials)
-	if err != nil {
-		return "", time.Time{}, err
-	}
-	expiresAt := rdsAuthTokenExpiry(token, issuedAt)
-	if sessionExpiry != nil && sessionExpiry.Before(expiresAt) {
-		expiresAt = *sessionExpiry
-	}
-	// BuildAuthToken retrieved the credentials through the cache, so this
-	// doesn't call out again.
-	if creds, err := awscfg.Credentials.Retrieve(ctx); err == nil && creds.CanExpire && creds.Expires.Before(expiresAt) {
-		expiresAt = creds.Expires
-	}
-	return token, expiresAt, nil
-}
-
 func createGoogleCredsFileIfNeeded() error {
 	if _, err := google.FindDefaultCredentials(context.Background()); err == nil {
 		return nil
@@ -408,9 +334,8 @@ func providerConfigure(d *schema.ResourceData) (any, error) {
 		profile := d.Get("aws_rds_iam_profile").(string)
 		region := d.Get("aws_rds_iam_region").(string)
 		role := d.Get("aws_rds_iam_provider_role_arn").(string)
-		authTokens = newAuthTokenSource("AWS RDS IAM", func(ctx context.Context) (string, time.Time, error) {
-			return getRDSAuthToken(ctx, region, profile, role, username, host, port)
-		})
+		authTokens = newAuthTokenSource("AWS RDS IAM",
+			newRDSAuthTokenFetcher(region, profile, role, username, host, port).fetch)
 	} else if d.Get("azure_identity_auth").(bool) {
 		tenantId := d.Get("azure_tenant_id").(string)
 		if tenantId == "" {
@@ -430,10 +355,10 @@ func providerConfigure(d *schema.ResourceData) (any, error) {
 		if err != nil {
 			return nil, err
 		}
-		if scheme != "postgres" {
-			// The gocloud schemes open their connections themselves from the
-			// DSN, so the token can't be refreshed per connection there; keep
-			// passing the first one as the password.
+		if !supportsAuthTokens(scheme) {
+			// gcppostgres opens its connections itself from the DSN, so the
+			// token can't be refreshed per connection there; keep passing
+			// the first one as the password.
 			password = token
 			authTokens = nil
 		}

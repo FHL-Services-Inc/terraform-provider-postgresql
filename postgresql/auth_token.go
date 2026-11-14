@@ -154,12 +154,16 @@ func newTokenAuthConnector(dsn string, tokens *authTokenSource, dialer pq.Dialer
 	if err != nil {
 		return nil, err
 	}
+	return newTokenAuthConnectorConfig(cfg, tokens, dialer), nil
+}
+
+func newTokenAuthConnectorConfig(cfg pq.Config, tokens *authTokenSource, dialer pq.Dialer) *tokenAuthConnector {
 	return &tokenAuthConnector{
 		cfg:    cfg,
 		tokens: tokens,
 		dialer: dialer,
 		open:   openPQConn,
-	}, nil
+	}
 }
 
 func openPQConn(ctx context.Context, cfg pq.Config, dialer pq.Dialer) (driver.Conn, error) {
@@ -196,15 +200,34 @@ func (c *tokenAuthConnector) Connect(ctx context.Context) (driver.Conn, error) {
 // Driver implements driver.Connector.
 func (c *tokenAuthConnector) Driver() driver.Driver { return &pq.Driver{} }
 
-// newPostgresConnector returns the connector used for the "postgres" scheme
-// when an auth token source is configured: connections are dialed through
-// proxyDriver (honoring ALL_PROXY / HTTPS_PROXY) and authenticated with a
-// fresh token.
+// newPostgresConnector returns the connector used when an auth token source
+// is configured. Connections are authenticated with a fresh token and
+// dialed:
+//   - for "postgres", through proxyDriver (honoring ALL_PROXY / HTTPS_PROXY);
+//   - for "awspostgres", through rdsTLSDialer, as gocloud's awspostgres does
+//     (gocloud keeps its connector private, so it can't be given a token).
 func (c *Config) newPostgresConnector(dsn string) (driver.Connector, error) {
-	return newTokenAuthConnector(dsn, c.AuthTokens, proxyDriver{})
+	switch c.Scheme {
+	case "postgres":
+		return newTokenAuthConnector(dsn, c.AuthTokens, proxyDriver{})
+	case "awspostgres":
+		cfg, err := awsPostgresConfig(dsn)
+		if err != nil {
+			return nil, err
+		}
+		return newTokenAuthConnectorConfig(cfg, c.AuthTokens, newRDSTLSDialer()), nil
+	default:
+		return nil, fmt.Errorf("auth tokens are not supported with scheme %q", c.Scheme)
+	}
 }
 
-// openTokenAuthDB opens a pool for the "postgres" scheme whose connections
+// supportsAuthTokens reports whether connections for scheme can be
+// authenticated with a token per connection (see newPostgresConnector).
+func supportsAuthTokens(scheme string) bool {
+	return scheme == "postgres" || scheme == "awspostgres"
+}
+
+// openTokenAuthDB opens a pool whose connections
 // authenticate with tokens from c.AuthTokens.
 func (c *Config) openTokenAuthDB(dsn string) (*sql.DB, error) {
 	connector, err := c.newPostgresConnector(dsn)

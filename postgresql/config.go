@@ -210,7 +210,8 @@ type Config struct {
 	GCPIAMImpersonateServiceAccount string
 
 	// AuthTokens, when set, supplies the password of every new connection
-	// for the "postgres" scheme (AWS RDS IAM and Azure AD tokens), and
+	// for the "postgres" and "awspostgres" schemes (AWS RDS IAM and Azure AD
+	// tokens, see newPostgresConnector), and
 	// Password is left empty, so the DSN and the dbRegistry key carry no
 	// token. It is a pointer: all Clients of a provider share the cache.
 	AuthTokens *authTokenSource
@@ -418,7 +419,7 @@ func (c *Client) connectWithRetry(ctx context.Context, postgresDriverName, dsn s
 
 	connectRetryTimeout := time.Duration(c.config.ConnectionRetryTimeoutSeconds) * time.Second
 	retryError := retry.RetryContext(ctx, connectRetryTimeout, func() *retry.RetryError {
-		if c.config.Scheme == "postgres" && c.config.AuthTokens != nil {
+		if c.config.AuthTokens != nil {
 			db, err = c.config.openTokenAuthDB(dsn)
 		} else if c.config.Scheme == "postgres" {
 			db, err = sql.Open(postgresDriverName, dsn)
