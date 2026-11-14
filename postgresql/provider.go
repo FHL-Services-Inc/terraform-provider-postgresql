@@ -3,6 +3,7 @@ package postgresql
 import (
 	"context"
 	"fmt"
+	"log"
 	"os"
 
 	"github.com/aws/aws-sdk-go-v2/credentials"
@@ -24,6 +25,8 @@ import (
 const (
 	defaultProviderMaxOpenConnections            = 20
 	defaultProviderMaxIdleConnections            = 0
+	defaultProviderMaxTotalConnections           = 0 // no endpoint budget
+	defaultProviderConnectTimeoutSeconds         = 180
 	defaultProviderConnMaxLifetimeSeconds        = 0 // unlimited
 	defaultProviderMaxConnRetries                = 0
 	defaultProviderConnectionRetryTimeoutSeconds = 5
@@ -186,7 +189,7 @@ func Provider() *schema.Provider {
 			"connect_timeout": {
 				Type:         schema.TypeInt,
 				Optional:     true,
-				DefaultFunc:  schema.EnvDefaultFunc("PGCONNECT_TIMEOUT", 180),
+				DefaultFunc:  schema.EnvDefaultFunc("PGCONNECT_TIMEOUT", defaultProviderConnectTimeoutSeconds),
 				Description:  "Maximum wait for connection, in seconds. Zero or not specified means wait indefinitely.",
 				ValidateFunc: validation.IntAtLeast(-1),
 			},
@@ -216,6 +219,13 @@ func Provider() *schema.Provider {
 				Optional:     true,
 				DefaultFunc:  schema.EnvDefaultFunc("PGMAXIDLECONNECTIONS", defaultProviderMaxIdleConnections),
 				Description:  "Maximum number of idle connections kept open per database for reuse. Zero (the default) means connections are closed after each use. Capped to max_connections when the latter is non-zero.",
+				ValidateFunc: validation.IntAtLeast(0),
+			},
+			"max_total_connections": {
+				Type:         schema.TypeInt,
+				Optional:     true,
+				DefaultFunc:  schema.EnvDefaultFunc("PGMAXTOTALCONNECTIONS", defaultProviderMaxTotalConnections),
+				Description:  "Maximum number of connections open at once to the server, across all databases (per host, port and user). Zero (the default) means no limit beyond max_connections per database. Only applies to the postgres scheme.",
 				ValidateFunc: validation.IntAtLeast(0),
 			},
 			"conn_max_lifetime_seconds": {
@@ -419,6 +429,7 @@ func providerConfigure(d *schema.ResourceData) (any, error) {
 		ConnectionRetryTimeoutSeconds:   d.Get("connection_retry_timeout_seconds").(int),
 		MaxConns:                        d.Get("max_connections").(int),
 		MaxIdleConns:                    d.Get("max_idle_connections").(int),
+		MaxTotalConns:                   d.Get("max_total_connections").(int),
 		ConnMaxLifetimeSeconds:          d.Get("conn_max_lifetime_seconds").(int),
 		ExpectedVersion:                 version,
 		SSLRootCertPath:                 d.Get("sslrootcert").(string),
@@ -433,6 +444,10 @@ func providerConfigure(d *schema.ResourceData) (any, error) {
 				SSLInline:       spec["sslinline"].(bool),
 			}
 		}
+	}
+
+	if config.MaxTotalConns > 0 && config.Scheme != "postgres" {
+		log.Printf("[WARN] max_total_connections is only supported with the postgres scheme, ignoring it for %s", config.Scheme)
 	}
 
 	if config.Scheme == "gcppostgres" {

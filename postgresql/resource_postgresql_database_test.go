@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"os"
 	"strconv"
 	"testing"
 
@@ -636,6 +637,210 @@ func testAccCheckDBConnectionRegistered(dbName string, want bool) resource.TestC
 
 		if found != want {
 			return fmt.Errorf("connection to database %q registered = %t, want %t", dbName, found, want)
+		}
+		return nil
+	}
+}
+
+// singleConnProviderFactories lets a step config carry its own provider block
+// (max_connections), which Providers does not.
+var singleConnProviderFactories = map[string]func() (*schema.Provider, error){
+	"postgresql": func() (*schema.Provider, error) { return testAccProvider, nil },
+}
+
+// TestAccPostgresqlDatabase_OwnerMaxConnectionsOne creates, re-owns and drops
+// a database with an owner while the provider may open a single connection.
+// Owner handling takes the role advisory lock and grants/revokes the owner
+// membership; all of that has to run on one connection, otherwise the
+// operation waits forever for a second connection from an exhausted pool.
+func TestAccPostgresqlDatabase_OwnerMaxConnectionsOne(t *testing.T) {
+	skipIfNotAcc(t)
+
+	config := getTestConfig(t)
+
+	// dbRegistry is process-wide and keyed by DSN, so a pool opened by an
+	// earlier test (with the default max_connections) would be reused here.
+	// A connect_timeout unique to this test gives the provider its own pools.
+	const providerConfig = `
+provider "postgresql" {
+  max_connections = 1
+  connect_timeout = 178
+}
+
+resource "postgresql_role" "owner1" {
+  name = "tf_tests_single_conn_owner1"
+}
+
+resource "postgresql_role" "owner2" {
+  name = "tf_tests_single_conn_owner2"
+}
+`
+	dbConfig := func(owner string) string {
+		return providerConfig + fmt.Sprintf(`
+resource "postgresql_database" "db" {
+  name  = "tf_tests_single_conn_db"
+  owner = postgresql_role.%s.name
+}
+`, owner)
+	}
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:          func() { testAccPreCheck(t) },
+		ProviderFactories: singleConnProviderFactories,
+		CheckDestroy:      testAccCheckPostgresqlDatabaseDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config: dbConfig("owner1"),
+				Check: resource.ComposeTestCheckFunc(
+					testAccCheckPostgresqlDatabaseExists("postgresql_database.db"),
+					resource.TestCheckResourceAttr("postgresql_database.db", "owner", "tf_tests_single_conn_owner1"),
+					checkUserMembership(t, config.Username, "tf_tests_single_conn_owner1", false),
+				),
+			},
+			{
+				// ALTER DATABASE OWNER also needs membership in the current
+				// owner, which setDBOwner does not grant, so a non-superuser
+				// cannot change the owner here (same without max_connections).
+				SkipFunc: func() (bool, error) { return os.Getenv("PGSUPERUSER") == "false", nil },
+				Config:   dbConfig("owner2"),
+				Check: resource.ComposeTestCheckFunc(
+					testAccCheckPostgresqlDatabaseExists("postgresql_database.db"),
+					resource.TestCheckResourceAttr("postgresql_database.db", "owner", "tf_tests_single_conn_owner2"),
+					checkUserMembership(t, config.Username, "tf_tests_single_conn_owner2", false),
+				),
+			},
+			{
+				// Drop the database but keep the roles, so the membership
+				// check still has something to look at.
+				Config: providerConfig,
+				Check: resource.ComposeTestCheckFunc(
+					testAccCheckDatabaseGone("tf_tests_single_conn_db"),
+					checkUserMembership(t, config.Username, "tf_tests_single_conn_owner2", false),
+				),
+			},
+		},
+	})
+}
+
+// TestAccPostgresqlDatabase_AlterObjectOwnershipMaxConnectionsOne is the
+// alter_object_ownership variant of the test above (REASSIGN OWNED needs a
+// superuser here, like TestAccPostgresqlDatabase_AlterObjectOwnership).
+func TestAccPostgresqlDatabase_AlterObjectOwnershipMaxConnectionsOne(t *testing.T) {
+	skipIfNotAcc(t)
+
+	const providerConfig = `
+provider "postgresql" {
+  max_connections = 1
+  connect_timeout = 177
+}
+
+resource "postgresql_role" "owner1" {
+  name = "tf_tests_single_conn_reassign1"
+}
+
+resource "postgresql_role" "owner2" {
+  name = "tf_tests_single_conn_reassign2"
+}
+`
+	dbConfig := func(owner string) string {
+		return providerConfig + fmt.Sprintf(`
+resource "postgresql_database" "db" {
+  name                   = "tf_tests_single_conn_reassign_db"
+  owner                  = postgresql_role.%s.name
+  alter_object_ownership = true
+}
+`, owner)
+	}
+
+	resource.Test(t, resource.TestCase{
+		PreCheck: func() {
+			testAccPreCheck(t)
+			testSuperuserPreCheck(t)
+		},
+		ProviderFactories: singleConnProviderFactories,
+		CheckDestroy:      testAccCheckPostgresqlDatabaseDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config: dbConfig("owner1"),
+				Check:  testAccCheckPostgresqlDatabaseExists("postgresql_database.db"),
+			},
+			{
+				Config: dbConfig("owner2"),
+				Check: resource.ComposeTestCheckFunc(
+					testAccCheckPostgresqlDatabaseExists("postgresql_database.db"),
+					resource.TestCheckResourceAttr("postgresql_database.db", "owner", "tf_tests_single_conn_reassign2"),
+				),
+			},
+		},
+	})
+}
+
+// TestAccPostgresqlDatabase_OwnerMaxConnectionsTwo creates and drops two
+// databases with an owner concurrently with max_connections = 2: both
+// operations compete for the same role advisory lock, and the holder must not
+// need a connection the waiter is sitting on.
+func TestAccPostgresqlDatabase_OwnerMaxConnectionsTwo(t *testing.T) {
+	skipIfNotAcc(t)
+
+	config := getTestConfig(t)
+
+	const providerConfig = `
+provider "postgresql" {
+  max_connections = 2
+  connect_timeout = 176
+}
+
+resource "postgresql_role" "owner" {
+  name = "tf_tests_two_conns_owner"
+}
+`
+	dbConfig := providerConfig + `
+resource "postgresql_database" "a" {
+  name  = "tf_tests_two_conns_db_a"
+  owner = postgresql_role.owner.name
+}
+
+resource "postgresql_database" "b" {
+  name  = "tf_tests_two_conns_db_b"
+  owner = postgresql_role.owner.name
+}
+`
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:          func() { testAccPreCheck(t) },
+		ProviderFactories: singleConnProviderFactories,
+		CheckDestroy:      testAccCheckPostgresqlDatabaseDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config: dbConfig,
+				Check: resource.ComposeTestCheckFunc(
+					testAccCheckPostgresqlDatabaseExists("postgresql_database.a"),
+					testAccCheckPostgresqlDatabaseExists("postgresql_database.b"),
+					checkUserMembership(t, config.Username, "tf_tests_two_conns_owner", false),
+				),
+			},
+			{
+				Config: providerConfig,
+				Check: resource.ComposeTestCheckFunc(
+					testAccCheckDatabaseGone("tf_tests_two_conns_db_a"),
+					testAccCheckDatabaseGone("tf_tests_two_conns_db_b"),
+					checkUserMembership(t, config.Username, "tf_tests_two_conns_owner", false),
+				),
+			},
+		},
+	})
+}
+
+// testAccCheckDatabaseGone checks that a database dropped by a previous step
+// no longer exists on the server.
+func testAccCheckDatabaseGone(dbName string) resource.TestCheckFunc {
+	return func(*terraform.State) error {
+		exists, err := checkDatabaseExists(testAccProvider.Meta().(*Client), dbName)
+		if err != nil {
+			return fmt.Errorf("error checking db %s", err)
+		}
+		if exists {
+			return fmt.Errorf("database %q still exists after destroy", dbName)
 		}
 		return nil
 	}

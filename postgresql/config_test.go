@@ -120,7 +120,7 @@ func TestConnectWithRetrySucceedsAfterTransientFailures(t *testing.T) {
 	drv := &flakyPingDriver{failuresBeforeSuccess: 2}
 	c := newFlakyClient("flaky-retry-success", drv, 5, 5)
 
-	db, err := c.connectWithRetry(context.Background(), "flaky-retry-success", "dsn")
+	db, err := c.connectWithRetry(context.Background(), openDriver("flaky-retry-success"), "dsn")
 	if err != nil {
 		t.Fatalf("connectWithRetry() returned unexpected error: %v", err)
 	}
@@ -135,7 +135,7 @@ func TestConnectWithRetryGivesUpAfterMaxConnRetries(t *testing.T) {
 	drv := &flakyPingDriver{failuresBeforeSuccess: 100}
 	c := newFlakyClient("flaky-retry-exhausted", drv, 3, 30)
 
-	_, err := c.connectWithRetry(context.Background(), "flaky-retry-exhausted", "dsn")
+	_, err := c.connectWithRetry(context.Background(), openDriver("flaky-retry-exhausted"), "dsn")
 	if err == nil {
 		t.Fatal("connectWithRetry() expected an error, got nil")
 	}
@@ -257,6 +257,11 @@ func TestConfigEvictDBConnection(t *testing.T) {
 	}
 }
 
+// openDriver opens pools with the registered database/sql driver name.
+func openDriver(name string) func(string) (*sql.DB, error) {
+	return func(dsn string) (*sql.DB, error) { return sql.Open(name, dsn) }
+}
+
 // gatedDialDriver is a fake driver that counts physical dials and blocks every
 // Ping until release is closed, so concurrent Connect() calls overlap.
 type gatedDialDriver struct {
@@ -317,7 +322,7 @@ func TestConnectConcurrentCallsDialOnce(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			conns[i], errs[i] = config.NewClient("db").connect(context.Background(), "connect-singleflight-test")
+			conns[i], errs[i] = config.NewClient("db").connect(context.Background(), openDriver("connect-singleflight-test"))
 		}()
 	}
 
@@ -366,10 +371,10 @@ func TestConnectDoesNotCacheErrors(t *testing.T) {
 		}
 	})
 
-	if _, err := config.NewClient("db").connect(context.Background(), "connect-no-error-cache-test"); err == nil {
+	if _, err := config.NewClient("db").connect(context.Background(), openDriver("connect-no-error-cache-test")); err == nil {
 		t.Fatal("first connect() expected an error, got nil")
 	}
-	if _, err := config.NewClient("db").connect(context.Background(), "connect-no-error-cache-test"); err != nil {
+	if _, err := config.NewClient("db").connect(context.Background(), openDriver("connect-no-error-cache-test")); err != nil {
 		t.Fatalf("second connect() returned unexpected error, the first error was cached: %v", err)
 	}
 	if got := drv.attempts.Load(); got != 2 {
