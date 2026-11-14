@@ -95,22 +95,7 @@ func resourcePostgreSQLDefaultPrivilegesRead(db *DBConnection, d *schema.Resourc
 		)
 	}
 
-	exists, err := checkRoleDBSchemaExists(db, d)
-	if err != nil {
-		return err
-	}
-	if !exists {
-		d.SetId("")
-		return nil
-	}
-
-	txn, err := startTransaction(db.client, d.Get("database").(string))
-	if err != nil {
-		return err
-	}
-	defer deferredRollback(txn)
-
-	return readRoleDefaultPrivileges(txn, db, d)
+	return readRoleDefaultPrivileges(db, d)
 }
 
 func resourcePostgreSQLDefaultPrivilegesCreate(db *DBConnection, d *schema.ResourceData) error {
@@ -179,13 +164,7 @@ func resourcePostgreSQLDefaultPrivilegesCreate(db *DBConnection, d *schema.Resou
 
 	d.SetId(generateDefaultPrivilegesID(d))
 
-	txn, err = startTransaction(db.client, d.Get("database").(string))
-	if err != nil {
-		return err
-	}
-	defer deferredRollback(txn)
-
-	return readRoleDefaultPrivileges(txn, db, d)
+	return readRoleDefaultPrivileges(db, d)
 }
 
 func resourcePostgreSQLDefaultPrivilegesDelete(db *DBConnection, d *schema.ResourceData) error {
@@ -224,53 +203,85 @@ func resourcePostgreSQLDefaultPrivilegesDelete(db *DBConnection, d *schema.Resou
 	return nil
 }
 
-func readRoleDefaultPrivileges(txn *sql.Tx, db *DBConnection, d *schema.ResourceData) error {
-	role := d.Get("role").(string)
-	owner := d.Get("owner").(string)
+// buildReadRoleDefaultPrivilegesQuery builds the default privileges Read query.
+// It returns one row: role_exists, schema_exists (true when no schema is set)
+// and the default privileges the owner grants to the role (NULL when none).
+//
+// pg_default_acl is filtered on its unique key (defaclrole, defaclnamespace,
+// defaclobjtype) before the ACL is exploded, and the owner is matched by OID.
+// aclexplode(defaclacl) always reports defaclrole as the grantor, so this is the
+// same entry the previous filter on pg_get_userbyid(grantor) = owner selected,
+// without calling that function for every default ACL item. A missing owner
+// matches no entry, exactly as before.
+func buildReadRoleDefaultPrivilegesQuery(d *schema.ResourceData) (string, []any) {
 	pgSchema := d.Get("schema").(string)
-	objectType := d.Get("object_type").(string)
+	args := []any{
+		d.Get("role").(string),
+		d.Get("owner").(string),
+		objectTypes[d.Get("object_type").(string)],
+	}
+
+	namespace, schemaExists, withSchema := "0", "true", ""
+	if pgSchema != "" {
+		withSchema = `,
+n AS (SELECT oid FROM pg_namespace WHERE nspname = $4)`
+		namespace, schemaExists = "(SELECT oid FROM n)", "EXISTS (SELECT 1 FROM n)"
+		args = append(args, pgSchema)
+	}
+
+	query := grantReadRoleCTE + `,
+o AS (SELECT oid FROM pg_roles WHERE rolname = $2)` + withSchema + `
+SELECT r.oid IS NOT NULL, ` + schemaExists + `, (
+    SELECT array_agg(a.privilege_type)
+    FROM pg_default_acl da
+    CROSS JOIN LATERAL aclexplode(da.defaclacl) a
+    WHERE da.defaclrole = (SELECT oid FROM o)
+      AND da.defaclnamespace = ` + namespace + `
+      AND da.defaclobjtype = $3
+      AND a.grantee = r.oid
+)
+FROM r
+`
+	return query, args
+}
+
+// readRoleDefaultPrivileges reads the default privileges with a single
+// statement on the target database: no transaction, no separate existence
+// checks and no advisory lock on the owner (only the write paths lock it), so
+// Reads of default privileges sharing an owner no longer wait for each other
+// or for a concurrent apply on that owner.
+func readRoleDefaultPrivileges(db *DBConnection, d *schema.ResourceData) error {
+	role := d.Get("role").(string)
+	pgSchema := d.Get("schema").(string)
 	privilegesInput := d.Get("privileges").(*schema.Set).List()
 
-	if err := pgLockRole(txn, owner); err != nil {
-		return err
-	}
-
-	roleOID, err := getRoleOID(txn, role)
+	query, args := buildReadRoleDefaultPrivilegesQuery(d)
+	rows, err := queryGrantRead(db, d, query, args...)
 	if err != nil {
-		return err
+		return fmt.Errorf("could not read default privileges: %w", err)
 	}
+	if rows == nil {
+		return nil
+	}
+	defer closeGrantReadRows(rows)
 
-	var query string
-	var queryArgs []any
-
-	if pgSchema != "" {
-		query = `SELECT array_agg(prtype) FROM (
-		SELECT defaclnamespace, (aclexplode(defaclacl)).* FROM pg_default_acl
-		WHERE defaclobjtype = $3
-	) AS t (namespace, grantor_oid, grantee_oid, prtype, grantable)
-	JOIN pg_namespace ON pg_namespace.oid = namespace
-	WHERE grantee_oid = $1 AND nspname = $2 AND pg_get_userbyid(grantor_oid) = $4;
-`
-		queryArgs = []any{roleOID, pgSchema, objectTypes[objectType], owner}
-	} else {
-		query = `SELECT array_agg(prtype) FROM (
-		SELECT defaclnamespace, (aclexplode(defaclacl)).* FROM pg_default_acl
-		WHERE defaclobjtype = $2
-	) AS t (namespace, grantor_oid, grantee_oid, prtype, grantable)
-	WHERE grantee_oid = $1 AND namespace = 0 AND pg_get_userbyid(grantor_oid) = $3;
-`
-		queryArgs = []any{roleOID, objectTypes[objectType], owner}
+	if !rows.Next() {
+		if err := rows.Err(); err != nil {
+			return fmt.Errorf("could not read default privileges: %w", err)
+		}
+		return fmt.Errorf("could not read default privileges: query returned no row")
 	}
 
 	// This query aggregates the list of default privileges type (prtype)
 	// for the role (grantee), owner (grantor), schema (namespace name)
 	// and the specified object type (defaclobjtype).
-
+	var roleExists, schemaExists bool
 	var privileges pq.ByteaArray
-	if err := txn.QueryRow(
-		query, queryArgs...,
-	).Scan(&privileges); err != nil {
+	if err := rows.Scan(&roleExists, &schemaExists, &privileges); err != nil {
 		return fmt.Errorf("could not read default privileges: %w", err)
+	}
+	if grantTargetGone(d, roleExists, schemaExists) {
+		return nil
 	}
 
 	// We consider no privileges as "not exists" unless no privileges were provided as input
