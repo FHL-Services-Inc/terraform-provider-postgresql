@@ -1425,6 +1425,123 @@ resource "postgresql_grant" "test" {
 	})
 }
 
+// TestAccPostgresqlGrantDatabaseNotOwned covers database grants on a database
+// owned by another role. A non-superuser provider (e.g. RDS) has to act as a
+// member of the database owner, otherwise PostgreSQL only emits
+// "WARNING: no privileges were granted/revoked" and nothing changes (#113).
+func TestAccPostgresqlGrantDatabaseNotOwned(t *testing.T) {
+	skipIfNotAcc(t)
+
+	const (
+		dbName    = "test_grant_db_not_owned"
+		ownerRole = "test_grant_db_owner"
+		roRole    = "test_grant_db_owner_ro"
+	)
+
+	config := getTestConfig(t)
+	dsn := config.connStr("postgres")
+	adminUser := pq.QuoteIdentifier(config.getDatabaseUsername())
+
+	dbExecute(t, dsn, fmt.Sprintf("CREATE ROLE %s", ownerRole))
+	dbExecute(t, dsn, fmt.Sprintf("CREATE ROLE %s", roRole))
+	// The provider user needs to be a member of the owner to create the
+	// database for it, but must not stay one: that is the case under test.
+	// It keeps its own CONNECT, because the provider connects to the database
+	// it manages grants on and PUBLIC loses CONNECT below.
+	dbExecute(t, dsn, fmt.Sprintf("GRANT %s TO %s", ownerRole, adminUser))
+	dbExecute(t, dsn, fmt.Sprintf("CREATE DATABASE %s OWNER %s", dbName, ownerRole))
+	dbExecute(t, dsn, fmt.Sprintf("GRANT CONNECT ON DATABASE %s TO %s", dbName, adminUser))
+	dbExecute(t, dsn, fmt.Sprintf("REVOKE %s FROM %s", ownerRole, adminUser))
+	defer func() {
+		dbExecute(t, dsn, fmt.Sprintf("GRANT %s TO %s", ownerRole, adminUser))
+		dbExecute(t, dsn, fmt.Sprintf("DROP DATABASE IF EXISTS %s", dbName))
+		dbExecute(t, dsn, fmt.Sprintf("DROP ROLE IF EXISTS %s", roRole))
+		dbExecute(t, dsn, fmt.Sprintf("REVOKE %s FROM %s", ownerRole, adminUser))
+		dbExecute(t, dsn, fmt.Sprintf("DROP ROLE IF EXISTS %s", ownerRole))
+	}()
+
+	// Placeholder: privileges of roRole.
+	tfConfig := fmt.Sprintf(`
+resource "postgresql_grant" "revoke_public" {
+	database    = "%[1]s"
+	role        = "public"
+	object_type = "database"
+	privileges  = []
+}
+
+resource "postgresql_grant" "ro_connect" {
+	database    = "%[1]s"
+	role        = "%[2]s"
+	object_type = "database"
+	privileges  = %%s
+}
+`, dbName, roRole)
+
+	resource.Test(t, resource.TestCase{
+		PreCheck: func() {
+			testAccPreCheck(t)
+			testCheckCompatibleVersion(t, featurePrivileges)
+		},
+		Providers: testAccProviders,
+		Steps: []resource.TestStep{
+			{
+				Config: fmt.Sprintf(tfConfig, `["CONNECT"]`),
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr("postgresql_grant.revoke_public", "privileges.#", "0"),
+					resource.TestCheckResourceAttr("postgresql_grant.ro_connect", "privileges.#", "1"),
+					// Checked in the ACL itself: has_database_privilege() would
+					// also be true for roRole through PUBLIC.
+					testCheckDatabaseConnectACL(t, dsn, dbName, map[string]bool{
+						"public": false,
+						roRole:   true,
+					}),
+				),
+			},
+			// Revoke goes through the same path.
+			{
+				Config: fmt.Sprintf(tfConfig, "[]"),
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr("postgresql_grant.ro_connect", "privileges.#", "0"),
+					testCheckDatabaseConnectACL(t, dsn, dbName, map[string]bool{
+						"public": false,
+						roRole:   false,
+					}),
+				),
+			},
+		},
+	})
+}
+
+// testCheckDatabaseConnectACL checks whether each role ("public" for PUBLIC)
+// is granted CONNECT directly in the ACL of the database.
+func testCheckDatabaseConnectACL(t *testing.T, dsn, dbName string, connect map[string]bool) resource.TestCheckFunc {
+	return func(*terraform.State) error {
+		db, err := sql.Open("postgres", dsn)
+		if err != nil {
+			return err
+		}
+		defer closeDB(t, db)
+
+		for role, want := range connect {
+			var got bool
+			if err := db.QueryRow(`
+SELECT EXISTS (
+	SELECT 1
+	  FROM (SELECT (aclexplode(datacl)).* FROM pg_database WHERE datname = $1) acl
+	 WHERE privilege_type = 'CONNECT'
+	   AND grantee = CASE WHEN $2::text = 'public' THEN 0
+	                      ELSE (SELECT oid FROM pg_roles WHERE rolname = $2::text) END
+)`, dbName, role).Scan(&got); err != nil {
+				return fmt.Errorf("could not read ACL of database %s: %w", dbName, err)
+			}
+			if got != want {
+				return fmt.Errorf("CONNECT on database %s for %s: got %t, want %t", dbName, role, got, want)
+			}
+		}
+		return nil
+	}
+}
+
 func TestAccPostgresqlImplicitGrants(t *testing.T) {
 	skipIfNotAcc(t)
 
