@@ -26,6 +26,11 @@
 // resource with the same name, instance count and references. Planning it measures
 // Terraform core alone, without the provider and without a database.
 //
+// -aggregate writes the privileges of every role as one postgresql_role_privileges
+// resource per role and database instead of its postgresql_grant and
+// postgresql_default_privileges resources; the privileges are the same, so the two
+// configurations manage the same database and differ only in the number of instances.
+//
 // -preset sets the sizes in one go; flags given explicitly override the preset.
 package main
 
@@ -54,6 +59,7 @@ type params struct {
 	fixtureDBs     int
 	shape          string
 	coreOnly       bool
+	aggregate      bool
 }
 
 // presets are sizes for -preset. "default" is the flag defaults.
@@ -77,6 +83,7 @@ func main() {
 	flag.IntVar(&p.fixtureDBs, "fixture-dbs", 1, "number of databases the schemas, grants and default privileges are spread over")
 	flag.StringVar(&p.shape, "shape", "blocks", "blocks: one resource block per object; count: one block with count per kind of resource")
 	flag.BoolVar(&p.coreOnly, "core-only", false, "write only main.tf, with terraform_data in place of every provider resource (no database needed)")
+	flag.BoolVar(&p.aggregate, "aggregate", false, "one postgresql_role_privileges per role instead of its postgresql_grant / postgresql_default_privileges resources (shape blocks only)")
 	preset := flag.String("preset", "default", "size preset: "+presetNames()+"; explicit flags override it")
 	flag.Parse()
 
@@ -95,6 +102,9 @@ func main() {
 	}
 	if p.shape != "blocks" && p.shape != "count" {
 		log.Fatalf("unknown -shape %q, want blocks or count", p.shape)
+	}
+	if p.aggregate && p.shape != "blocks" {
+		log.Fatal("-aggregate needs -shape blocks: a role whose schemas live in two databases needs two instances, which one count block cannot express")
 	}
 
 	if p.schemas < 2 || p.tables < p.schemas || p.roles < 1 || p.groups < 1 {
@@ -202,7 +212,17 @@ type res struct {
 	typ, name   string
 	count       int
 	attrs       [][2]string // name, HCL expression
+	blocks      []block     // nested blocks, after the attributes
 	ignoreRoles bool        // add lifecycle { ignore_changes = [roles] }
+}
+
+// block is a nested block of a resource (schema { tables { ... } }). For the
+// provider it is written as a block; for terraform_data, where everything is
+// one input value, blocks of the same type become a list of objects.
+type block struct {
+	typ    string
+	attrs  [][2]string
+	blocks []block
 }
 
 // tfWriter renders resources either for the provider or, with core set, as
@@ -249,6 +269,7 @@ func (t *tfWriter) resource(r res) {
 	for _, a := range r.attrs {
 		_, _ = fmt.Fprintf(t.w, "%s%-*s = %s\n", indent, width, a[0], a[1])
 	}
+	t.blocks(r.blocks, indent)
 	switch {
 	case t.core:
 		_, _ = fmt.Fprint(t.w, "  }\n")
@@ -261,6 +282,48 @@ func (t *tfWriter) resource(r res) {
 `)
 	}
 	_, _ = fmt.Fprint(t.w, "}\n")
+}
+
+// blocks writes nested blocks at the given indent: as blocks for the provider,
+// as "<type> = [ { ... }, ... ]" lists of objects inside terraform_data's input.
+func (t *tfWriter) blocks(blocks []block, indent string) {
+	if t.core {
+		var types []string
+		byType := map[string][]block{}
+		for _, b := range blocks {
+			if byType[b.typ] == nil {
+				types = append(types, b.typ)
+			}
+			byType[b.typ] = append(byType[b.typ], b)
+		}
+		for _, typ := range types {
+			_, _ = fmt.Fprintf(t.w, "%s%s = [\n", indent, typ)
+			for _, b := range byType[typ] {
+				_, _ = fmt.Fprintf(t.w, "%s  {\n", indent)
+				t.attrs(b.attrs, indent+"    ")
+				t.blocks(b.blocks, indent+"    ")
+				_, _ = fmt.Fprintf(t.w, "%s  },\n", indent)
+			}
+			_, _ = fmt.Fprintf(t.w, "%s]\n", indent)
+		}
+		return
+	}
+	for _, b := range blocks {
+		_, _ = fmt.Fprintf(t.w, "%s%s {\n", indent, b.typ)
+		t.attrs(b.attrs, indent+"  ")
+		t.blocks(b.blocks, indent+"  ")
+		_, _ = fmt.Fprintf(t.w, "%s}\n", indent)
+	}
+}
+
+func (t *tfWriter) attrs(attrs [][2]string, indent string) {
+	width := 0
+	for _, a := range attrs {
+		width = max(width, len(a[0]))
+	}
+	for _, a := range attrs {
+		_, _ = fmt.Fprintf(t.w, "%s%-*s = %s\n", indent, width, a[0], a[1])
+	}
 }
 
 func (p params) header(t *tfWriter) {
@@ -357,6 +420,10 @@ func (p params) terraformBlocks(t *tfWriter) {
 			{"role", role},
 			{"grant_role", t.ref("postgresql_role", fmt.Sprintf("group_%d", i%p.groups), "", "name")},
 		}})
+		if p.aggregate {
+			p.aggregateRole(t, i)
+			continue
+		}
 		t.resource(res{typ: "postgresql_grant", name: user + "_usage", attrs: [][2]string{
 			{"database", fmt.Sprintf("%q", p.schemaDB(own))},
 			{"role", role},
@@ -390,6 +457,54 @@ func (p params) terraformBlocks(t *tfWriter) {
 			}})
 		}
 	}
+}
+
+// aggregateRole writes the privileges of login role i as postgresql_role_privileges:
+// the same privileges the per-object resources of terraformBlocks grant (USAGE and
+// schema-wide SELECT on its own schema, SELECT/INSERT on objectsPerGrnt tables of the
+// next schema, default privileges for every other role), as one instance per
+// database the role has privileges in.
+func (p params) aggregateRole(t *tfWriter, i int) {
+	own := i % p.schemas
+	next := (i + 1) % p.schemas
+	user := fmt.Sprintf("user_%d", i)
+	role := t.ref("postgresql_role", user, "", "name")
+
+	ownSchema := block{typ: "schema", attrs: [][2]string{
+		{"name", fmt.Sprintf("\"app_%d\"", own)},
+		{"usage", "true"},
+	}, blocks: []block{
+		{typ: "tables", attrs: [][2]string{{"privileges", `["SELECT"]`}}},
+	}}
+	if i%2 == 0 {
+		ownSchema.blocks = append(ownSchema.blocks, block{typ: "default_privileges", attrs: [][2]string{
+			{"owner", `"postgres"`},
+			{"object_type", `"table"`},
+			{"privileges", `["SELECT"]`},
+		}})
+	}
+	nextSchema := block{typ: "schema", attrs: [][2]string{
+		{"name", fmt.Sprintf("\"app_%d\"", next)},
+	}, blocks: []block{
+		{typ: "tables", attrs: [][2]string{
+			{"privileges", `["INSERT", "SELECT"]`},
+			{"objects", "[" + p.objectList(i, next) + "]"},
+		}},
+	}}
+
+	schemas := []block{ownSchema, nextSchema}
+	if p.schemaDB(own) != p.schemaDB(next) {
+		// The next schema lives in another database: a second instance.
+		schemas = schemas[:1]
+		t.resource(res{typ: "postgresql_role_privileges", name: user + "_next", attrs: [][2]string{
+			{"database", fmt.Sprintf("%q", p.schemaDB(next))},
+			{"role", role},
+		}, blocks: []block{nextSchema}})
+	}
+	t.resource(res{typ: "postgresql_role_privileges", name: user, attrs: [][2]string{
+		{"database", fmt.Sprintf("%q", p.schemaDB(own))},
+		{"role", role},
+	}, blocks: schemas})
 }
 
 // terraformCount writes the same instances as terraformBlocks, grouped into one

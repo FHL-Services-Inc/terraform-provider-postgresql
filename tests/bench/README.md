@@ -64,6 +64,21 @@ shows what a config built around a few big `count`/`for_each` blocks costs, befo
 the provider does any work. See the core reference below and
 `website/docs/guides/large-configurations.html.markdown`.
 
+`-aggregate` writes the privileges of every role as one `postgresql_role_privileges`
+resource per role and database (two instances when its schemas live in two fixture
+databases) instead of its three `postgresql_grant` and one
+`postgresql_default_privileges` resources. The privileges are the same, so the two
+configurations manage the same database and differ only in the number of instances:
+with the defaults 1,143 resources become 643. It needs a provider build that has the
+resource and `-shape blocks`; `-core-only` renders the nested blocks as `terraform_data`
+input. Compare the two shapes with two runs of `run.sh` (one `-w` work directory each,
+same `-p` build), for example:
+
+```sh
+GEN_ARGS="-roles 500 -schemas 20 -tables 2000" tests/bench/run.sh -p rp=. -l "0 10" -n 2 -w /tmp/bench-grants
+GEN_ARGS="-roles 500 -schemas 20 -tables 2000 -aggregate" tests/bench/run.sh -p rp=. -l "0 10" -n 2 -w /tmp/bench-aggregate
+```
+
 ## Running it
 
 You need Go, Terraform 1.x, `psql` and `perl`. `perl` is used for sub-second timestamps.
