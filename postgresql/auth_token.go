@@ -116,7 +116,8 @@ func rdsAuthTokenExpiry(token string, issuedAt time.Time) time.Time {
 	return signed.Add(time.Duration(seconds) * time.Second)
 }
 
-// redactTokenError returns err with any occurrence of token replaced by XXXX.
+// redactTokenError returns err with any occurrence of token, raw or in one of
+// its URL-escaped forms, replaced by XXXX. It is also used for the password.
 // Errors that don't contain the token are returned unchanged, so callers can
 // still inspect them (e.g. *pq.Error for SQLSTATE checks). A redacted error
 // does not wrap the original, whose message holds the token.
@@ -126,7 +127,9 @@ func redactTokenError(err error, token string) error {
 	}
 	msg := err.Error()
 	redacted := msg
-	for _, form := range []string{token, url.PathEscape(token), url.QueryEscape(token)} {
+	// The last form is the token as url.UserPassword escapes it in a DSN.
+	userinfo := strings.TrimPrefix(url.UserPassword("", token).String(), ":")
+	for _, form := range []string{token, url.PathEscape(token), url.QueryEscape(token), userinfo} {
 		redacted = strings.ReplaceAll(redacted, form, "XXXX")
 	}
 	if redacted == msg {

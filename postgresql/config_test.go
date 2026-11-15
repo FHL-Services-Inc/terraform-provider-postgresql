@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"database/sql/driver"
 	"errors"
+	"net/url"
 	"reflect"
 	"sort"
 	"strings"
@@ -273,5 +274,117 @@ func TestConfigEvictDBConnection(t *testing.T) {
 	}
 	if !inRegistry(dsn) {
 		t.Error("evictDBConnection() removed a pool without idle connections")
+	}
+}
+
+// TestConfigConnStrUserinfo pins that the username and password survive the
+// round trip through the DSN, including characters with a meaning in URL
+// userinfo such as ':' in an AWS-style role session name (#129).
+func TestConfigConnStrUserinfo(t *testing.T) {
+	tests := []struct {
+		username string
+		password string
+	}{
+		{"postgres_user", "postgres_password"},
+		{"AROA123:me", "p387"},
+		{"user@example.com", "pa:ss@w/rd?#% x"},
+		{"spaced user", ""},
+	}
+
+	for _, test := range tests {
+		c := &Config{Scheme: "postgres", Host: "localhost", Port: 5432, Username: test.username, Password: test.password, SSLMode: "disable"}
+		dsn := c.connStr("postgres")
+		u, err := url.Parse(dsn)
+		if err != nil {
+			t.Fatalf("connStr() for user %q returned an unparsable DSN: %v", test.username, err)
+		}
+		if got := u.User.Username(); got != test.username {
+			t.Errorf("username: got %q, want %q", got, test.username)
+		}
+		if got, _ := u.User.Password(); got != test.password {
+			t.Errorf("password for user %q: got %q, want %q", test.username, got, test.password)
+		}
+		if u.Host != "localhost:5432" {
+			t.Errorf("host for user %q: got %q, want %q", test.username, u.Host, "localhost:5432")
+		}
+	}
+}
+
+// TestConfigConnStrHost pins that IPv6 literals are bracketed in the DSN
+// (#130), with or without brackets in the provider host, while host names,
+// IPv4 addresses and GCP instance names keep their form.
+func TestConfigConnStrHost(t *testing.T) {
+	tests := []struct {
+		scheme string
+		host   string
+		want   string
+	}{
+		{"postgres", "localhost", "localhost:5432"},
+		{"postgres", "127.0.0.1", "127.0.0.1:5432"},
+		{"postgres", "::1", "[::1]:5432"},
+		{"postgres", "[::1]", "[::1]:5432"},
+		{"postgres", "2001:db8::10", "[2001:db8::10]:5432"},
+		{"awspostgres", "fd00::5", "[fd00::5]:5432"},
+		{"gcppostgres", "project:region:instance", "project/region/instance:5432"},
+		{"gcppostgres", "project/region/instance", "project/region/instance:5432"},
+	}
+
+	for _, test := range tests {
+		c := &Config{Scheme: test.scheme, Host: test.host, Port: 5432, Username: "u", Password: "p"}
+		dsn := c.connStr("postgres")
+		prefix := test.scheme + "://u:p@"
+		if !strings.HasPrefix(dsn, prefix) {
+			t.Fatalf("connStr() = %q, want prefix %q", dsn, prefix)
+		}
+		hostPort := strings.TrimPrefix(dsn, prefix)
+		hostPort = hostPort[:strings.LastIndex(strings.SplitN(hostPort, "?", 2)[0], "/postgres")]
+		if hostPort != test.want {
+			t.Errorf("%s host %q: got %q, want %q", test.scheme, test.host, hostPort, test.want)
+		}
+		if test.scheme != "gcppostgres" {
+			u, err := url.Parse(dsn)
+			if err != nil {
+				t.Fatalf("connStr() for host %q returned an unparsable DSN: %v", test.host, err)
+			}
+			if u.Port() != "5432" {
+				t.Errorf("port for host %q: got %q, want 5432", test.host, u.Port())
+			}
+		}
+	}
+}
+
+// TestConnectWithRetryRedactsEscapedPassword pins that a connection error
+// echoing the DSN does not leak the password in any of its escaped forms
+// (#135). The invalid host makes the driver fail to parse the DSN, and the
+// parse error quotes the whole URL.
+func TestConnectWithRetryRedactsEscapedPassword(t *testing.T) {
+	for _, password := range []string{"s3cr3t/pa ss%x", "a:b@c?d#e+f&g=h;i,j", "plain"} {
+		c := &Client{config: Config{
+			Scheme:                        "postgres",
+			Host:                          "bad host",
+			Port:                          5432,
+			Username:                      "u428",
+			Password:                      password,
+			SSLMode:                       "disable",
+			ConnectionRetryTimeoutSeconds: 5,
+		}}
+		_, err := c.connectWithRetry(context.Background(), "postgres", c.config.connStr("postgres"))
+		if err == nil {
+			t.Fatalf("connectWithRetry() with an invalid host expected an error, got nil")
+		}
+		msg := err.Error()
+		for _, form := range []string{
+			password,
+			url.PathEscape(password),
+			url.QueryEscape(password),
+			strings.TrimPrefix(url.UserPassword("", password).String(), ":"),
+		} {
+			if strings.Contains(msg, form) {
+				t.Errorf("connection error leaks password form %q: %s", form, msg)
+			}
+		}
+		if !strings.Contains(msg, "XXXX") {
+			t.Errorf("connection error has no redaction marker, the test does not exercise the DSN echo: %s", msg)
+		}
 	}
 }

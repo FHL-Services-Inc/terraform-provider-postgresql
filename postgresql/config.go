@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net"
 	"net/url"
 	"sort"
 	"strconv"
@@ -358,20 +359,25 @@ func (c *Config) connParams() []string {
 }
 
 func (c *Config) connStr(database string) string {
-	host := c.Host
-	// For GCP, support both project/region/instance and project:region:instance
-	// (The second one allows to use the output of google_sql_database_instance as host
+	var hostPort string
 	if c.Scheme == "gcppostgres" {
-		host = strings.ReplaceAll(host, ":", "/")
+		// For GCP, support both project/region/instance and project:region:instance
+		// (The second one allows to use the output of google_sql_database_instance as host
+		hostPort = fmt.Sprintf("%s:%d", strings.ReplaceAll(c.Host, ":", "/"), c.Port)
+	} else {
+		// JoinHostPort brackets IPv6 literals; strip brackets the user may
+		// already have put around one so they are not doubled.
+		host := strings.TrimSuffix(strings.TrimPrefix(c.Host, "["), "]")
+		hostPort = net.JoinHostPort(host, strconv.Itoa(c.Port))
 	}
 
+	// url.UserPassword escapes ':' in the username too, which PathEscape
+	// leaves as is, so a username such as "AROA123:session" is not split.
 	connStr := fmt.Sprintf(
-		"%s://%s:%s@%s:%d/%s?%s",
+		"%s://%s@%s/%s?%s",
 		c.Scheme,
-		url.PathEscape(c.Username),
-		url.PathEscape(c.Password),
-		host,
-		c.Port,
+		url.UserPassword(c.Username, c.Password).String(),
+		hostPort,
 		database,
 		strings.Join(c.connParams(), "&"),
 	)
@@ -529,13 +535,12 @@ func (c *Client) connectWithRetry(ctx context.Context, postgresDriverName, dsn s
 		if _, ok := errors.AsType[*pq.Error](retryError); ok {
 			return nil, fmt.Errorf("error connecting to PostgreSQL server %s (scheme: %s): %w", c.config.Host, c.config.Scheme, retryError)
 		}
+		// The DSN holds the password URL-escaped, and errors such as a URL
+		// parse failure echo the DSN, so redact the escaped forms as well.
 		// On the auth token path Password is empty and the connector has
 		// already redacted the token.
-		errString := retryError.Error()
-		if c.config.Password != "" {
-			errString = strings.Replace(errString, c.config.Password, "XXXX", 2)
-		}
-		return nil, fmt.Errorf("error connecting to PostgreSQL server %s (scheme: %s): %s", c.config.Host, c.config.Scheme, errString)
+		redacted := redactTokenError(retryError, c.config.Password)
+		return nil, fmt.Errorf("error connecting to PostgreSQL server %s (scheme: %s): %s", c.config.Host, c.config.Scheme, redacted)
 	}
 
 	return db, nil
