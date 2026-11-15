@@ -124,7 +124,10 @@ upgrading. Each one fixes behavior that was silently wrong before.
 - `statement_timeout` and `idle_in_transaction_session_timeout` on
   `postgresql_role` accept time units (#172, #120).
 - RDS IAM and Azure AD tokens are refreshed for every new connection instead
-  of once per provider run (#81, #13).
+  of once per provider run (#81, #13), also with `scheme = "awspostgres"`,
+  which used the first token for the whole run and failed after 15 minutes
+  (#214, #89). The AWS config, and the assumed role credentials with
+  `aws_rds_iam_provider_role_arn`, are loaded once and reused.
 
 ### Performance
 
@@ -135,6 +138,9 @@ resources, 10 ms round-trip time) went from 39.9 s to 14.6 s; with
 `max_idle_connections` at `5`) it takes 3.7 s, and 2.4 s with
 `catalog_snapshot` too (#33).
 
+- With `scheme = "awspostgres"` the RDS CA bundle is downloaded once per
+  provider run instead of once per connection, with IAM and with password
+  authentication (#214, #97, #102).
 - `postgresql_grant` and `postgresql_default_privileges` are read with one
   statement, without a transaction or read lock (#51, #38, #52); the `objects`
   filter of table, sequence and function grants runs in SQL (#61, #59).
