@@ -411,3 +411,4 @@ The provider supports connecting via a SOCKS5 proxy, but when the `postgres` sch
 The `NO_PROXY` or `no_proxy` environment can also be set to opt out of proxying for specific hostnames or ports.
 
 [libpq]: https://pkg.go.dev/github.com/lib/pq
+
