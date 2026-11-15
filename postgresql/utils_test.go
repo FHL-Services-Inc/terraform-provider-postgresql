@@ -103,6 +103,14 @@ func dbExecute(t *testing.T, dsn, query string, args ...any) {
 // accessed by other users". Those sessions are terminated first, and the drop
 // uses WITH (FORCE) on PostgreSQL 13+. Older servers retry while a backend
 // sneaks in between the terminate and the drop.
+//
+// Only the sessions of roles whose privileges the current user has are
+// terminated, which is what pg_terminate_backend allows: in the rds profile an
+// autovacuum worker on the database (it has no role, so only a superuser can
+// signal it) made pg_terminate_backend, and WITH (FORCE), fail with
+// "permission denied to terminate process". A plain DROP DATABASE stops
+// autovacuum workers itself and waits a few seconds for other sessions, so the
+// drop falls back to it.
 func dropTestDatabase(t *testing.T, config Config, dbName string) {
 	t.Helper()
 
@@ -124,7 +132,8 @@ func dropTestDatabase(t *testing.T, config Config, dbName string) {
 	const attempts = 5
 	for i := 1; ; i++ {
 		if _, err := db.Exec(
-			"SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = $1 AND pid <> pg_backend_pid()",
+			`SELECT pg_terminate_backend(pid) FROM pg_stat_activity
+			  WHERE datname = $1 AND pid <> pg_backend_pid() AND pg_has_role(usesysid, 'USAGE')`,
 			dbName,
 		); err != nil {
 			t.Fatalf("could not terminate connections to database %s: %v", dbName, err)
@@ -134,6 +143,10 @@ func dropTestDatabase(t *testing.T, config Config, dbName string) {
 			return
 		}
 		var pqErr *pq.Error
+		if forced := " WITH (FORCE)"; errors.As(err, &pqErr) && pqErr.Code == "42501" && strings.HasSuffix(drop, forced) {
+			drop = strings.TrimSuffix(drop, forced)
+			continue
+		}
 		if i == attempts || !errors.As(err, &pqErr) || pqErr.Code != "55006" { // object_in_use
 			t.Fatalf("could not drop database %s: %v", dbName, err)
 		}
@@ -525,4 +538,65 @@ func testCheckCanSetSecurityLabel(t *testing.T) {
 		"CREATE ROLE tf_probe_label",
 		"SECURITY LABEL FOR dummy ON ROLE tf_probe_label IS 'classified'",
 	)
+}
+
+// dropTestDatabase must drop a database while a session it may not terminate
+// is connected to it: an autovacuum worker in the rds profile in CI, here the
+// session of another role.
+func TestAccDropTestDatabaseWithForeignSession(t *testing.T) {
+	skipIfNotAcc(t)
+
+	config := getTestConfig(t)
+	dbName, roleName := getTestDBNames(strconv.Itoa(int(time.Now().UnixNano())))
+	dbExecute(t, config.connStr("postgres"), fmt.Sprintf(
+		"CREATE ROLE %s LOGIN PASSWORD '%s'", roleName, testRolePassword))
+	defer dbExecute(t, config.connStr("postgres"), fmt.Sprintf("DROP ROLE IF EXISTS %s", roleName))
+	dbExecute(t, config.connStr("postgres"), fmt.Sprintf("CREATE DATABASE %s", dbName))
+
+	other := config
+	other.Username = roleName
+	other.Password = testRolePassword
+	otherDB, err := sql.Open("postgres", other.connStr(dbName))
+	if err != nil {
+		t.Fatalf("could not create connection pool: %v", err)
+	}
+	defer closeDB(t, otherDB)
+	// The session ends with the query instead of staying idle in the pool.
+	otherDB.SetMaxIdleConns(0)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		// Ends after 2 s, or earlier with an error if it is terminated.
+		_, _ = otherDB.Exec("SELECT pg_sleep(2)")
+	}()
+
+	db, err := sql.Open("postgres", config.connStr("postgres"))
+	if err != nil {
+		t.Fatalf("could not create connection pool: %v", err)
+	}
+	defer closeDB(t, db)
+	for i := 0; ; i++ {
+		var sessions int
+		if err := db.QueryRow("SELECT count(*) FROM pg_stat_activity WHERE datname = $1", dbName).Scan(&sessions); err != nil {
+			t.Fatalf("could not read sessions: %v", err)
+		}
+		if sessions > 0 {
+			break
+		}
+		if i == 50 {
+			t.Fatalf("the session of %s did not connect to %s", roleName, dbName)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	dropTestDatabase(t, config, dbName)
+	<-done
+
+	var exists bool
+	if err := db.QueryRow("SELECT EXISTS (SELECT 1 FROM pg_database WHERE datname = $1)", dbName).Scan(&exists); err != nil {
+		t.Fatalf("could not check database %s: %v", dbName, err)
+	}
+	if exists {
+		t.Errorf("database %s still exists", dbName)
+	}
 }

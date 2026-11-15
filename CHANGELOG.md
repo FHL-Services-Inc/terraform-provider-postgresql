@@ -231,6 +231,8 @@ resources, 10 ms round-trip time) went from 39.9 s to 14.6 s; with
   #154).
 - The remove-waiting-response workflow no longer fails when the label is
   absent (#161, #159).
+- The test teardown no longer fails in the non-superuser profile when an
+  autovacuum worker is connected to the database it drops (#211).
 
 ## [1.28.0] - 2026-11-13
 
