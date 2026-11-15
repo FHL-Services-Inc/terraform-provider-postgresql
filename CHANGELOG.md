@@ -16,6 +16,26 @@ Releases up to v1.27.0 were made upstream; see the
 These changes can show up as a diff or an error on the first plan or apply after
 upgrading. Each one fixes behavior that was silently wrong before.
 
+- **New connection defaults: `max_idle_connections = 5` and
+  `binary_parameters = true`** (#205, #202). Each database pool now keeps up
+  to 5 idle connections for reuse (closed 30 s after their last use or when
+  Terraform exits), and statements with bind parameters take one round-trip
+  instead of two. What you may notice:
+  - more sessions on the server while Terraform runs: about
+    `(databases + 1) × 5` per provider block (measured peaks at
+    `-parallelism=10`: 15 with 1 database, 26–29 with 4, against 10 before).
+    Check the server's and the role's connection limits, or cap the total with
+    `max_total_connections`;
+  - a `DROP DATABASE`, `ALTER DATABASE ... RENAME` or
+    `CREATE DATABASE ... TEMPLATE` run outside of Terraform, on a database the
+    provider holds idle connections to, can fail with "database is being
+    accessed by other users" while Terraform runs. `postgresql_database`
+    closes the provider's own pools before such operations.
+
+  To keep the previous behavior, set `max_idle_connections = 0` and
+  `binary_parameters = false` in the provider block, or
+  `PGMAXIDLECONNECTIONS=0` and `PGBINARYPARAMETERS=false` in the environment
+  (a value in the provider block takes precedence).
 - **`postgresql_grant` on superuser-owned objects fails without `WITH GRANT OPTION`**
   (#201, #114). With a non-superuser provider, a grant on objects owned by a
   superuser (a schema created `AUTHORIZATION postgres`, `public` before
@@ -63,19 +83,20 @@ upgrading. Each one fixes behavior that was silently wrong before.
 
 ### Added
 
-- Opt-in performance settings, documented in the new
+- Performance settings, documented in the new
   [performance tuning guide](website/docs/guides/performance-tuning.html.markdown)
   (#153, #162):
   - `max_idle_connections` / `PGMAXIDLECONNECTIONS`: reuse connections instead
     of reconnecting for every statement (#17, #7, #23). Idle pools are evicted
     before a database rename or template copy, and idle connections close after
-    30 s (#55, #24).
+    30 s (#55, #24). Defaults to `5` (#205, #202); `0` turns it off.
   - `binary_parameters` / `PGBINARYPARAMETERS`: one round-trip per
-    parameterized statement (#45, #36).
-  - `catalog_snapshot` / `PGCATALOGSNAPSHOT` (and `catalog_snapshot_ttl_seconds`): read
+    parameterized statement (#45, #36). Enabled by default (#205, #202);
+    `false` turns it off.
+  - `catalog_snapshot` / `PGCATALOGSNAPSHOT` (and `catalog_snapshot_ttl_seconds`), opt-in: read
     `postgresql_grant` and `postgresql_default_privileges` from one catalog
     snapshot per database (#98, #67).
-  - `max_total_connections` / `PGMAXTOTALCONNECTIONS`: one limit for the
+  - `max_total_connections` / `PGMAXTOTALCONNECTIONS`, opt-in: one limit for the
     connections across all database pools (#185, #57).
 - Import for `postgresql_grant`, `postgresql_default_privileges` and
   `postgresql_grant_role` (#83, #69), `postgresql_user_mapping` (#168, #166),
@@ -90,10 +111,12 @@ upgrading. Each one fixes behavior that was silently wrong before.
 
 ### Performance
 
-With the default settings, a plan of the benchmark configuration (1,143
+With connection reuse and single round-trip statements turned off (the
+defaults before #205), a plan of the benchmark configuration (1,143
 resources, 10 ms round-trip time) went from 39.9 s to 14.6 s; with
-`max_idle_connections`, `binary_parameters` and `catalog_snapshot` it takes
-2.4 s (#33).
+`max_idle_connections = 10` and `binary_parameters` (both now on by default,
+`max_idle_connections` at `5`) it takes 3.7 s, and 2.4 s with
+`catalog_snapshot` too (#33).
 
 - `postgresql_grant` and `postgresql_default_privileges` are read with one
   statement, without a transaction or read lock (#51, #38, #52); the `objects`

@@ -77,10 +77,13 @@ You need Go, Terraform 1.x, `psql` and `perl`. `perl` is used for sub-second tim
 
    To compare provider settings, use `-a label='argument = value'`. It adds provider
    arguments for one label. You can measure the same build under two labels, for
-   example with and without connection reuse:
+   example with and without connection reuse. A label without `-a` runs with the
+   provider's defaults (`max_idle_connections = 5` and `binary_parameters = true`
+   since they became the default; older builds default to `0` and `false`):
 
    ```sh
-   tests/bench/run.sh -p idle0=. -p idle10=. -a 'idle10=max_idle_connections = 10'
+   tests/bench/run.sh -p idle0=. -p idle10=. \
+     -a 'idle0=max_idle_connections = 0' -a 'idle10=max_idle_connections = 10'
    ```
 
    `-l` lists the added round-trip times in ms. `0` connects directly; any other value
@@ -106,8 +109,9 @@ means no changes. Exit code 2 means drift and is logged, so a provider that read
 something differently stands out.
 
 `run.sh` pauses for `COOLDOWN` seconds before a plan. The default is 2*MSL + 5 s,
-which is 35 s on macOS and 65 s elsewhere. Today a plan opens one connection per few
-statements, which is about 2,800 at the default size. Each connection leaves its
+which is 35 s on macOS and 65 s elsewhere. Without connection reuse
+(`max_idle_connections = 0`, or a build from before it became the default) a plan
+opens one connection per few statements, which is about 2,800 at the default size. Each connection leaves its
 ephemeral ports in TIME_WAIT. On macOS, two or three plans in a row exhaust the port
 range, and the plan then fails with `connect: can't assign requested address`. The
 `container` port forwarder and the latency proxy use extra ports, so this happens
@@ -161,8 +165,9 @@ does not touch the plan fixture.
 - **queries**: the sum of `calls` in `pg_stat_statements` during the plan. Protocol
   round trips that are not statements, such as connection startup and authentication,
   are not included.
-- **connections**: backends started during the plan. With `SetMaxIdleConns(0)`, almost
-  every statement outside a transaction opens a new connection.
+- **connections**: backends started during the plan. With `max_idle_connections = 0`
+  (`SetMaxIdleConns(0)`), almost every statement outside a transaction opens a new
+  connection.
 - **peak conns (max)**, **p95 conns**: connections the provider holds at the same time.
   `connsampler` counts client backends with `application_name = 'Terraform provider'`
   (the provider sets it as `fallback_application_name`) every 100 ms

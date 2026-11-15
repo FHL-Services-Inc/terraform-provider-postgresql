@@ -32,8 +32,8 @@ resource "postgresql_database" "my_db" {
 * `name` - (Required) The name of the database. Must be unique on the PostgreSQL
   server instance where it is configured. Changing it renames the database,
   which PostgreSQL refuses while other sessions are connected to it. With
-  `max_idle_connections` enabled in the provider, the provider closes its own
-  pooled connections to the database before renaming or dropping it.
+  `max_idle_connections` above zero in the provider (the default is `5`), the
+  provider closes its own pooled connections to the database before renaming or dropping it.
 
 * `owner` - (Optional) The role name of the user who will own the database, or
   `DEFAULT` to use the default (namely, the user executing the command). To
@@ -67,8 +67,8 @@ resource "postgresql_database" "my_db" {
   to it. When the template is a database managed in the same configuration,
   make this resource depend on the resources inside the template database
   (schemas, extensions, grants, ...), for example with `depends_on`, so they
-  are done before the copy starts. With `max_idle_connections` enabled in the
-  provider, the provider closes its pooled connections to the template
+  are done before the copy starts. With `max_idle_connections` above zero in
+  the provider (the default), the provider closes its pooled connections to the template
   database just before the copy; a resource inside the template database that
   is still running at that moment fails with `sql: database is closed`.
 

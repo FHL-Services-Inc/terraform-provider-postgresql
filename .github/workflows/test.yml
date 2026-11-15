@@ -11,6 +11,12 @@ name: test
 # superuser and the rds profile. The `unit` job checks that the shards cover
 # every test for both shard counts.
 #
+# The suite runs with the provider's default connection settings
+# (max_idle_connections = 5, binary_parameters = true). The "old defaults"
+# shards rerun it on PG 16 with PGMAXIDLECONNECTIONS=0 and
+# PGBINARYPARAMETERS=false, so the opt-out (no idle connections, a separate
+# prepare round-trip) stays covered too.
+#
 # PRs that only touch docs (website/**, docs/**, *.md) or tests/bench/** skip
 # the acceptance jobs. `test summary` always runs and is the job to mark as
 # required: it passes when every job that should have run succeeded.
@@ -53,8 +59,7 @@ jobs:
     outputs:
       go: ${{ steps.plan.outputs.go }}
       acc: ${{ steps.plan.outputs.acc }}
-      versions: ${{ steps.plan.outputs.versions }}
-      shards: ${{ steps.plan.outputs.shards }}
+      matrix: ${{ steps.plan.outputs.matrix }}
       shard_total: ${{ steps.plan.outputs.shard_total }}
     steps:
       - name: Checkout
@@ -94,12 +99,17 @@ jobs:
             n=$SHARDS_PR
           fi
           shards=$(jq -cn --argjson n "$n" '[range(1; $n + 1)]')
+          # Every version x shard with the default connection settings, plus
+          # the shards of PG 16 once more with the old defaults.
+          matrix=$(jq -cn --argjson v "$versions" --argjson s "$shards" '{include: (
+            [$v[] as $pg | $s[] as $sh | {pgversion: $pg, shard: $sh, old_defaults: false}]
+            + [$s[] | {pgversion: 16, shard: ., old_defaults: true}]
+          )}')
 
           {
             echo "go=$go"
             echo "acc=$acc"
-            echo "versions=$versions"
-            echo "shards=$shards"
+            echo "matrix=$matrix"
             echo "shard_total=$n"
           } | tee -a "$GITHUB_OUTPUT"
 
@@ -134,19 +144,20 @@ jobs:
           scripts/test-shard.sh verify "$SHARDS_FULL"
 
   acc:
-    name: acc (PG ${{ matrix.pgversion }}, shard ${{ matrix.shard }}/${{ needs.changes.outputs.shard_total }})
+    name: acc (PG ${{ matrix.pgversion }}${{ matrix.old_defaults && ', old defaults' || '' }}, shard ${{ matrix.shard }}/${{ needs.changes.outputs.shard_total }})
     needs: changes
     if: needs.changes.outputs.acc == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
     strategy:
-      matrix:
-        pgversion: ${{ fromJSON(needs.changes.outputs.versions) }}
-        shard: ${{ fromJSON(needs.changes.outputs.shards) }}
+      matrix: ${{ fromJSON(needs.changes.outputs.matrix) }}
 
     env:
       PGVERSION: ${{ matrix.pgversion }}
+      # Empty means unset: the provider then uses its own default.
+      PGMAXIDLECONNECTIONS: ${{ matrix.old_defaults && '0' || '' }}
+      PGBINARYPARAMETERS: ${{ matrix.old_defaults && 'false' || '' }}
 
     steps:
       - name: Checkout
@@ -173,7 +184,8 @@ jobs:
 
       # Build the test image (tests/build) through the Actions cache instead of
       # running apt-get in every shard; docker compose then uses the loaded
-      # tests-postgres image as is. Only the first shard writes the cache.
+      # tests-postgres image as is. Only the first shard (with the default
+      # settings) writes the cache.
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -185,7 +197,7 @@ jobs:
           tags: tests-postgres:latest
           load: true
           cache-from: type=gha,scope=pg${{ matrix.pgversion }}
-          cache-to: ${{ matrix.shard == 1 && format('type=gha,mode=max,scope=pg{0}', matrix.pgversion) || '' }}
+          cache-to: ${{ matrix.shard == 1 && !matrix.old_defaults && format('type=gha,mode=max,scope=pg{0}', matrix.pgversion) || '' }}
 
       - name: testacc
         run: make testacc

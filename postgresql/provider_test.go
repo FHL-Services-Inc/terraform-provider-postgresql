@@ -56,10 +56,13 @@ func TestProviderConfigureBinaryParameters(t *testing.T) {
 		raw  map[string]any
 		want bool
 	}{
-		{name: "default", want: false},
-		{name: "enabled", raw: map[string]any{"binary_parameters": true}, want: true},
-		{name: "env", env: "true", want: true},
+		{name: "default", want: true},
+		{name: "explicit true", raw: map[string]any{"binary_parameters": true}, want: true},
+		{name: "explicit false", raw: map[string]any{"binary_parameters": false}, want: false},
+		{name: "env false", env: "false", want: false},
+		{name: "env true", env: "true", want: true},
 		{name: "explicit false overrides env", env: "true", raw: map[string]any{"binary_parameters": false}, want: false},
+		{name: "explicit true overrides env", env: "false", raw: map[string]any{"binary_parameters": true}, want: true},
 	}
 
 	for _, tt := range tests {
@@ -78,12 +81,44 @@ func TestProviderConfigureBinaryParameters(t *testing.T) {
 	}
 }
 
+func TestProviderConfigureMaxIdleConnections(t *testing.T) {
+	tests := []struct {
+		name string
+		env  string
+		raw  map[string]any
+		want int
+	}{
+		{name: "default", want: 5},
+		{name: "explicit zero", raw: map[string]any{"max_idle_connections": 0}, want: 0},
+		{name: "explicit value", raw: map[string]any{"max_idle_connections": 10}, want: 10},
+		{name: "env zero", env: "0", want: 0},
+		{name: "env value", env: "4", want: 4},
+		{name: "explicit zero overrides env", env: "4", raw: map[string]any{"max_idle_connections": 0}, want: 0},
+		{name: "explicit value overrides env", env: "0", raw: map[string]any{"max_idle_connections": 3}, want: 3},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("PGMAXIDLECONNECTIONS", tt.env)
+			d := schema.TestResourceDataRaw(t, Provider().Schema, tt.raw)
+
+			client, err := providerConfigure(d)
+			if err != nil {
+				t.Fatalf("providerConfigure: %v", err)
+			}
+			if got := client.(*Client).config.MaxIdleConns; got != tt.want {
+				t.Errorf("MaxIdleConns = %d, want %d", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestProviderMaxIdleConnectionsEnvDefault(t *testing.T) {
 	s := Provider().Schema["max_idle_connections"]
 
 	t.Setenv("PGMAXIDLECONNECTIONS", "")
-	if v, err := s.DefaultValue(); err != nil || v != 0 {
-		t.Errorf("without PGMAXIDLECONNECTIONS: DefaultValue() = %v, %v; want 0", v, err)
+	if v, err := s.DefaultValue(); err != nil || v != defaultProviderMaxIdleConnections {
+		t.Errorf("without PGMAXIDLECONNECTIONS: DefaultValue() = %v, %v; want %d", v, err, defaultProviderMaxIdleConnections)
 	}
 
 	t.Setenv("PGMAXIDLECONNECTIONS", "4")
