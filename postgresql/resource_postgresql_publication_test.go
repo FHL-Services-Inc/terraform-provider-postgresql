@@ -1001,3 +1001,81 @@ resource "postgresql_publication" "test" {
 		},
 	})
 }
+
+// A failed rename must keep the old name in state. With the new name in
+// state, the next Read would look the publication up by it and take over the
+// publication that already has that name (destroy would then drop it).
+func TestAccPostgresqlPublication_FailedRenameKeepsOldState(t *testing.T) {
+	skipIfNotAcc(t)
+
+	dbSuffix, teardown := setupTestDatabase(t, true, true)
+	defer teardown()
+
+	dbName, _ := getTestDBNames(dbSuffix)
+	config := func(name string) string {
+		return fmt.Sprintf(`
+resource "postgresql_publication" "test" {
+  name     = "%s"
+  database = "%s"
+}
+`, name, dbName)
+	}
+
+	resource.Test(t, resource.TestCase{
+		PreCheck: func() {
+			testAccPreCheck(t)
+			testCheckCompatibleVersion(t, featurePublication)
+		},
+		Providers: testAccProviders,
+		CheckDestroy: resource.ComposeTestCheckFunc(
+			testAccCheckPostgresqlPublicationDestroy,
+			testAccCheckPublicationExistsInDB(dbName, "legacy"),
+		),
+		Steps: []resource.TestStep{
+			{
+				Config: config("app"),
+				Check:  testAccCheckPostgresqlPublicationExists("postgresql_publication.test"),
+			},
+			{
+				PreConfig: func() {
+					pgConfig := getTestConfig(t)
+					dbExecute(t, pgConfig.connStr(dbName), "CREATE PUBLICATION legacy")
+				},
+				Config:      config("legacy"),
+				ExpectError: regexp.MustCompile(`publication "legacy" already exists`),
+			},
+			{
+				Config:   config("app"),
+				PlanOnly: true,
+			},
+			{
+				Config: config("app"),
+				Check: resource.ComposeTestCheckFunc(
+					testAccCheckPostgresqlPublicationExists("postgresql_publication.test"),
+					resource.TestCheckResourceAttr("postgresql_publication.test", "name", "app"),
+					resource.TestCheckResourceAttr("postgresql_publication.test", "id", dbName+".app"),
+				),
+			},
+		},
+	})
+}
+
+func testAccCheckPublicationExistsInDB(database, pubName string) resource.TestCheckFunc {
+	return func(s *terraform.State) error {
+		client := testAccProvider.Meta().(*Client)
+		txn, err := startTransaction(client, database)
+		if err != nil {
+			return err
+		}
+		defer deferredRollback(txn)
+
+		exists, err := checkPublicationExists(txn, pubName)
+		if err != nil {
+			return err
+		}
+		if !exists {
+			return fmt.Errorf("publication %s not found in database %s", pubName, database)
+		}
+		return nil
+	}
+}

@@ -3,10 +3,12 @@ package postgresql
 import (
 	"database/sql"
 	"fmt"
+	"regexp"
 	"testing"
 
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/resource"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/terraform"
+	"github.com/lib/pq"
 )
 
 func TestAccPostgresqlServer_Basic(t *testing.T) {
@@ -578,4 +580,86 @@ func TestAccPostgresqlServer_Import(t *testing.T) {
 			importStep("postgresql_server.myserver_with_version"),
 		},
 	})
+}
+
+// A failed rename must keep the old name in state. With the new name in
+// state, the next Read would look the server up by it and take over the
+// server that already has that name (destroy would then drop it).
+func TestAccPostgresqlServer_FailedRenameKeepsOldState(t *testing.T) {
+	name := testUniqueName("myserver_app")
+	otherName := testUniqueName("myserver_legacy")
+	config := func(serverName string) string {
+		return fmt.Sprintf(`
+resource "postgresql_server" "test" {
+  server_name = "%s"
+  fdw_name    = "postgres_fdw"
+}
+`, serverName)
+	}
+
+	resource.Test(t, resource.TestCase{
+		PreCheck: func() {
+			testAccPreCheck(t)
+			testCheckCompatibleVersion(t, featureServer)
+			testSuperuserPreCheck(t)
+			// Created out of band: the other server depends on it, so a
+			// postgresql_extension resource could not be destroyed.
+			testDropExtensionsIfExist(t, "postgres_fdw")
+			pgConfig := getTestConfig(t)
+			dbExecute(t, pgConfig.connStr("postgres"), "CREATE EXTENSION postgres_fdw")
+			t.Cleanup(func() { testDropExtensionsIfExist(t, "postgres_fdw") })
+		},
+		Providers: testAccProviders,
+		CheckDestroy: resource.ComposeTestCheckFunc(
+			testAccCheckPostgresqlServerDestroy,
+			testAccCheckServerExistsByName(otherName),
+		),
+		Steps: []resource.TestStep{
+			{
+				Config: config(name),
+				Check:  testAccCheckPostgresqlServerExists("postgresql_server.test"),
+			},
+			{
+				PreConfig: func() {
+					pgConfig := getTestConfig(t)
+					dbExecute(t, pgConfig.connStr("postgres"), fmt.Sprintf(
+						"CREATE SERVER %s FOREIGN DATA WRAPPER postgres_fdw", pq.QuoteIdentifier(otherName)))
+				},
+				Config:      config(otherName),
+				ExpectError: regexp.MustCompile(`server "` + otherName + `" already exists`),
+			},
+			{
+				Config:   config(name),
+				PlanOnly: true,
+			},
+			{
+				Config: config(name),
+				Check: resource.ComposeTestCheckFunc(
+					testAccCheckPostgresqlServerExists("postgresql_server.test"),
+					resource.TestCheckResourceAttr("postgresql_server.test", "server_name", name),
+					resource.TestCheckResourceAttr("postgresql_server.test", "id", name),
+				),
+			},
+		},
+	})
+}
+
+func testAccCheckServerExistsByName(serverName string) resource.TestCheckFunc {
+	return func(s *terraform.State) error {
+		client := testAccProvider.Meta().(*Client)
+		txn, err := startTransaction(client, "")
+		if err != nil {
+			return err
+		}
+		defer deferredRollback(txn)
+
+		exists, err := checkServerExists(txn, serverName)
+		if err != nil {
+			return err
+		}
+		if !exists {
+			return fmt.Errorf("foreign server %s not found", serverName)
+		}
+		return nil
+	}
 }

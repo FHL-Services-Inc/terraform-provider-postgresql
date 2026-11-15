@@ -892,6 +892,10 @@ func resourcePostgreSQLRoleUpdate(db *DBConnection, d *schema.ResourceData) erro
 	}
 	d.Partial(false)
 
+	// Only after the commit: Read looks the role up by the ID, and in
+	// partial mode a failed update still saves the ID.
+	d.SetId(d.Get(roleNameAttr).(string))
+
 	return resourcePostgreSQLRoleReadImpl(db, d)
 }
 
@@ -911,8 +915,6 @@ func setRoleName(txn *sql.Tx, d *schema.ResourceData) error {
 	if _, err := txn.Exec(sql); err != nil {
 		return fmt.Errorf("error updating role NAME: %w", err)
 	}
-
-	d.SetId(n)
 
 	return nil
 }

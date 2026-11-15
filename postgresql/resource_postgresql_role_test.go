@@ -812,3 +812,50 @@ resource "postgresql_role" "role" {
 		},
 	})
 }
+
+// A failed update that renames the role must keep the old ID in state. Read
+// looks the role up by the ID: with the new name, which was rolled back, the
+// next refresh would drop the role from state and leave it unmanaged.
+func TestAccPostgresqlRole_FailedRenameKeepsOldState(t *testing.T) {
+	roleName := testUniqueName("role_failed_rename")
+	newRoleName := testUniqueName("role_failed_rename_new")
+	config := func(name, roles string) string {
+		return fmt.Sprintf(`
+resource "postgresql_role" "role" {
+  name  = "%s"
+  roles = [%s]
+}
+`, name, roles)
+	}
+
+	resource.Test(t, resource.TestCase{
+		PreCheck: func() {
+			testAccPreCheck(t)
+		},
+		Providers:    testAccProviders,
+		CheckDestroy: testAccCheckPostgresqlRoleDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config: config(roleName, ""),
+				Check:  resource.TestCheckResourceAttr("postgresql_role.role", "id", roleName),
+			},
+			{
+				// Granting a role that doesn't exist fails after the rename,
+				// so the transaction rolls back.
+				Config:      config(newRoleName, `"does_not_exist"`),
+				ExpectError: regexp.MustCompile(`role "does_not_exist" does not exist`),
+			},
+			{
+				Config:   config(roleName, ""),
+				PlanOnly: true,
+			},
+			{
+				Config: config(newRoleName, ""),
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr("postgresql_role.role", "id", newRoleName),
+					resource.TestCheckResourceAttr("postgresql_role.role", "name", newRoleName),
+				),
+			},
+		},
+	})
+}

@@ -246,6 +246,11 @@ func resourcePostgreSQLServerUpdate(db *DBConnection, d *schema.ResourceData) er
 		)
 	}
 
+	// If the update fails, keep the previous state. Otherwise the SDK saves
+	// the new name, and the next Read looks the server up by it: it loses the
+	// server, or takes over another one that already has that name.
+	d.Partial(true)
+
 	txn, err := startTransaction(db.client, "")
 	if err != nil {
 		return err
@@ -267,6 +272,7 @@ func resourcePostgreSQLServerUpdate(db *DBConnection, d *schema.ResourceData) er
 	if err = txn.Commit(); err != nil {
 		return fmt.Errorf("error updating foreign server: %w", err)
 	}
+	d.Partial(false)
 
 	return resourcePostgreSQLServerReadImpl(db, d)
 }

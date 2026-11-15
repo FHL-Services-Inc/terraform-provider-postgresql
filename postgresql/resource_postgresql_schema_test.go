@@ -3,6 +3,7 @@ package postgresql
 import (
 	"database/sql"
 	"fmt"
+	"regexp"
 	"testing"
 
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/resource"
@@ -1018,4 +1019,78 @@ resource "postgresql_schema" "test" {
 			},
 		},
 	})
+}
+
+// A failed rename must keep the old name in state. With the new name in
+// state, the next Read would look the schema up by it and take over the
+// schema that already has that name (destroy would then drop it).
+func TestAccPostgresqlSchema_FailedRenameKeepsOldState(t *testing.T) {
+	skipIfNotAcc(t)
+
+	dbSuffix, teardown := setupTestDatabase(t, true, true)
+	defer teardown()
+
+	dbName, _ := getTestDBNames(dbSuffix)
+	config := func(name string) string {
+		return fmt.Sprintf(`
+resource "postgresql_schema" "test" {
+  name     = "%s"
+  database = "%s"
+}
+`, name, dbName)
+	}
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:  func() { testAccPreCheck(t) },
+		Providers: testAccProviders,
+		CheckDestroy: resource.ComposeTestCheckFunc(
+			testAccCheckPostgresqlSchemaDestroy,
+			testAccCheckSchemaExistsInDB(dbName, "legacy"),
+		),
+		Steps: []resource.TestStep{
+			{
+				Config: config("app"),
+				Check:  testAccCheckPostgresqlSchemaExists("postgresql_schema.test", "app"),
+			},
+			{
+				PreConfig: func() {
+					pgConfig := getTestConfig(t)
+					dbExecute(t, pgConfig.connStr(dbName), "CREATE SCHEMA legacy")
+				},
+				Config:      config("legacy"),
+				ExpectError: regexp.MustCompile(`schema "legacy" already exists`),
+			},
+			{
+				Config:   config("app"),
+				PlanOnly: true,
+			},
+			{
+				Config: config("app"),
+				Check: resource.ComposeTestCheckFunc(
+					testAccCheckPostgresqlSchemaExists("postgresql_schema.test", "app"),
+					resource.TestCheckResourceAttr("postgresql_schema.test", "id", dbName+".app"),
+				),
+			},
+		},
+	})
+}
+
+func testAccCheckSchemaExistsInDB(database, schemaName string) resource.TestCheckFunc {
+	return func(s *terraform.State) error {
+		client := testAccProvider.Meta().(*Client)
+		txn, err := startTransaction(client, database)
+		if err != nil {
+			return err
+		}
+		defer deferredRollback(txn)
+
+		exists, err := checkSchemaExists(txn, schemaName)
+		if err != nil {
+			return err
+		}
+		if !exists {
+			return fmt.Errorf("schema %s not found in database %s", schemaName, database)
+		}
+		return nil
+	}
 }
