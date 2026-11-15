@@ -2,7 +2,9 @@ package postgresql
 
 import (
 	"bytes"
+	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"log"
 	"strings"
@@ -24,7 +26,7 @@ func resourcePostgreSQLUserMapping() *schema.Resource {
 		Update: PGResourceFunc(resourcePostgreSQLUserMappingUpdate),
 		Delete: PGResourceFunc(resourcePostgreSQLUserMappingDelete),
 		Importer: &schema.ResourceImporter{
-			StateContext: schema.ImportStatePassthroughContext,
+			StateContext: resourcePostgreSQLUserMappingImport,
 		},
 
 		Schema: map[string]*schema.Schema{
@@ -273,4 +275,115 @@ func userMappingUserSQL(username string) string {
 		return "PUBLIC"
 	}
 	return pq.QuoteIdentifier(username)
+}
+
+// userMappingImportFormat describes the import ID, which is the resource ID.
+const userMappingImportFormat = "<user_name>.<server_name>"
+
+// userMappingCatalogEntry is a user mapping as pg_user_mappings shows it.
+type userMappingCatalogEntry struct {
+	public       bool // umuser = 0
+	user, server string
+}
+
+// userMappingLookup returns the user mappings of the given servers.
+type userMappingLookup func(servers []string) ([]userMappingCatalogEntry, error)
+
+// parseUserMappingImportID splits an import ID "<user_name>.<server_name>"
+// into its parts. Role and server names may contain dots, so the ID is split
+// at every dot and the split that names an existing user mapping wins; an ID
+// that matches no mapping, or more than one, is rejected. user_name keeps the
+// spelling of the ID, so "public" and "PUBLIC" both import the PUBLIC mapping
+// as written in the configuration.
+func parseUserMappingImportID(id string, lookup userMappingLookup) (string, string, error) {
+	fail := func(err error) (string, string, error) {
+		return "", "", importParseError("postgresql_user_mapping", id, userMappingImportFormat, err)
+	}
+
+	type split struct{ user, server string }
+	var splits []split
+	var servers []string
+	for i := range len(id) {
+		if id[i] == '.' {
+			splits = append(splits, split{user: id[:i], server: id[i+1:]})
+			servers = append(servers, id[i+1:])
+		}
+	}
+	if len(splits) == 0 {
+		return fail(errors.New("no user mapping matches the ID"))
+	}
+
+	mappings, err := lookup(servers)
+	if err != nil {
+		return fail(fmt.Errorf("could not look up user mappings: %w", err))
+	}
+
+	var candidates []split
+	var descr []string
+	for _, s := range splits {
+		for _, m := range mappings {
+			if m.server != s.server {
+				continue
+			}
+			if isPublicUserMapping(s.user) && m.public || !isPublicUserMapping(s.user) && !m.public && m.user == s.user {
+				candidates = append(candidates, s)
+				descr = append(descr, fmt.Sprintf("user_name=%s server_name=%s", s.user, s.server))
+				break
+			}
+		}
+	}
+
+	switch len(candidates) {
+	case 1:
+		return candidates[0].user, candidates[0].server, nil
+	case 0:
+		return fail(errors.New("no user mapping matches the ID"))
+	default:
+		return fail(ambiguousImportError(descr))
+	}
+}
+
+// lookupUserMappings reads the user mappings of servers from
+// pg_user_mappings, which every role can read (only the options are masked).
+func lookupUserMappings(db QueryAble) userMappingLookup {
+	return func(servers []string) ([]userMappingCatalogEntry, error) {
+		rows, err := db.Query(
+			"SELECT umuser = 0, usename, srvname FROM pg_catalog.pg_user_mappings WHERE srvname = ANY($1)",
+			pq.Array(servers),
+		)
+		if err != nil {
+			return nil, err
+		}
+		defer closeRows(rows)
+
+		var out []userMappingCatalogEntry
+		for rows.Next() {
+			var m userMappingCatalogEntry
+			if err := rows.Scan(&m.public, &m.user, &m.server); err != nil {
+				return nil, err
+			}
+			out = append(out, m)
+		}
+		return out, rows.Err()
+	}
+}
+
+func resourcePostgreSQLUserMappingImport(ctx context.Context, d *schema.ResourceData, meta any) ([]*schema.ResourceData, error) {
+	db, err := meta.(*Client).Connect()
+	if err != nil {
+		return nil, err
+	}
+
+	username, serverName, err := parseUserMappingImportID(d.Id(), lookupUserMappings(db))
+	if err != nil {
+		return nil, err
+	}
+	if err := d.Set(userMappingUserNameAttr, username); err != nil {
+		return nil, fmt.Errorf("could not set %s: %w", userMappingUserNameAttr, err)
+	}
+	if err := d.Set(userMappingServerNameAttr, serverName); err != nil {
+		return nil, fmt.Errorf("could not set %s: %w", userMappingServerNameAttr, err)
+	}
+
+	return []*schema.ResourceData{d}, nil
 }

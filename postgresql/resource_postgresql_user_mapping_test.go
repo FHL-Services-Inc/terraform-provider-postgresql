@@ -3,9 +3,10 @@ package postgresql
 import (
 	"database/sql"
 	"fmt"
-	"strings"
+	"regexp"
 	"testing"
 
+	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/acctest"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/resource"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/terraform"
 )
@@ -41,6 +42,8 @@ func TestAccPostgresqlUserMapping_Basic(t *testing.T) {
 						"postgresql_user_mapping.special_chars", "options.password", "pass=$*'"),
 				),
 			},
+			testAccUserMappingImportStep("postgresql_user_mapping.remote"),
+			testAccUserMappingImportStep("postgresql_user_mapping.special_chars"),
 		},
 	})
 }
@@ -88,6 +91,17 @@ func TestAccPostgresqlUserMapping_Update(t *testing.T) {
 			},
 		},
 	})
+}
+
+// testAccUserMappingImportStep imports resourceName by its ID and compares
+// the imported state with the current one, except for the ignored attributes.
+func testAccUserMappingImportStep(resourceName string, ignore ...string) resource.TestStep {
+	return resource.TestStep{
+		ResourceName:            resourceName,
+		ImportState:             true,
+		ImportStateVerify:       true,
+		ImportStateVerifyIgnore: ignore,
+	}
 }
 
 // testUserMappingMaskedPreCheck skips unless the provider connects as a
@@ -146,6 +160,8 @@ func TestAccPostgresqlUserMapping_NonSuperuser(t *testing.T) {
 					resource.TestCheckResourceAttr("postgresql_user_mapping.masked", "options.password", "passUpdated"),
 				),
 			},
+			// The options of another role's mapping are not visible here.
+			testAccUserMappingImportStep("postgresql_user_mapping.masked", "options"),
 		},
 	})
 }
@@ -210,8 +226,9 @@ func testAccCheckPostgresqlUserMappingDestroy(s *terraform.State) error {
 		}
 		defer deferredRollback(txn)
 
-		splitted := strings.Split(rs.Primary.ID, ".")
-		exists, err := checkUserMappingExists(txn, splitted[0], splitted[1])
+		exists, err := checkUserMappingExists(txn,
+			rs.Primary.Attributes[userMappingUserNameAttr],
+			rs.Primary.Attributes[userMappingServerNameAttr])
 
 		if err != nil {
 			return fmt.Errorf("error checking user mapping %s", err)
@@ -423,6 +440,10 @@ func TestAccPostgresqlUserMapping_Public(t *testing.T) {
 					resource.TestCheckResourceAttr("postgresql_user_mapping.upper", "options.password", "passUpdated"),
 				),
 			},
+			// The ID keeps the spelling of user_name ("public.<server>",
+			// "PUBLIC.<server>"), and so does the imported state.
+			testAccUserMappingImportStep("postgresql_user_mapping.lower"),
+			testAccUserMappingImportStep("postgresql_user_mapping.upper"),
 		},
 	})
 }
@@ -465,4 +486,87 @@ resource "postgresql_user_mapping" "upper" {
   }
 }
 `, lowerServer, upperServer, password)
+}
+
+// TestAccPostgresqlUserMapping_ImportDots imports mappings whose role or
+// server name contains dots, which the "<user_name>.<server_name>" ID can't
+// separate syntactically (issue #166). The importer picks the split that
+// names an existing mapping.
+func TestAccPostgresqlUserMapping_ImportDots(t *testing.T) {
+	suffix := acctest.RandString(6)
+	dottedRole := "tf_tests.um.role_" + suffix
+	dottedServer := "tf_tests.um.srv_" + suffix
+	plainRole := "tf_tests_um_role_" + suffix
+	plainServer := "tf_tests_um_srv_" + suffix
+
+	resource.Test(t, resource.TestCase{
+		PreCheck: func() {
+			testAccPreCheck(t)
+			testCheckCompatibleVersion(t, featureServer)
+			testUserMappingPublicPreCheck(t)
+		},
+		Providers:    testAccProviders,
+		CheckDestroy: testAccCheckPostgresqlUserMappingDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config: testAccPostgresqlUserMappingDotsConfig(dottedRole, dottedServer, plainRole, plainServer),
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr("postgresql_user_mapping.dotted_role", "id", dottedRole+"."+plainServer),
+					resource.TestCheckResourceAttr("postgresql_user_mapping.dotted_server", "id", plainRole+"."+dottedServer),
+				),
+			},
+			testAccUserMappingImportStep("postgresql_user_mapping.dotted_role"),
+			testAccUserMappingImportStep("postgresql_user_mapping.dotted_server"),
+			testAccUserMappingImportStep("postgresql_user_mapping.dotted_both"),
+			testAccUserMappingImportStep("postgresql_user_mapping.public_dotted_server"),
+			{
+				ResourceName:  "postgresql_user_mapping.dotted_role",
+				ImportState:   true,
+				ImportStateId: plainRole + ".no_such_server_" + suffix,
+				ExpectError:   regexp.MustCompile("no user mapping matches the ID"),
+			},
+		},
+	})
+}
+
+func testAccPostgresqlUserMappingDotsConfig(dottedRole, dottedServer, plainRole, plainServer string) string {
+	return fmt.Sprintf(`
+resource "postgresql_role" "dotted" {
+  name = "%[1]s"
+}
+
+resource "postgresql_role" "plain" {
+  name = "%[3]s"
+}
+
+resource "postgresql_server" "dotted" {
+  server_name = "%[2]s"
+  fdw_name    = "postgres_fdw"
+}
+
+resource "postgresql_server" "plain" {
+  server_name = "%[4]s"
+  fdw_name    = "postgres_fdw"
+}
+
+resource "postgresql_user_mapping" "dotted_role" {
+  server_name = postgresql_server.plain.server_name
+  user_name   = postgresql_role.dotted.name
+}
+
+resource "postgresql_user_mapping" "dotted_server" {
+  server_name = postgresql_server.dotted.server_name
+  user_name   = postgresql_role.plain.name
+}
+
+resource "postgresql_user_mapping" "dotted_both" {
+  server_name = postgresql_server.dotted.server_name
+  user_name   = postgresql_role.dotted.name
+}
+
+resource "postgresql_user_mapping" "public_dotted_server" {
+  server_name = postgresql_server.dotted.server_name
+  user_name   = "PUBLIC"
+}
+`, dottedRole, dottedServer, plainRole, plainServer)
 }
