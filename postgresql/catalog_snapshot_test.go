@@ -120,7 +120,7 @@ var (
 
 // catalogFixture is the canned catalog of database "testdb": roles r (grantee
 // of every resource) and o (owner), schema s with table t, sequence q and the
-// routines f (two overloads, EXECUTE on one) and p, default ACLs by o, and
+// routines f (two overloads) and p, default ACLs by o, and
 // the database ACL. Privileges match the resources in grantReadCases.
 func catalogFixture() [][]driver.Value {
 	acl := func(s string) driver.Value { return s }
@@ -140,10 +140,10 @@ func catalogFixture() [][]driver.Value {
 
 func catalogProcFixture() [][]driver.Value {
 	return [][]driver.Value{
-		{int64(20), "f", "{o=X/o,r=X*/o}"},
-		{int64(20), "f", "{o=X/o}"},
-		{int64(20), "p", "{o=X/o,r=X/o}"},
-		{int64(21), "nogrant", "{o=X/o}"},
+		{int64(20), "f", "f", "{o=X/o,r=X*/o}"},
+		{int64(20), "f", "f", "{o=X/o,r=X/o}"},
+		{int64(20), "p", "p", "{o=X/o,r=X/o}"},
+		{int64(21), "nogrant", "f", "{o=X/o}"},
 	}
 }
 
@@ -287,16 +287,16 @@ func TestCatalogSnapshotServesReadsFromOneBuild(t *testing.T) {
 	}
 }
 
-// TestCatalogSnapshotDetectsDrift: the first object (by name) whose privileges
-// differ is written to state, as the direct Read does; a table without any
-// ACL reads as no privileges.
+// TestCatalogSnapshotDetectsDrift: on drift the value of
+// grantReadDriftPrivileges is written to state, as the direct Read does, with
+// every relation and routine overload compared on its own.
 func TestCatalogSnapshotDetectsDrift(t *testing.T) {
 	client := newCatalogSnapshotConnection(t, catalogFixtureRows(catalogFixture(), catalogProcFixture()), nil)
 	cases := grantReadCases()
 
-	d := readCase(t, client, cases[0], map[string]any{"schema": "empty"}) // table noacl: NULL relacl
+	d := readCase(t, client, cases[0], map[string]any{"schema": "empty"}) // table noacl: no privileges for r
 	if got := privilegesOfData(d); fmt.Sprint(got) != "[]" {
-		t.Errorf("table grant on a table without ACL: privileges = %v, want []", got)
+		t.Errorf("table grant on a table without privileges: privileges = %v, want []", got)
 	}
 
 	d = readCase(t, client, cases[0], map[string]any{"privileges": []any{"INSERT"}}) // table, all objects
@@ -309,21 +309,25 @@ func TestCatalogSnapshotDetectsDrift(t *testing.T) {
 		t.Errorf("table grant on t with drift: privileges = %v, want [SELECT]", got)
 	}
 
-	// Overloads merge: f has EXECUTE on one overload only and reads as granted.
 	d = readCase(t, client, cases[3], nil)
 	if got := privilegesOfData(d); fmt.Sprint(got) != "[EXECUTE]" {
 		t.Errorf("function grant on f: privileges = %v, want [EXECUTE]", got)
 	}
 
-	// A routine without a grant to the role is drift, for every routine type.
+	// A function without a grant to the role is drift for the function and
+	// routine types; a procedure grant does not cover it (prokind filter).
 	for _, objectType := range []string{"function", "procedure", "routine"} {
+		want := "[]"
+		if objectType == "procedure" {
+			want = "[EXECUTE]"
+		}
 		d = readCase(t, client, cases[3], map[string]any{"schema": "empty", "object_type": objectType, "objects": []any{"nogrant"}})
-		if got := privilegesOfData(d); fmt.Sprint(got) != "[]" {
-			t.Errorf("%s grant on nogrant: privileges = %v, want []", objectType, got)
+		if got := privilegesOfData(d); fmt.Sprint(got) != want {
+			t.Errorf("%s grant on nogrant: privileges = %v, want %s", objectType, got, want)
 		}
 		d = readCase(t, client, cases[3], map[string]any{"schema": "empty", "object_type": objectType, "objects": []any{}})
-		if got := privilegesOfData(d); fmt.Sprint(got) != "[]" {
-			t.Errorf("%s grant on all routines: privileges = %v, want [] (nogrant)", objectType, got)
+		if got := privilegesOfData(d); fmt.Sprint(got) != want {
+			t.Errorf("%s grant on all routines: privileges = %v, want %s", objectType, got, want)
 		}
 	}
 
@@ -335,6 +339,44 @@ func TestCatalogSnapshotDetectsDrift(t *testing.T) {
 
 	if got := catalogFake.count(catalogSnapshotQuery); got != 1 {
 		t.Errorf("catalog snapshot built %d times, want 1", got)
+	}
+
+	// Overloads are compared one by one: with EXECUTE on one overload of f
+	// only, the grant on f drifts and stores the partial marker; a function
+	// grant on every routine of s leaves the procedure p out.
+	procs := catalogProcFixture()
+	procs[1][3] = "{o=X/o}"
+	client = newCatalogSnapshotConnection(t, catalogFixtureRows(catalogFixture(), procs), nil)
+	d = readCase(t, client, cases[3], nil)
+	if got := privilegesOfData(d); fmt.Sprint(got) != "[EXECUTE"+partialPrivilegeSuffix+"]" {
+		t.Errorf("function grant on f with one overload granted: privileges = %v, want [EXECUTE%s]", got, partialPrivilegeSuffix)
+	}
+	procs[0][3], procs[1][3], procs[2][3] = "{o=X/o,r=X/o}", "{o=X/o,r=X/o}", "{o=X/o}"
+	client = newCatalogSnapshotConnection(t, catalogFixtureRows(catalogFixture(), procs), nil)
+	d = readCase(t, client, cases[3], map[string]any{"objects": []any{}})
+	if got := privilegesOfData(d); fmt.Sprint(got) != "[EXECUTE]" {
+		t.Errorf("function grant on all functions of s: privileges = %v, want [EXECUTE] (procedure p left out)", got)
+	}
+	d = readCase(t, client, cases[3], map[string]any{"object_type": "routine", "objects": []any{}})
+	if got := privilegesOfData(d); fmt.Sprint(got) != "[EXECUTE"+partialPrivilegeSuffix+"]" {
+		t.Errorf("routine grant on all routines of s: privileges = %v, want [EXECUTE%s]", got, partialPrivilegeSuffix)
+	}
+}
+
+// TestCatalogSnapshotLeavesSignatureEntriesToDirectRead: a function grant
+// whose objects carry an argument list is read directly (the direct Read
+// resolves it with to_regprocedure), without building the snapshot.
+func TestCatalogSnapshotLeavesSignatureEntriesToDirectRead(t *testing.T) {
+	client := newCatalogSnapshotConnection(t, catalogFixtureRows(catalogFixture(), catalogProcFixture()), nil)
+	tc := grantReadCases()[3] // function grant on f
+	for _, objectType := range []string{"function", "procedure", "routine"} {
+		readCase(t, client, tc, map[string]any{"object_type": objectType, "objects": []any{"f", "f(integer)"}})
+	}
+	if got := catalogFake.count(catalogSnapshotQuery) + catalogFake.count(catalogSnapshotProcQuery); got != 0 {
+		t.Errorf("snapshot statements = %d, want 0", got)
+	}
+	if got := catalogFake.count("to_regprocedure"); got != 3 {
+		t.Errorf("%d direct Reads, want 3: %q", got, catalogFake.all())
 	}
 }
 
@@ -475,7 +517,7 @@ func TestCatalogSnapshotFallsBackToDirectRead(t *testing.T) {
 		if got := catalogFake.count(catalogSnapshotQuery); got != 1 {
 			t.Errorf("build attempted %d times, want 1 (backed off until the TTL)", got)
 		}
-		if got := catalogFake.count("aclexplode(c.relacl)"); got != 3 {
+		if got := catalogFake.count("aclexplode(COALESCE(c.relacl"); got != 3 {
 			t.Errorf("%d direct Reads, want 3: %q", got, catalogFake.all())
 		}
 	})
@@ -492,7 +534,7 @@ func TestCatalogSnapshotFallsBackToDirectRead(t *testing.T) {
 		if got := catalogFake.count(catalogSnapshotQuery); got != 1 {
 			t.Errorf("build attempted %d times, want 1", got)
 		}
-		if got := catalogFake.count("aclexplode(c.relacl)"); got != 2 {
+		if got := catalogFake.count("aclexplode(COALESCE(c.relacl"); got != 2 {
 			t.Errorf("%d direct Reads, want 2", got)
 		}
 	})
@@ -504,7 +546,7 @@ func TestCatalogSnapshotFallsBackToDirectRead(t *testing.T) {
 		if d := readCase(t, client, grantReadCases()[1], nil); d.Id() == "" { // objects = [t]
 			t.Error("Read cleared the ID")
 		}
-		if got := catalogFake.count("aclexplode(c.relacl)"); got != 1 {
+		if got := catalogFake.count("aclexplode(COALESCE(c.relacl"); got != 1 {
 			t.Errorf("%d direct Reads, want 1", got)
 		}
 		// The snapshot stays for the Reads it can serve.
@@ -621,6 +663,8 @@ func setupACLFixture(t *testing.T) (dbName, roleName string, aclRoles []string, 
 		"CREATE FUNCTION test_schema.f(text) RETURNS text LANGUAGE sql AS 'SELECT $1'",
 		"CREATE PROCEDURE test_schema.p() LANGUAGE sql AS 'SELECT 1'",
 		"CREATE FUNCTION test_schema.h() RETURNS integer LANGUAGE sql AS 'SELECT 1'",
+		// g keeps a NULL proacl: its default privileges (EXECUTE for PUBLIC).
+		"CREATE FUNCTION test_schema.g() RETURNS integer LANGUAGE sql AS 'SELECT 1'",
 		"REVOKE ALL ON FUNCTION test_schema.f(integer), test_schema.f(text), test_schema.h() FROM PUBLIC",
 		"REVOKE ALL ON PROCEDURE test_schema.p() FROM PUBLIC",
 		"GRANT SELECT, INSERT ON test_schema.t1 TO " + role,
@@ -785,6 +829,13 @@ func TestAccCatalogSnapshotEquivalence(t *testing.T) {
 		grant("matview_m1_drift", map[string]any{"schema": "test_schema", "object_type": "table", "objects": []any{"m1"}, "privileges": []any{"SELECT"}}),
 		grant("partitioned_pt", map[string]any{"schema": "test_schema", "object_type": "table", "objects": []any{"pt"}, "privileges": []any{"SELECT", "INSERT"}}),
 		grant("sequence_not_a_table", map[string]any{"schema": "test_schema", "object_type": "table", "objects": []any{"s1"}, "privileges": []any{"USAGE"}}),
+		grant("table_t3_owner_default_acl", map[string]any{"role": owner, "schema": "test_schema", "object_type": "table", "objects": []any{"t3"}, "privileges": []any{"ALL"}}),
+		grant("table_t3_public_default_acl", map[string]any{"role": "public", "schema": "test_schema", "object_type": "table", "objects": []any{"t3"}, "privileges": []any{"SELECT"}}),
+		grant("function_g_public_default_acl", map[string]any{"role": "public", "schema": "test_schema", "object_type": "function", "objects": []any{"g"}, "privileges": []any{"EXECUTE"}}),
+		grant("function_g_owner_default_acl", map[string]any{"role": owner, "schema": "test_schema", "object_type": "function", "objects": []any{"g"}, "privileges": []any{"EXECUTE"}}),
+		grant("schema_dev_owner_default_acl", map[string]any{"role": owner, "schema": "dev_schema", "object_type": "schema", "privileges": []any{"USAGE", "CREATE"}}),
+		grant("schema_dev_public_default_acl", map[string]any{"role": "public", "schema": "dev_schema", "object_type": "schema", "privileges": []any{"USAGE"}}),
+		grant("function_f_signature_named_arg", map[string]any{"schema": "test_schema", "object_type": "function", "objects": []any{"f(IN x integer)"}, "privileges": []any{"EXECUTE"}}),
 		grant("sequence", map[string]any{"schema": "test_schema", "object_type": "sequence", "privileges": []any{"USAGE"}}),
 		grant("sequence_s1", map[string]any{"schema": "test_schema", "object_type": "sequence", "objects": []any{"s1"}, "privileges": []any{"USAGE"}}),
 		grant("function_f", map[string]any{"schema": "test_schema", "object_type": "function", "objects": []any{"f"}, "privileges": []any{"EXECUTE"}}),
@@ -820,20 +871,10 @@ func TestAccCatalogSnapshotEquivalence(t *testing.T) {
 		defaultPrivileges("missing_schema", map[string]any{"schema": "nope", "object_type": "table", "privileges": []any{"SELECT"}}),
 	}
 
-	// When several relations of a schema-wide grant differ from the
-	// configuration, the direct Read writes back the privileges of whichever
-	// relation the server returned first (an unordered GROUP BY), the snapshot
-	// those of the first relation by name. Both produce a non-empty plan and
-	// the same REVOKE/GRANT on apply; for these cases the test only requires
-	// that both detect the drift.
-	severalDrift := map[string]bool{
-		"grant/table_all_select":     true, // t1 has INSERT too, t3 has nothing
-		"grant/table_all_insert":     true,
-		"grant/table_space_role_all": true, // SELECT on t1, UPDATE on t2, nothing on t3
-	}
-
-	state := func(tc grantReadCase, d *schema.ResourceData) string {
-		name := tc.name
+	// Every case must read exactly the same state, drift included: both
+	// Reads compare each relation and routine overload on its own and store
+	// grantReadDriftPrivileges' order-independent value on drift.
+	state := func(d *schema.ResourceData) string {
 		if d.Id() == "" {
 			return "<pruned>"
 		}
@@ -849,14 +890,7 @@ func TestAccCatalogSnapshotEquivalence(t *testing.T) {
 		var b strings.Builder
 		fmt.Fprintf(&b, "id=%s", s.ID)
 		for _, k := range keys {
-			if severalDrift[name] && strings.HasPrefix(k, "privileges.") {
-				continue
-			}
 			fmt.Fprintf(&b, " %s=%s", k, s.Attributes[k])
-		}
-		if severalDrift[name] {
-			configured := schema.NewSet(schema.HashString, tc.attrs["privileges"].([]any))
-			fmt.Fprintf(&b, " drift=%t", !d.Get("privileges").(*schema.Set).Equal(configured))
 		}
 		return b.String()
 	}
@@ -871,7 +905,13 @@ func TestAccCatalogSnapshotEquivalence(t *testing.T) {
 			var errDirect, errSnapshot error
 			if strings.HasPrefix(tc.name, "grant/") {
 				errDirect = readRolePrivileges(db, direct)
-				errSnapshot = readRolePrivilegesFromSnapshot(snap, db, fromSnapshot)
+				if grantReadUsesSnapshot(fromSnapshot) {
+					errSnapshot = readRolePrivilegesFromSnapshot(snap, db, fromSnapshot)
+				} else {
+					// Function signature entries are left to the direct
+					// Read (grantReadUsesSnapshot).
+					errSnapshot = readRolePrivileges(db, fromSnapshot)
+				}
 			} else {
 				errDirect = readRoleDefaultPrivileges(db, direct)
 				errSnapshot = readRoleDefaultPrivilegesFromSnapshot(snap, db, fromSnapshot)
@@ -879,7 +919,7 @@ func TestAccCatalogSnapshotEquivalence(t *testing.T) {
 			if errDirect != nil || errSnapshot != nil {
 				t.Fatalf("direct: %v, snapshot: %v", errDirect, errSnapshot)
 			}
-			if got, want := state(tc, fromSnapshot), state(tc, direct); got != want {
+			if got, want := state(fromSnapshot), state(direct); got != want {
 				t.Errorf("snapshot Read differs from the direct Read\n  snapshot: %s\n  direct:   %s", got, want)
 			} else {
 				t.Logf("%s", got)

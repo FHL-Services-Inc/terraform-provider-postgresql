@@ -255,7 +255,8 @@ The following arguments are supported:
   string cannot be parsed. Default: `9.0.0`.
 * `catalog_snapshot` - (Optional) Opt-in, off by default. If set to `true`,
   `postgresql_grant` (all object types but `column`, `foreign_data_wrapper` and
-  `foreign_server`) and
+  `foreign_server`; function, procedure and routine grants whose `objects`
+  carry an argument list are also read directly) and
   `postgresql_default_privileges` are read from one snapshot of the catalogs per
   database (`pg_roles`, `pg_namespace`, `pg_class`, `pg_proc`, `pg_default_acl`,
   `pg_database`), taken by one statement the first time a resource of that database

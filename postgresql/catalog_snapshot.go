@@ -31,25 +31,37 @@ var catalogSnapshotMaxBytes = 64 << 20
 //	d: default ACLs     (defaclrole, defaclnamespace, NULL, defaclobjtype, defaclacl)
 //	D: this database    (0, 0, datname, NULL, datacl)
 //
+// A NULL object ACL is read as acldefault(type, owner), exactly as the direct
+// Read queries do (see relationACLType), so an object never granted or revoked
+// on explicitly reads with its owner's (and PUBLIC's) default privileges.
+// Default ACLs are read as they are, as the direct default privileges Read
+// does.
+//
 // ACLs come back in their text form (aclitem[]::text) and are parsed in Go
 // when a Read needs them: exploding them on the server costs several times the
 // raw read on large catalogs.
 const catalogSnapshotQuery = `SELECT 'r', oid::bigint, 0::bigint, rolname::text, NULL::text, NULL::text FROM pg_catalog.pg_roles
-UNION ALL SELECT 'n', oid::bigint, 0::bigint, nspname::text, NULL, nspacl::text FROM pg_catalog.pg_namespace
-UNION ALL SELECT 'c', 0::bigint, relnamespace::bigint, relname::text, relkind::text, relacl::text FROM pg_catalog.pg_class WHERE relkind IN ('r', 'p', 'v', 'm', 'f', 'S')
+UNION ALL SELECT 'n', oid::bigint, 0::bigint, nspname::text, NULL, COALESCE(nspacl, pg_catalog.acldefault('n', nspowner))::text FROM pg_catalog.pg_namespace
+UNION ALL SELECT 'c', 0::bigint, relnamespace::bigint, relname::text, relkind::text, COALESCE(relacl, pg_catalog.acldefault(CASE WHEN relkind = 'S' THEN 's' ELSE 'r' END::"char", relowner))::text FROM pg_catalog.pg_class WHERE relkind IN ('r', 'p', 'v', 'm', 'f', 'S')
 UNION ALL SELECT 'd', defaclrole::bigint, defaclnamespace::bigint, NULL, defaclobjtype::text, defaclacl::text FROM pg_catalog.pg_default_acl
-UNION ALL SELECT 'D', 0::bigint, 0::bigint, datname::text, NULL, datacl::text FROM pg_catalog.pg_database WHERE datname = current_database()
+UNION ALL SELECT 'D', 0::bigint, 0::bigint, datname::text, NULL, COALESCE(datacl, pg_catalog.acldefault('d', datdba))::text FROM pg_catalog.pg_database WHERE datname = current_database()
 `
 
 // catalogSnapshotProcQuery loads pg_proc on demand: only Reads of function,
 // procedure and routine grants need it, and PostGIS-like extensions make it
-// the largest ACL-bearing catalog after pg_class.
-const catalogSnapshotProcQuery = `SELECT pronamespace::bigint, proname::text, proacl::text FROM pg_catalog.pg_proc
+// the largest ACL-bearing catalog after pg_class. A NULL proacl reads as
+// acldefault('f', owner), as in the direct Read. Servers without
+// pg_proc.prokind (before PostgreSQL 11, no procedures) use
+// catalogSnapshotProcQueryNoProkind, where every routine is a function.
+const catalogSnapshotProcQuery = `SELECT pronamespace::bigint, proname::text, prokind::text, COALESCE(proacl, pg_catalog.acldefault('f', proowner))::text FROM pg_catalog.pg_proc
+`
+
+const catalogSnapshotProcQueryNoProkind = `SELECT pronamespace::bigint, proname::text, 'f'::text, COALESCE(proacl, pg_catalog.acldefault('f', proowner))::text FROM pg_catalog.pg_proc
 `
 
 type catalogObject struct {
 	name string
-	// kind is relkind for relations; unused for routines.
+	// kind is relkind for relations, prokind for routines.
 	kind string
 	acl  sql.NullString
 }
@@ -291,7 +303,11 @@ func (s *catalogSnapshot) routinesOf(namespace uint32) ([]catalogObject, error) 
 }
 
 func loadCatalogRoutines(db *DBConnection) (map[uint32][]catalogObject, error) {
-	rows, err := db.Query(catalogSnapshotProcQuery)
+	query := catalogSnapshotProcQuery
+	if !db.featureSupported(featureProcedure) {
+		query = catalogSnapshotProcQueryNoProkind
+	}
+	rows, err := db.Query(query)
 	if err != nil {
 		return nil, err
 	}
@@ -301,15 +317,15 @@ func loadCatalogRoutines(db *DBConnection) (map[uint32][]catalogObject, error) {
 	var size int
 	for rows.Next() {
 		var namespace int64
-		var name string
+		var name, kind string
 		var acl sql.NullString
-		if err := rows.Scan(&namespace, &name, &acl); err != nil {
+		if err := rows.Scan(&namespace, &name, &kind, &acl); err != nil {
 			return nil, err
 		}
 		if size += len(name) + len(acl.String); size > catalogSnapshotMaxBytes {
 			return nil, errCatalogSnapshotTooLarge
 		}
-		routines[uint32(namespace)] = append(routines[uint32(namespace)], catalogObject{name: name, acl: acl})
+		routines[uint32(namespace)] = append(routines[uint32(namespace)], catalogObject{name: name, kind: kind, acl: acl})
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
@@ -332,7 +348,8 @@ func (s *catalogSnapshot) granteeOf(role string) (grantee string, exists bool) {
 
 // privilegesOf returns the privileges the ACL grants to grantee as a set, the
 // way the direct Read aggregates aclexplode rows: every grantor, with or
-// without grant option, and no entry at all for a NULL ACL.
+// without grant option. The snapshot queries never return a NULL object ACL
+// (it is read as acldefault); a NULL here grants nothing.
 func privilegesOf(acl sql.NullString, grantee string) (*schema.Set, error) {
 	var privileges []string
 	if acl.Valid {

@@ -116,12 +116,10 @@ func resourcePostgreSQLGrantRead(db *DBConnection, d *schema.ResourceData) error
 		return fmt.Errorf("feature is not supported: %v", err)
 	}
 
-	// With catalog_snapshot, the object types the snapshot covers are read
-	// from it; the others, and any Read the snapshot cannot serve, query the
+	// With catalog_snapshot, the Reads the snapshot covers are served from
+	// it; the others, and any Read the snapshot cannot serve, query the
 	// database as before. Create and Update read directly after their write.
-	switch d.Get("object_type").(string) {
-	case "column", "foreign_data_wrapper", "foreign_server":
-	default:
+	if grantReadUsesSnapshot(d) {
 		snap, gone := grantReadSnapshot(db, d)
 		if gone {
 			return nil
@@ -1045,12 +1043,13 @@ func privilegeNames(privileges *schema.Set) *schema.Set {
 
 // readRolePrivilegesFromSnapshot is readRolePrivileges (and the single-object
 // Read of schema and database grants) served from the catalog snapshot, with
-// the same outcome for every input: a missing role or schema removes the
-// resource from state, objects are matched by name, routine overloads are
-// merged by name, and the privileges of the first object (by name) whose
-// privileges differ from the configured ones are written to state. Nothing is
-// written to d before every ACL it needs has been parsed, so on an error the
-// caller can fall back to the direct Read.
+// the same outcome for every input it is given (see grantReadUsesSnapshot): a
+// missing role or schema removes the resource from state, a NULL ACL reads as
+// the object's default privileges, objects are matched by name, each relation
+// or routine overload is compared on its own, and on drift the value of
+// grantReadDriftPrivileges is written to state. Nothing is written to d before
+// every ACL it needs has been parsed, so on an error the caller can fall back
+// to the direct Read.
 func readRolePrivilegesFromSnapshot(snap *catalogSnapshot, db *DBConnection, d *schema.ResourceData) error {
 	objectType := d.Get("object_type").(string)
 	schemaName := d.Get("schema").(string)
@@ -1091,11 +1090,12 @@ func readRolePrivilegesFromSnapshot(snap *catalogSnapshot, db *DBConnection, d *
 	default:
 		ns, ok := snap.namespaces[schemaName]
 		schemaExists = ok
-		// candidates are the routines of the schema (no prokind filter, as
-		// the direct Read) or its relations, filtered by the relkinds the
-		// object type covers (ownerRelkinds, as the direct Read).
+		// candidates are the routines of the schema or its relations;
+		// keep is the kind filter of the direct Read: the prokinds of the
+		// object type (functionProkindFilter) or its relkinds
+		// (ownerRelkinds).
 		var candidates []catalogObject
-		var relkinds []string
+		var keep func(kind string) bool
 		if ok {
 			switch objectType {
 			case "function", "procedure", "routine":
@@ -1103,44 +1103,51 @@ func readRolePrivilegesFromSnapshot(snap *catalogSnapshot, db *DBConnection, d *
 				if candidates, err = snap.routinesOf(ns.oid); err != nil {
 					return err
 				}
+				hasProkind := db.featureSupported(featureProcedure)
+				keep = func(kind string) bool {
+					switch {
+					case !hasProkind:
+						return true
+					case objectType == "function":
+						return kind != "p"
+					case objectType == "procedure":
+						return kind == "p"
+					}
+					return true
+				}
 			default:
 				candidates = snap.relations[ns.oid]
-				relkinds = ownerRelkinds[objectType]
+				relkinds := ownerRelkinds[objectType]
+				keep = func(kind string) bool { return slices.Contains(relkinds, kind) }
 			}
 		}
 
-		for i := 0; i < len(candidates); i++ {
-			object := candidates[i]
-			if relkinds != nil && !slices.Contains(relkinds, object.kind) {
+		var objectPrivileges []*schema.Set
+		for _, object := range candidates {
+			if !keep(object.kind) {
 				continue
 			}
 			if objects.Len() > 0 && !objects.Contains(object.name) {
 				continue
 			}
-
-			// The direct Read aggregates the privileges of every routine
-			// with this name: a name reads as granted when any overload is.
 			granted, err := privilegesOf(object.acl, grantee)
 			if err != nil {
 				return err
 			}
-			for i+1 < len(candidates) && candidates[i+1].name == object.name {
-				i++
-				more, err := privilegesOf(candidates[i].acl, grantee)
-				if err != nil {
-					return err
-				}
-				granted = granted.Union(more)
-			}
-
 			if !resourcePrivilegesEqual(granted, db, d) {
 				log.Printf(
 					"[DEBUG] %s %s has not the expected privileges %v for role %s",
 					strings.ToTitle(objectType), object.name, granted.List(), d.Get("role"),
 				)
-				drift = granted
-				break
 			}
+			objectPrivileges = append(objectPrivileges, granted)
+		}
+
+		if drifted, ok := grantReadDriftPrivileges(
+			objectPrivileges, d.Get("privileges").(*schema.Set),
+			func(granted, _ *schema.Set) bool { return resourcePrivilegesEqual(granted, db, d) },
+		); ok {
+			drift = drifted
 		}
 	}
 
@@ -1152,6 +1159,21 @@ func readRolePrivilegesFromSnapshot(snap *catalogSnapshot, db *DBConnection, d *
 		return d.Set("privileges", drift)
 	}
 	return nil
+}
+
+// grantReadUsesSnapshot reports whether the Read of d may be served from the
+// catalog snapshot. Column, foreign data wrapper and foreign server grants
+// are not in it, and neither are function signature entries ("f(integer)"):
+// the direct Read resolves them with to_regprocedure, which the snapshot
+// cannot do without the server.
+func grantReadUsesSnapshot(d *schema.ResourceData) bool {
+	switch d.Get("object_type").(string) {
+	case "column", "foreign_data_wrapper", "foreign_server":
+		return false
+	case "function", "procedure", "routine":
+		return !hasFunctionSignature(d.Get("objects").(*schema.Set))
+	}
+	return true
 }
 
 func createGrantQuery(d *schema.ResourceData, privileges []string) string {
