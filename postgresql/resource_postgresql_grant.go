@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"regexp"
+	"slices"
 	"strings"
 	"unicode"
 
@@ -42,10 +43,10 @@ type ResourceSchemeGetter func(string) any
 
 func resourcePostgreSQLGrant() *schema.Resource {
 	return &schema.Resource{
-		Create: PGResourceFunc(retryOnConcurrentCatalogUpdate(resourcePostgreSQLGrantCreate)),
-		Update: PGResourceFunc(retryOnConcurrentCatalogUpdate(resourcePostgreSQLGrantUpdate)),
+		Create: PGResourceWriteFunc(retryOnConcurrentCatalogUpdate(resourcePostgreSQLGrantCreate)),
+		Update: PGResourceWriteFunc(retryOnConcurrentCatalogUpdate(resourcePostgreSQLGrantUpdate)),
 		Read:   PGResourceFunc(resourcePostgreSQLGrantRead),
-		Delete: PGResourceFunc(retryOnConcurrentCatalogUpdate(resourcePostgreSQLGrantDelete)),
+		Delete: PGResourceWriteFunc(retryOnConcurrentCatalogUpdate(resourcePostgreSQLGrantDelete)),
 		Importer: &schema.ResourceImporter{
 			StateContext: resourcePostgreSQLGrantImport,
 		},
@@ -113,6 +114,23 @@ func resourcePostgreSQLGrant() *schema.Resource {
 func resourcePostgreSQLGrantRead(db *DBConnection, d *schema.ResourceData) error {
 	if err := validateFeatureSupport(db, d); err != nil {
 		return fmt.Errorf("feature is not supported: %v", err)
+	}
+
+	// With catalog_snapshot, the Reads the snapshot covers are served from
+	// it; the others, and any Read the snapshot cannot serve, query the
+	// database as before. Create and Update read directly after their write.
+	if grantReadUsesSnapshot(d) {
+		snap, gone := grantReadSnapshot(db, d)
+		if gone {
+			return nil
+		}
+		if snap != nil {
+			err := readRolePrivilegesFromSnapshot(snap, db, d)
+			if err == nil {
+				return nil
+			}
+			log.Printf("[WARN] could not read %s from the catalog snapshot, reading directly: %v", d.Id(), err)
+		}
 	}
 
 	return readRolePrivileges(db, d)
@@ -1021,6 +1039,141 @@ func privilegeNames(privileges *schema.Set) *schema.Set {
 		names.Add(strings.TrimSuffix(p.(string), partialPrivilegeSuffix))
 	}
 	return names
+}
+
+// readRolePrivilegesFromSnapshot is readRolePrivileges (and the single-object
+// Read of schema and database grants) served from the catalog snapshot, with
+// the same outcome for every input it is given (see grantReadUsesSnapshot): a
+// missing role or schema removes the resource from state, a NULL ACL reads as
+// the object's default privileges, objects are matched by name, each relation
+// or routine overload is compared on its own, and on drift the value of
+// grantReadDriftPrivileges is written to state. Nothing is written to d before
+// every ACL it needs has been parsed, so on an error the caller can fall back
+// to the direct Read.
+func readRolePrivilegesFromSnapshot(snap *catalogSnapshot, db *DBConnection, d *schema.ResourceData) error {
+	objectType := d.Get("object_type").(string)
+	schemaName := d.Get("schema").(string)
+	objects := d.Get("objects").(*schema.Set)
+	grantee, roleExists := snap.granteeOf(d.Get("role").(string))
+
+	// drift is the privilege set to write to state, nil when every object
+	// has the configured privileges.
+	var drift *schema.Set
+	schemaExists := true
+
+	single := func(acl sql.NullString) error {
+		granted, err := privilegesOf(acl, grantee)
+		if err != nil {
+			return err
+		}
+		if !resourcePrivilegesEqual(granted, db, d) {
+			drift = granted
+		}
+		return nil
+	}
+
+	switch objectType {
+	case "database":
+		if err := single(snap.datACL); err != nil {
+			return err
+		}
+
+	case "schema":
+		ns, ok := snap.namespaces[schemaName]
+		schemaExists = ok
+		if ok {
+			if err := single(ns.acl); err != nil {
+				return err
+			}
+		}
+
+	default:
+		ns, ok := snap.namespaces[schemaName]
+		schemaExists = ok
+		// candidates are the routines of the schema or its relations;
+		// keep is the kind filter of the direct Read: the prokinds of the
+		// object type (functionProkindFilter) or its relkinds
+		// (ownerRelkinds).
+		var candidates []catalogObject
+		var keep func(kind string) bool
+		if ok {
+			switch objectType {
+			case "function", "procedure", "routine":
+				var err error
+				if candidates, err = snap.routinesOf(ns.oid); err != nil {
+					return err
+				}
+				hasProkind := db.featureSupported(featureProcedure)
+				keep = func(kind string) bool {
+					switch {
+					case !hasProkind:
+						return true
+					case objectType == "function":
+						return kind != "p"
+					case objectType == "procedure":
+						return kind == "p"
+					}
+					return true
+				}
+			default:
+				candidates = snap.relations[ns.oid]
+				relkinds := ownerRelkinds[objectType]
+				keep = func(kind string) bool { return slices.Contains(relkinds, kind) }
+			}
+		}
+
+		var objectPrivileges []*schema.Set
+		for _, object := range candidates {
+			if !keep(object.kind) {
+				continue
+			}
+			if objects.Len() > 0 && !objects.Contains(object.name) {
+				continue
+			}
+			granted, err := privilegesOf(object.acl, grantee)
+			if err != nil {
+				return err
+			}
+			if !resourcePrivilegesEqual(granted, db, d) {
+				log.Printf(
+					"[DEBUG] %s %s has not the expected privileges %v for role %s",
+					strings.ToTitle(objectType), object.name, granted.List(), d.Get("role"),
+				)
+			}
+			objectPrivileges = append(objectPrivileges, granted)
+		}
+
+		if drifted, ok := grantReadDriftPrivileges(
+			objectPrivileges, d.Get("privileges").(*schema.Set),
+			func(granted, _ *schema.Set) bool { return resourcePrivilegesEqual(granted, db, d) },
+		); ok {
+			drift = drifted
+		}
+	}
+
+	if grantTargetGone(d, roleExists, schemaExists) {
+		return nil
+	}
+	d.SetId(generateGrantID(d))
+	if drift != nil {
+		return d.Set("privileges", drift)
+	}
+	return nil
+}
+
+// grantReadUsesSnapshot reports whether the Read of d may be served from the
+// catalog snapshot. Column, foreign data wrapper and foreign server grants
+// are not in it, and neither are function signature entries ("f(integer)"):
+// the direct Read resolves them with to_regprocedure, which the snapshot
+// cannot do without the server.
+func grantReadUsesSnapshot(d *schema.ResourceData) bool {
+	switch d.Get("object_type").(string) {
+	case "column", "foreign_data_wrapper", "foreign_server":
+		return false
+	case "function", "procedure", "routine":
+		return !hasFunctionSignature(d.Get("objects").(*schema.Set))
+	}
+	return true
 }
 
 func createGrantQuery(d *schema.ResourceData, privileges []string) string {
