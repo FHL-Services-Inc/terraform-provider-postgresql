@@ -509,3 +509,43 @@ resource "postgresql_server" "myserver_postgres" {
 	depends_on = [postgresql_extension.ext_postgres_fdw]
 }
 `
+
+// A foreign server must be importable by its name (#124). The read used to
+// take the name from server_name, which is empty during import, so every
+// import ended with "Cannot import non-existent remote object".
+func TestAccPostgresqlServer_Import(t *testing.T) {
+	ownerName := testUniqueName("owner")
+	config := fmt.Sprintf(testAccPostgresqlServerConfig,
+		testUniqueName("MyServer-Postgres"), testUniqueName("myserver_file"), ownerName,
+		testUniqueName("with_owner"), testUniqueName("myserver_with_type"), testUniqueName("myserver_with_version"))
+
+	importStep := func(resourceName string) resource.TestStep {
+		return resource.TestStep{
+			ResourceName:            resourceName,
+			ImportState:             true,
+			ImportStateVerify:       true,
+			ImportStateVerifyIgnore: []string{serverDropCascadeAttr},
+		}
+	}
+
+	resource.Test(t, resource.TestCase{
+		PreCheck: func() {
+			testAccPreCheck(t)
+			testCheckCompatibleVersion(t, featureServer)
+			testSuperuserPreCheck(t)
+			testDropExtensionsIfExist(t, "postgres_fdw", "file_fdw")
+		},
+		Providers:    testAccProviders,
+		CheckDestroy: testAccCheckPostgresqlServerDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config: config,
+			},
+			importStep("postgresql_server.myserver_postgres"),
+			importStep("postgresql_server.myserver_file"),
+			importStep("postgresql_server.myserver_with_owner"),
+			importStep("postgresql_server.myserver_with_type"),
+			importStep("postgresql_server.myserver_with_version"),
+		},
+	})
+}
