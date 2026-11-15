@@ -36,6 +36,8 @@ func TestParseUserMappingImportID(t *testing.T) {
 		{user: "dave", server: "a.b"},
 		{user: "dave.a", server: "b"},
 		{user: "PUBLIC", server: "quoted"},
+		{current: true, user: "postgres", server: "mine"},
+		{user: "user", server: "mine"},
 	}
 
 	cases := []struct {
@@ -61,6 +63,16 @@ func TestParseUserMappingImportID(t *testing.T) {
 		// A role named "PUBLIC" is not the PUBLIC mapping and can't be
 		// managed by this resource.
 		{id: "PUBLIC.quoted", wantErr: "no user mapping"},
+		// The current user keywords import the provider role's mapping and
+		// keep their spelling.
+		{id: "CURRENT_USER.mine", wantUser: "CURRENT_USER", wantServer: "mine"},
+		{id: "CURRENT_ROLE.mine", wantUser: "CURRENT_ROLE", wantServer: "mine"},
+		{id: "USER.mine", wantUser: "USER", wantServer: "mine"},
+		{id: "postgres.mine", wantUser: "postgres", wantServer: "mine"},
+		{id: "CURRENT_USER.srv", wantErr: "no user mapping"},
+		// Not upper case: a role name.
+		{id: "user.mine", wantUser: "user", wantServer: "mine"},
+		{id: "current_user.mine", wantErr: "no user mapping"},
 	}
 
 	for _, tc := range cases {
@@ -98,5 +110,26 @@ func TestParseUserMappingImportIDLookupError(t *testing.T) {
 	lookup := func([]string) ([]userMappingCatalogEntry, error) { return nil, boom }
 	if _, _, err := parseUserMappingImportID("a.b", lookup); !errors.Is(err, boom) {
 		t.Fatalf("err = %v, want it to wrap %v", err, boom)
+	}
+}
+
+func TestUserMappingUserSQL(t *testing.T) {
+	cases := map[string]string{
+		"alice":        `"alice"`,
+		"public":       "PUBLIC",
+		"PUBLIC":       "PUBLIC",
+		"CURRENT_USER": "CURRENT_USER",
+		// CURRENT_ROLE is a syntax error there before PostgreSQL 14.
+		"CURRENT_ROLE": "CURRENT_USER",
+		"USER":         "CURRENT_USER",
+		// Only the upper case spelling is a keyword.
+		"user":         `"user"`,
+		"current_user": `"current_user"`,
+		"Current_Role": `"Current_Role"`,
+	}
+	for username, want := range cases {
+		if got := userMappingUserSQL(username); got != want {
+			t.Errorf("userMappingUserSQL(%q) = %s, want %s", username, got, want)
+		}
 	}
 }

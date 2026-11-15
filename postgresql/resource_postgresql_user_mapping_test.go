@@ -197,8 +197,12 @@ func checkUserMappingExists(txn *sql.Tx, username string, serverName string) (bo
 	// pg_user_mappings reports a PUBLIC mapping as umuser = 0 (usename 'public').
 	query := "SELECT TRUE FROM pg_user_mappings WHERE srvname = $1 AND umuser <> 0 AND usename = $2"
 	args := []any{serverName, username}
-	if isPublicUserMapping(username) {
+	switch {
+	case isPublicUserMapping(username):
 		query = "SELECT TRUE FROM pg_user_mappings WHERE srvname = $1 AND umuser = 0"
+		args = args[:1]
+	case isCurrentUserMapping(username):
+		query = "SELECT TRUE FROM pg_user_mappings WHERE srvname = $1 AND usename = current_user"
 		args = args[:1]
 	}
 	err := txn.QueryRow(query, args...).Scan(&_rez)
@@ -569,4 +573,126 @@ resource "postgresql_user_mapping" "public_dotted_server" {
   user_name   = "PUBLIC"
 }
 `, dottedRole, dottedServer, plainRole, plainServer)
+}
+
+// TestAccPostgresqlUserMapping_CurrentUser covers the CURRENT_USER,
+// CURRENT_ROLE and USER keywords in user_name (issue #167). They must create
+// a mapping for the provider role, not for a role of that name, stay in state
+// as written (each step's follow-up plan must be empty), and import.
+func TestAccPostgresqlUserMapping_CurrentUser(t *testing.T) {
+	prefix := testUniqueName("tf_tests_um_cur")
+
+	resource.Test(t, resource.TestCase{
+		PreCheck: func() {
+			testAccPreCheck(t)
+			testCheckCompatibleVersion(t, featureServer)
+			testUserMappingPublicPreCheck(t)
+		},
+		Providers:    testAccProviders,
+		CheckDestroy: testAccCheckPostgresqlUserMappingDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config: testAccPostgresqlUserMappingCurrentUserConfig(prefix, "pass"),
+				Check: resource.ComposeTestCheckFunc(
+					testAccCheckUserMappingOfCurrentUser(prefix+"_current_user"),
+					testAccCheckUserMappingOfCurrentUser(prefix+"_current_role"),
+					testAccCheckUserMappingOfCurrentUser(prefix+"_user"),
+					resource.TestCheckResourceAttr("postgresql_user_mapping.current_user", "user_name", "CURRENT_USER"),
+					resource.TestCheckResourceAttr("postgresql_user_mapping.current_role", "user_name", "CURRENT_ROLE"),
+					resource.TestCheckResourceAttr("postgresql_user_mapping.user", "user_name", "USER"),
+					resource.TestCheckResourceAttr("postgresql_user_mapping.current_user", "options.password", "pass"),
+				),
+			},
+			{
+				Config: testAccPostgresqlUserMappingCurrentUserConfig(prefix, "passUpdated"),
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr("postgresql_user_mapping.current_user", "options.password", "passUpdated"),
+					resource.TestCheckResourceAttr("postgresql_user_mapping.current_role", "options.password", "passUpdated"),
+					resource.TestCheckResourceAttr("postgresql_user_mapping.user", "options.password", "passUpdated"),
+				),
+			},
+			testAccUserMappingImportStep("postgresql_user_mapping.current_user"),
+			testAccUserMappingImportStep("postgresql_user_mapping.current_role"),
+			testAccUserMappingImportStep("postgresql_user_mapping.user"),
+		},
+	})
+}
+
+// testAccCheckUserMappingOfCurrentUser checks that serverName has a mapping
+// for the provider role.
+func testAccCheckUserMappingOfCurrentUser(serverName string) resource.TestCheckFunc {
+	return func(*terraform.State) error {
+		db, err := testAccProvider.Meta().(*Client).Connect()
+		if err != nil {
+			return err
+		}
+		var exists bool
+		if err := db.QueryRow(
+			"SELECT EXISTS (SELECT 1 FROM pg_user_mappings WHERE srvname = $1 AND usename = current_user)", serverName,
+		).Scan(&exists); err != nil {
+			return err
+		}
+		if !exists {
+			return fmt.Errorf("server %s has no user mapping for the current user", serverName)
+		}
+		return nil
+	}
+}
+
+func testAccPostgresqlUserMappingCurrentUserConfig(prefix, password string) string {
+	return fmt.Sprintf(`
+resource "postgresql_server" "current_user" {
+  server_name = "%[1]s_current_user"
+  fdw_name    = "postgres_fdw"
+  options = {
+    host   = "foo"
+    dbname = "foodb"
+  }
+}
+
+resource "postgresql_server" "current_role" {
+  server_name = "%[1]s_current_role"
+  fdw_name    = "postgres_fdw"
+  options = {
+    host   = "foo"
+    dbname = "foodb"
+  }
+}
+
+resource "postgresql_server" "user" {
+  server_name = "%[1]s_user"
+  fdw_name    = "postgres_fdw"
+  options = {
+    host   = "foo"
+    dbname = "foodb"
+  }
+}
+
+resource "postgresql_user_mapping" "current_user" {
+  server_name = postgresql_server.current_user.server_name
+  user_name   = "CURRENT_USER"
+  options = {
+    user     = "remote"
+    password = "%[2]s"
+  }
+}
+
+resource "postgresql_user_mapping" "current_role" {
+  server_name = postgresql_server.current_role.server_name
+  user_name   = "CURRENT_ROLE"
+  options = {
+    user     = "remote"
+    password = "%[2]s"
+  }
+}
+
+resource "postgresql_user_mapping" "user" {
+  server_name = postgresql_server.user.server_name
+  user_name   = "USER"
+  options = {
+    user     = "remote"
+    password = "%[2]s"
+  }
+}
+`, prefix, password)
 }

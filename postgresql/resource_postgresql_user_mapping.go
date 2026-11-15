@@ -34,7 +34,7 @@ func resourcePostgreSQLUserMapping() *schema.Resource {
 				Type:        schema.TypeString,
 				Required:    true,
 				ForceNew:    true,
-				Description: "The name of an existing user that is mapped to foreign server. CURRENT_ROLE, CURRENT_USER, and USER match the name of the current user. When PUBLIC is specified, a so-called public mapping is created that is used when no user-specific mapping is applicable",
+				Description: "The name of an existing user that is mapped to foreign server. CURRENT_ROLE, CURRENT_USER, and USER (in upper case) match the role the provider connects as. When PUBLIC is specified (in any case), a so-called public mapping is created that is used when no user-specific mapping is applicable",
 			},
 			userMappingServerNameAttr: {
 				Type:        schema.TypeString,
@@ -114,8 +114,15 @@ func resourcePostgreSQLUserMappingReadImpl(db *DBConnection, d *schema.ResourceD
 	userFilter := "umuser <> 0 AND authorization_identifier = $2"
 	fallbackFilter := "umuser <> 0 AND usename = $2"
 	args := []any{serverName, username}
-	if isPublicUserMapping(username) {
+	switch {
+	case isPublicUserMapping(username):
 		userFilter = "umuser = 0"
+		fallbackFilter = userFilter
+		args = args[:1]
+	case isCurrentUserMapping(username):
+		// The keyword is kept in state as written; resolve it to the role
+		// the provider connects as.
+		userFilter = "umuser = (SELECT oid FROM pg_catalog.pg_roles WHERE rolname = current_user)"
 		fallbackFilter = userFilter
 		args = args[:1]
 	}
@@ -268,11 +275,29 @@ func isPublicUserMapping(username string) bool {
 	return strings.EqualFold(username, "public")
 }
 
+// isCurrentUserMapping reports whether username is one of the keywords that
+// CREATE USER MAPPING accepts for the current user. Only the upper case
+// spelling the documentation uses is a keyword: unlike PUBLIC, a role named
+// "user" is plausible, and it keeps working as a role name.
+func isCurrentUserMapping(username string) bool {
+	switch username {
+	case "CURRENT_USER", "CURRENT_ROLE", "USER":
+		return true
+	}
+	return false
+}
+
 // userMappingUserSQL renders username for CREATE/ALTER/DROP USER MAPPING FOR.
-// PUBLIC must stay unquoted: "PUBLIC" (quoted) would name a regular role.
+// PUBLIC and the current user keywords must stay unquoted: "PUBLIC" (quoted)
+// would name a regular role. CURRENT_ROLE and USER are written as
+// CURRENT_USER, which means the same and which PostgreSQL 12 and 13 accept
+// there too (CURRENT_ROLE is only accepted since 14).
 func userMappingUserSQL(username string) string {
-	if isPublicUserMapping(username) {
+	switch {
+	case isPublicUserMapping(username):
 		return "PUBLIC"
+	case isCurrentUserMapping(username):
+		return "CURRENT_USER"
 	}
 	return pq.QuoteIdentifier(username)
 }
@@ -283,6 +308,7 @@ const userMappingImportFormat = "<user_name>.<server_name>"
 // userMappingCatalogEntry is a user mapping as pg_user_mappings shows it.
 type userMappingCatalogEntry struct {
 	public       bool // umuser = 0
+	current      bool // umuser is the role the provider connects as
 	user, server string
 }
 
@@ -294,7 +320,8 @@ type userMappingLookup func(servers []string) ([]userMappingCatalogEntry, error)
 // at every dot and the split that names an existing user mapping wins; an ID
 // that matches no mapping, or more than one, is rejected. user_name keeps the
 // spelling of the ID, so "public" and "PUBLIC" both import the PUBLIC mapping
-// as written in the configuration.
+// as written in the configuration, and CURRENT_USER, CURRENT_ROLE and USER
+// import the mapping of the role the provider connects as.
 func parseUserMappingImportID(id string, lookup userMappingLookup) (string, string, error) {
 	fail := func(err error) (string, string, error) {
 		return "", "", importParseError("postgresql_user_mapping", id, userMappingImportFormat, err)
@@ -325,7 +352,7 @@ func parseUserMappingImportID(id string, lookup userMappingLookup) (string, stri
 			if m.server != s.server {
 				continue
 			}
-			if isPublicUserMapping(s.user) && m.public || !isPublicUserMapping(s.user) && !m.public && m.user == s.user {
+			if userMappingMatches(s.user, m) {
 				candidates = append(candidates, s)
 				descr = append(descr, fmt.Sprintf("user_name=%s server_name=%s", s.user, s.server))
 				break
@@ -343,12 +370,24 @@ func parseUserMappingImportID(id string, lookup userMappingLookup) (string, stri
 	}
 }
 
+// userMappingMatches reports whether user_name username refers to mapping m.
+func userMappingMatches(username string, m userMappingCatalogEntry) bool {
+	switch {
+	case isPublicUserMapping(username):
+		return m.public
+	case isCurrentUserMapping(username):
+		return m.current
+	}
+	return !m.public && m.user == username
+}
+
 // lookupUserMappings reads the user mappings of servers from
 // pg_user_mappings, which every role can read (only the options are masked).
 func lookupUserMappings(db QueryAble) userMappingLookup {
 	return func(servers []string) ([]userMappingCatalogEntry, error) {
 		rows, err := db.Query(
-			"SELECT umuser = 0, usename, srvname FROM pg_catalog.pg_user_mappings WHERE srvname = ANY($1)",
+			"SELECT umuser = 0, umuser = (SELECT oid FROM pg_catalog.pg_roles WHERE rolname = current_user), usename, srvname "+
+				"FROM pg_catalog.pg_user_mappings WHERE srvname = ANY($1)",
 			pq.Array(servers),
 		)
 		if err != nil {
@@ -359,7 +398,7 @@ func lookupUserMappings(db QueryAble) userMappingLookup {
 		var out []userMappingCatalogEntry
 		for rows.Next() {
 			var m userMappingCatalogEntry
-			if err := rows.Scan(&m.public, &m.user, &m.server); err != nil {
+			if err := rows.Scan(&m.public, &m.current, &m.user, &m.server); err != nil {
 				return nil, err
 			}
 			out = append(out, m)
