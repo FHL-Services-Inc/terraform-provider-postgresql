@@ -31,10 +31,11 @@ func resourcePostgreSQLDefaultPrivileges() *schema.Resource {
 				Description: "The name of the role to which grant default privileges on",
 			},
 			"database": {
-				Type:        schema.TypeString,
-				Required:    true,
-				ForceNew:    true,
-				Description: "The database to grant default privileges for this role",
+				Type:         schema.TypeString,
+				Required:     true,
+				ForceNew:     true,
+				ValidateFunc: validation.StringIsNotEmpty,
+				Description:  "The database to grant default privileges for this role",
 			},
 			"owner": {
 				Type:        schema.TypeString,

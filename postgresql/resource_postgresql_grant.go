@@ -59,10 +59,11 @@ func resourcePostgreSQLGrant() *schema.Resource {
 				Description: "The name of the role to grant privileges on",
 			},
 			"database": {
-				Type:        schema.TypeString,
-				Required:    true,
-				ForceNew:    true,
-				Description: "The database to grant privileges on for this role",
+				Type:         schema.TypeString,
+				Required:     true,
+				ForceNew:     true,
+				ValidateFunc: validation.StringIsNotEmpty,
+				Description:  "The database to grant privileges on for this role",
 			},
 			"schema": {
 				Type:        schema.TypeString,
