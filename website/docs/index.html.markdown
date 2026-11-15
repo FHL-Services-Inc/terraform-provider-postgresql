@@ -334,6 +334,39 @@ The following arguments are supported:
   `aws_rds_iam_auth`, the token is renewed before it expires and every new connection uses a current one.
 * `azure_tenant_id` - (Optional) (Required if `azure_identity_auth` is `true`) Azure tenant ID [read more](https://registry.terraform.io/providers/hashicorp/azurerm/latest/docs/data-sources/client_config.html)
 
+## Amazon RDS and Aurora: owner roles with `rds_iam`
+
+When the provider user is not a superuser (on RDS and Aurora even the master user is not), it temporarily makes
+itself a member of the roles that own the objects it changes, for example the owner of a database or of the granted
+objects, and removes the membership afterwards.
+
+On RDS and Aurora, a role that is a member of `rds_iam`, directly or through another role, can only log in with IAM
+authentication. This also holds for a membership granted `WITH INHERIT FALSE`. So while the provider user is a
+temporary member of an owner role that has `rds_iam`, new connections of a provider that logs in with a password fail
+with `PAM authentication failed`. Resources applied in parallel then fail at random, depending on whether they need a
+new connection in that window.
+
+Don't grant `rds_iam` to roles that own objects managed by a provider that logs in with a password. Keep the owner
+role without `rds_iam` and give `rds_iam` to a separate login role that is a member of the owner role:
+
+```hcl
+resource "postgresql_role" "app_owner" {
+  name = "app_owner"
+}
+
+# Logs in with IAM and acts on the objects of app_owner through its membership.
+resource "postgresql_role" "app" {
+  name  = "app"
+  login = true
+  roles = ["rds_iam", postgresql_role.app_owner.name]
+}
+
+resource "postgresql_database" "app" {
+  name  = "app"
+  owner = postgresql_role.app_owner.name
+}
+```
+
 ## GoCloud
 
 By default, the provider uses the [lib/pq][libpq] library to directly connect to PostgreSQL host instance. For connections to AWS/GCP hosted instances, the provider can connect through the [GoCloud](https://gocloud.dev/howto/sql/) library. GoCloud simplifies connecting to AWS/GCP hosted databases, managing any proxy or custom authentication details.
