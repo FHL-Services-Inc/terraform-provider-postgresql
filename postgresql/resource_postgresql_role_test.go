@@ -6,6 +6,7 @@ import (
 	"log"
 	"os"
 	"reflect"
+	"regexp"
 	"sort"
 	"strings"
 	"testing"
@@ -762,6 +763,50 @@ resource "postgresql_role" "role" {
 				Check: resource.ComposeTestCheckFunc(
 					resource.TestCheckResourceAttr("postgresql_role.role", "statement_timeout", "12000"),
 					resource.TestCheckResourceAttr("postgresql_role.role", "idle_in_transaction_session_timeout", "120000"),
+				),
+			},
+		},
+	})
+}
+
+// A failed update must not leave the new configuration in state. The password
+// can't be read back from the server, so if it ended up in state the next
+// apply would see no change and never set it.
+func TestAccPostgresqlRole_FailedUpdateKeepsOldState(t *testing.T) {
+	roleName := testUniqueName("role_failed_update")
+	config := func(password, roles string) string {
+		return fmt.Sprintf(`
+resource "postgresql_role" "role" {
+  name     = "%s"
+  login    = true
+  password = "%s"
+  roles    = [%s]
+}
+`, roleName, password, roles)
+	}
+
+	resource.Test(t, resource.TestCase{
+		PreCheck: func() {
+			testAccPreCheck(t)
+		},
+		Providers:    testAccProviders,
+		CheckDestroy: testAccCheckPostgresqlRoleDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config: config("old_pw", ""),
+				Check:  testAccCheckRoleCanLogin(t, roleName, "old_pw"),
+			},
+			{
+				// Granting a role that doesn't exist fails after the
+				// password was changed, so the transaction rolls back.
+				Config:      config("new_pw", `"does_not_exist"`),
+				ExpectError: regexp.MustCompile(`role "does_not_exist" does not exist`),
+			},
+			{
+				Config: config("new_pw", ""),
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr("postgresql_role.role", "password", "new_pw"),
+					testAccCheckRoleCanLogin(t, roleName, "new_pw"),
 				),
 			},
 		},

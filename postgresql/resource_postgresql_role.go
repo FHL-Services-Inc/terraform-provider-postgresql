@@ -691,6 +691,11 @@ func readRolePassword(db *DBConnection, d *schema.ResourceData, roleCanLogin boo
 }
 
 func resourcePostgreSQLRoleUpdate(db *DBConnection, d *schema.ResourceData) error {
+	// If the update fails, keep the previous state. Otherwise the SDK saves
+	// the new config, and attributes Read can't refresh (password) would look
+	// applied when the transaction was rolled back.
+	d.Partial(true)
+
 	txn, err := startTransaction(db.client, "")
 	if err != nil {
 		return err
@@ -775,6 +780,7 @@ func resourcePostgreSQLRoleUpdate(db *DBConnection, d *schema.ResourceData) erro
 	if err = txn.Commit(); err != nil {
 		return fmt.Errorf("could not commit transaction: %w", err)
 	}
+	d.Partial(false)
 
 	return resourcePostgreSQLRoleReadImpl(db, d)
 }
