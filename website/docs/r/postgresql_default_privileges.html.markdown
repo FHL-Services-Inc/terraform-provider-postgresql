@@ -64,6 +64,20 @@ resource "postgresql_default_privileges" "revoke_public" {
 }
 ```
 
+### Built-in defaults
+
+Without a `schema`, the owner's objects get PostgreSQL's built-in default
+privileges (`acldefault`) until they are changed: every privilege for the owner
+itself, plus `EXECUTE` on functions and `USAGE` on types for `PUBLIC`.
+PostgreSQL stores no `pg_default_acl` entry that equals these defaults, so the
+resource reads a missing entry as the built-in defaults. A resource such as
+`role = owner`, `privileges = ["ALL"]` therefore applies cleanly and shows no
+drift.
+
+Destroying such a resource revokes the privileges like any other, so the
+owner (or `PUBLIC`) is left without them on new objects, and PostgreSQL keeps a
+`pg_default_acl` entry for it.
+
 ## Concurrency
 
 Before it changes default privileges, the resource takes PostgreSQL advisory

@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -865,6 +866,17 @@ func TestAccCatalogSnapshotEquivalence(t *testing.T) {
 		defaultPrivileges("functions_noschema_grant_option", map[string]any{"object_type": "function", "privileges": []any{"EXECUTE"}, "with_grant_option": true}),
 		defaultPrivileges("tables_noschema_none", map[string]any{"object_type": "table", "privileges": []any{"SELECT"}}),
 		defaultPrivileges("tables_noschema_none_empty_input", map[string]any{"object_type": "table", "privileges": []any{}}),
+		// Global entries (no schema) equal to the built-in defaults have no
+		// pg_default_acl row: both Reads fall back to acldefault (#117).
+		defaultPrivileges("tables_noschema_owner_builtin", map[string]any{"role": owner, "object_type": "table", "privileges": []any{"ALL"}}),
+		defaultPrivileges("tables_noschema_owner_builtin_drift", map[string]any{"role": owner, "object_type": "table", "privileges": []any{"SELECT"}}),
+		defaultPrivileges("tables_noschema_public_builtin_none", map[string]any{"role": "public", "object_type": "table", "privileges": []any{"SELECT"}}),
+		defaultPrivileges("types_noschema_owner_builtin", map[string]any{"role": owner, "object_type": "type", "privileges": []any{"USAGE"}}),
+		defaultPrivileges("types_noschema_public_builtin", map[string]any{"role": "public", "object_type": "type", "privileges": []any{"USAGE"}}),
+		defaultPrivileges("schemas_noschema_owner_builtin", map[string]any{"role": owner, "object_type": "schema", "privileges": []any{"USAGE", "CREATE"}}),
+		defaultPrivileges("sequences_noschema_owner_stored", map[string]any{"role": owner, "object_type": "sequence", "privileges": []any{"ALL"}}),
+		defaultPrivileges("functions_noschema_public_stored", map[string]any{"role": "public", "object_type": "function", "privileges": []any{"EXECUTE"}}),
+		defaultPrivileges("tables_schema_owner_none", map[string]any{"role": owner, "schema": "test_schema", "object_type": "table", "privileges": []any{"ALL"}}),
 		defaultPrivileges("other_owner", map[string]any{"owner": roleName, "schema": "test_schema", "object_type": "table", "privileges": []any{"SELECT"}}),
 		defaultPrivileges("missing_owner", map[string]any{"owner": "tf_acl_missing", "schema": "test_schema", "object_type": "table", "privileges": []any{"SELECT"}}),
 		defaultPrivileges("missing_role", map[string]any{"role": "tf_acl_missing", "schema": "test_schema", "object_type": "table", "privileges": []any{"SELECT"}}),
@@ -918,6 +930,10 @@ func TestAccCatalogSnapshotEquivalence(t *testing.T) {
 			}
 			if errDirect != nil || errSnapshot != nil {
 				t.Fatalf("direct: %v, snapshot: %v", errDirect, errSnapshot)
+			}
+			// The built-in defaults are present, not missing (#117).
+			if strings.Contains(tc.name, "_builtin") && !strings.HasSuffix(tc.name, "_none") && direct.Id() == "" {
+				t.Errorf("the built-in default privileges read as missing")
 			}
 			if got, want := state(fromSnapshot), state(direct); got != want {
 				t.Errorf("snapshot Read differs from the direct Read\n  snapshot: %s\n  direct:   %s", got, want)
@@ -989,7 +1005,7 @@ func TestAccPostgresqlGrantSnapshot_Lifecycle(t *testing.T) {
 	// visible only as builds: more than at the previous Check with the flag
 	// on, none since the start of this test without it (other tests of the
 	// package, such as the equivalence test, build snapshots directly).
-	snapshotOn := os.Getenv("PGCATALOGSNAPSHOT") == "true"
+	snapshotOn, _ := strconv.ParseBool(os.Getenv("PGCATALOGSNAPSHOT"))
 	clearCatalogSnapshots()
 	builds := catalogSnapshotBuilds()
 	checkSnapshotUsed := func(*terraform.State) error {
