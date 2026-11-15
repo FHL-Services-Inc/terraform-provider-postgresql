@@ -85,6 +85,15 @@ upgrading. Each one fixes behavior that was silently wrong before.
   the state are rewritten on the next refresh without a diff, and import uses
   the new form. `object_type` is validated and must be lower case; an upper
   case type was never read back before.
+- **`statement_timeout = 0` on `postgresql_role` sets the timeout to 0** (#207,
+  #134). Before, 0 reset the setting, so the role inherited a database or
+  server value instead of disabling it, and adding or removing `= 0` on an
+  existing role showed no change. Roles with an explicit `0` (also for
+  `idle_in_transaction_session_timeout`) show an in-place update on the first
+  plan, and the role then overrides any database or server value with 0;
+  remove the attribute to keep inheriting it. Both attributes are strings now
+  and accept units (`"30s"`); numbers in configurations keep working, and
+  existing states are upgraded without a diff.
 
 ### Added
 

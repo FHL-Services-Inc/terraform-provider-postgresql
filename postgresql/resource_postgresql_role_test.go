@@ -157,8 +157,8 @@ resource "postgresql_role" "update_role" {
 					resource.TestCheckResourceAttr("postgresql_role.update_role", "valid_until", "2099-05-04 12:00:00+00"),
 					resource.TestCheckResourceAttr("postgresql_role.update_role", "roles.#", "0"),
 					resource.TestCheckResourceAttr("postgresql_role.update_role", "search_path.#", "0"),
-					resource.TestCheckResourceAttr("postgresql_role.update_role", "statement_timeout", "0"),
-					resource.TestCheckResourceAttr("postgresql_role.update_role", "idle_in_transaction_session_timeout", "0"),
+					resource.TestCheckResourceAttr("postgresql_role.update_role", "statement_timeout", ""),
+					resource.TestCheckResourceAttr("postgresql_role.update_role", "idle_in_transaction_session_timeout", ""),
 					resource.TestCheckResourceAttr("postgresql_role.update_role", "assume_role", ""),
 					testAccCheckRoleCanLogin(t, updateRole, "toto"),
 				),
@@ -196,8 +196,8 @@ resource "postgresql_role" "update_role" {
 					resource.TestCheckResourceAttr("postgresql_role.update_role", "password", "toto"),
 					resource.TestCheckResourceAttr("postgresql_role.update_role", "roles.#", "0"),
 					resource.TestCheckResourceAttr("postgresql_role.update_role", "search_path.#", "0"),
-					resource.TestCheckResourceAttr("postgresql_role.update_role", "statement_timeout", "0"),
-					resource.TestCheckResourceAttr("postgresql_role.update_role", "idle_in_transaction_session_timeout", "0"),
+					resource.TestCheckResourceAttr("postgresql_role.update_role", "statement_timeout", ""),
+					resource.TestCheckResourceAttr("postgresql_role.update_role", "idle_in_transaction_session_timeout", ""),
 					resource.TestCheckResourceAttr("postgresql_role.update_role", "assume_role", ""),
 					testAccCheckRoleCanLogin(t, updateRole, "toto"),
 				),
@@ -764,6 +764,103 @@ resource "postgresql_role" "role" {
 					resource.TestCheckResourceAttr("postgresql_role.role", "statement_timeout", "12000"),
 					resource.TestCheckResourceAttr("postgresql_role.role", "idle_in_transaction_session_timeout", "120000"),
 				),
+			},
+		},
+	})
+}
+
+// statement_timeout / idle_in_transaction_session_timeout = 0 must set the
+// setting to 0 on the role, which overrides a database or server value, and
+// removing it must reset the setting (issue #134). Both changes have to show
+// up in the plan of an existing role.
+func TestAccPostgresqlRole_TimeoutZero(t *testing.T) {
+	skipIfNotAcc(t)
+
+	dbSuffix, teardown := setupTestDatabase(t, true, true)
+	defer teardown()
+	dbName, _ := getTestDBNames(dbSuffix)
+	roleName := testUniqueName("role_timeout_zero")
+	const password = "timeout_zero_pw"
+
+	dbConfig := getTestConfig(t)
+	dbExecute(t, dbConfig.connStr(dbName), fmt.Sprintf(
+		"ALTER DATABASE %s SET statement_timeout = '5s'", pq.QuoteIdentifier(dbName)))
+
+	config := func(timeouts string) string {
+		return fmt.Sprintf(`
+resource "postgresql_role" "role" {
+  name     = "%s"
+  login    = true
+  password = "%s"
+  %s
+}
+`, roleName, password, timeouts)
+	}
+
+	// effective checks the settings a session of the role gets in dbName.
+	effective := func(statementTimeout, idleTimeout string) resource.TestCheckFunc {
+		return func(*terraform.State) error {
+			roleConfig := dbConfig
+			roleConfig.Username = roleName
+			roleConfig.Password = password
+			db, err := sql.Open("postgres", roleConfig.connStr(dbName))
+			if err != nil {
+				return err
+			}
+			defer closeDB(t, db)
+			var st, idle string
+			if err := db.QueryRow("SELECT current_setting('statement_timeout'), current_setting('idle_in_transaction_session_timeout')").Scan(&st, &idle); err != nil {
+				return fmt.Errorf("could not read the settings as %s: %w", roleName, err)
+			}
+			if st != statementTimeout || idle != idleTimeout {
+				return fmt.Errorf("as %s in %s: statement_timeout = %s, idle_in_transaction_session_timeout = %s; want %s, %s",
+					roleName, dbName, st, idle, statementTimeout, idleTimeout)
+			}
+			return nil
+		}
+	}
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:     func() { testAccPreCheck(t) },
+		Providers:    testAccProviders,
+		CheckDestroy: testAccCheckPostgresqlRoleDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config: config(""),
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr("postgresql_role.role", "statement_timeout", ""),
+					resource.TestCheckResourceAttr("postgresql_role.role", "idle_in_transaction_session_timeout", ""),
+					effective("5s", "0"),
+				),
+			},
+			// 0 added to an existing role without the settings.
+			{
+				Config: config("statement_timeout = 0\n  idle_in_transaction_session_timeout = 0"),
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr("postgresql_role.role", "statement_timeout", "0"),
+					resource.TestCheckResourceAttr("postgresql_role.role", "idle_in_transaction_session_timeout", "0"),
+					effective("0", "0"),
+				),
+			},
+			// Removing 0 resets the settings: the database value applies again.
+			{
+				Config: config(""),
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr("postgresql_role.role", "statement_timeout", ""),
+					effective("5s", "0"),
+				),
+			},
+			// Units, and the same duration in milliseconds shows no diff.
+			{
+				Config: config(`statement_timeout = "30s"`),
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr("postgresql_role.role", "statement_timeout", "30s"),
+					effective("30s", "0"),
+				),
+			},
+			{
+				Config:   config("statement_timeout = 30000"),
+				PlanOnly: true,
 			},
 		},
 	})
