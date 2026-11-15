@@ -331,6 +331,202 @@ resource "postgresql_schema" "public" {
 	})
 }
 
+// Changing the owner (alone or with the name) must work for a non-superuser
+// provider user too: it has to take the old and the new owner temporarily.
+func TestAccPostgresqlSchema_ChangeOwner(t *testing.T) {
+	skipIfNotAcc(t)
+
+	dbSuffix, teardown := setupTestDatabase(t, true, true)
+	defer teardown()
+
+	dbName, _ := getTestDBNames(dbSuffix)
+	roleA := testUniqueName("schema_owner_a")
+	roleB := testUniqueName("schema_owner_b")
+
+	config := func(name, owner string) string {
+		return fmt.Sprintf(`
+resource "postgresql_role" "a" {
+  name = "%s"
+}
+
+resource "postgresql_role" "b" {
+  name = "%s"
+}
+
+resource "postgresql_schema" "test" {
+  database   = "%s"
+  name       = "%s"
+  owner      = "%s"
+  depends_on = [postgresql_role.a, postgresql_role.b]
+}
+`, roleA, roleB, dbName, name, owner)
+	}
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:     func() { testAccPreCheck(t) },
+		Providers:    testAccProviders,
+		CheckDestroy: testAccCheckPostgresqlSchemaDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config: config("app", roleA),
+				Check:  testAccCheckSchemaOwner(dbName, "app", roleA),
+			},
+			{
+				Config: config("app", roleB),
+				Check:  testAccCheckSchemaOwner(dbName, "app", roleB),
+			},
+			{
+				Config: config("app_renamed", roleA),
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr("postgresql_schema.test", "name", "app_renamed"),
+					testAccCheckSchemaOwner(dbName, "app_renamed", roleA),
+				),
+			},
+		},
+	})
+}
+
+// Removing the owner role and moving its schema to another role in the same
+// apply: the role is dropped first and its schema reassigned to the provider
+// user, so the owner change must not rely on the old owner from the state.
+func TestAccPostgresqlSchema_ChangeOwnerDroppedRole(t *testing.T) {
+	skipIfNotAcc(t)
+
+	dbSuffix, teardown := setupTestDatabase(t, true, true)
+	defer teardown()
+
+	dbName, _ := getTestDBNames(dbSuffix)
+	oldOwner := testUniqueName("schema_old_owner")
+	newOwner := testUniqueName("schema_new_owner")
+
+	config := func(keepOldOwner bool) string {
+		return fmt.Sprintf(`
+resource "postgresql_role" "old" {
+  count = %t ? 1 : 0
+  name  = "%s"
+}
+
+resource "postgresql_role" "new" {
+  name = "%s"
+}
+
+resource "postgresql_schema" "test" {
+  database = "%s"
+  name     = "app"
+  owner    = %t ? postgresql_role.old[0].name : postgresql_role.new.name
+}
+`, keepOldOwner, oldOwner, newOwner, dbName, keepOldOwner)
+	}
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:     func() { testAccPreCheck(t) },
+		Providers:    testAccProviders,
+		CheckDestroy: testAccCheckPostgresqlSchemaDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config: config(true),
+				Check:  testAccCheckSchemaOwner(dbName, "app", oldOwner),
+			},
+			{
+				Config: config(false),
+				Check:  testAccCheckSchemaOwner(dbName, "app", newOwner),
+			},
+		},
+	})
+}
+
+// pg_database_owner cannot have explicit members: the provider user has to
+// take the database owner instead, on create, update and delete.
+func TestAccPostgresqlSchema_DatabaseOwnerRole(t *testing.T) {
+	skipIfNotAcc(t)
+
+	dbSuffix, teardown := setupTestDatabase(t, true, true)
+	defer teardown()
+
+	dbName, dbOwner := getTestDBNames(dbSuffix)
+	role := testUniqueName("schema_owner")
+
+	// The provider user must not own the database, or it already acts as
+	// pg_database_owner. It takes the database back before the teardown.
+	pgConfig := getTestConfig(t)
+	dsn := pgConfig.connStr("postgres")
+	setDatabaseOwner := func(owner string) {
+		dbExecute(t, dsn, fmt.Sprintf("GRANT %s TO CURRENT_USER", dbOwner))
+		dbExecute(t, dsn, fmt.Sprintf("ALTER DATABASE %s OWNER TO %s", dbName, owner))
+		dbExecute(t, dsn, fmt.Sprintf("REVOKE %s FROM CURRENT_USER", dbOwner))
+	}
+	setDatabaseOwner(dbOwner)
+	defer setDatabaseOwner("CURRENT_USER")
+
+	// policy is the privileges of the policy block, none without one.
+	config := func(owner string, policy string) string {
+		policyBlock := ""
+		if policy != "" {
+			policyBlock = fmt.Sprintf(`
+  policy {
+    %s
+    role  = postgresql_role.test.name
+  }`, policy)
+		}
+		return fmt.Sprintf(`
+resource "postgresql_role" "test" {
+  name = "%s"
+}
+
+resource "postgresql_schema" "test" {
+  database   = "%s"
+  name       = "app"
+  owner      = "%s"
+  depends_on = [postgresql_role.test]
+%s
+}
+`, role, dbName, owner, policyBlock)
+	}
+
+	resource.Test(t, resource.TestCase{
+		PreCheck: func() {
+			testAccPreCheck(t)
+			testCheckCompatibleVersion(t, featureDatabaseOwnerRole)
+		},
+		Providers:    testAccProviders,
+		CheckDestroy: testAccCheckPostgresqlSchemaDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config: config("pg_database_owner", ""),
+				Check:  testAccCheckSchemaOwner(dbName, "app", "pg_database_owner"),
+			},
+			{
+				Config: config("pg_database_owner", "usage = true"),
+				Check: resource.ComposeTestCheckFunc(
+					testAccCheckSchemaOwner(dbName, "app", "pg_database_owner"),
+					resource.TestCheckResourceAttr("postgresql_schema.test", "policy.#", "1"),
+				),
+			},
+			// The owner and the policy change in the same apply.
+			{
+				Config: config(role, "usage  = true\n    create = true"),
+				Check: resource.ComposeTestCheckFunc(
+					testAccCheckSchemaOwner(dbName, "app", role),
+					resource.TestCheckTypeSetElemNestedAttrs("postgresql_schema.test", "policy.*", map[string]string{
+						"create": "true",
+						"usage":  "true",
+					}),
+				),
+			},
+			{
+				Config: config("pg_database_owner", "usage = true"),
+				Check: resource.ComposeTestCheckFunc(
+					testAccCheckSchemaOwner(dbName, "app", "pg_database_owner"),
+					resource.TestCheckTypeSetElemNestedAttrs("postgresql_schema.test", "policy.*", map[string]string{
+						"create": "false",
+						"usage":  "true",
+					}),
+				),
+			},
+		},
+	})
+}
+
 func testAccCheckPostgresqlSchemaDestroy(s *terraform.State) error {
 	client := testAccProvider.Meta().(*Client)
 
