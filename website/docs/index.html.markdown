@@ -194,7 +194,8 @@ The following arguments are supported:
   number of connections in use at the same time is also bounded by Terraform's
   `-parallelism` (default 10), so there is rarely a reason to set
   `max_connections` below `-parallelism`; doing so makes resources wait for a
-  free connection.
+  free connection. To limit the connections to the server as a whole, use
+  `max_total_connections`.
 * `max_idle_connections` - (Optional) Maximum number of idle connections each
   pool keeps open for reuse. The default is `0`: every connection is closed as
   soon as it is returned to the pool, so almost every statement outside a
@@ -232,6 +233,34 @@ The following arguments are supported:
     to that database are terminated by the `pg_terminate_backend` that runs
     before `DROP DATABASE`, but they can make a rename or a template copy
     fail.
+* `max_total_connections` - (Optional) Maximum number of connections the
+  provider keeps open to the server at the same time, across all its
+  per-database pools. The default is `0`: no limit beyond `max_connections`
+  per pool. Can also be set with the `PGMAXTOTALCONNECTIONS` environment
+  variable.
+
+  Use it to bound the sessions a configuration with many databases opens,
+  for example with `max_idle_connections` above zero. Set it to at least
+  Terraform's `-parallelism` plus the number of databases the provider
+  connects to (the provider's `database` plus every database named in a
+  resource): with `-parallelism=10` and 4 databases with resources, at least
+  `15`. See the
+  [performance tuning guide](guides/performance-tuning.html)
+  for why.
+
+  * A connection takes a slot before it is opened and gives it back when it
+    is closed. When all slots are taken, the provider closes an idle
+    connection of one of its pools and opens the new one in its place. If no
+    connection is idle, it waits for one to be returned, up to
+    `connect_timeout` (180 seconds when `connect_timeout` is `0`), and then
+    fails with an error that names `max_total_connections`.
+  * Below `-parallelism + 1` a `postgresql_database` that changes owners
+    (it holds a connection to the maintenance database while it connects to
+    the database itself) can wait for `connect_timeout` and fail.
+  * Every `provider` block runs in its own plugin process and has its own
+    limit; add them up across blocks.
+  * Only the `postgres` scheme supports it. With `awspostgres` and
+    `gcppostgres` the setting is ignored and a warning is logged.
 * `conn_max_lifetime_seconds` - (Optional) Maximum lifetime of a connection,
   in seconds. Older connections are closed instead of being reused (a running
   statement is not interrupted). The default is `0`. Zero means unlimited.

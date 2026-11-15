@@ -112,6 +112,57 @@ the plan time at 10 ms round-trip time from 12.9 s to 5.2 s.
   `depends_on` (PostgreSQL refuses the copy while they are connected anyway);
   see [`postgresql_database`](../r/postgresql_database.html).
 
+## `max_total_connections`: one limit for all databases
+
+```hcl
+provider "postgresql" {
+  # ...
+  max_idle_connections  = 10
+  max_total_connections = 15 # >= -parallelism + number of databases
+}
+```
+
+or `export PGMAXTOTALCONNECTIONS=15`.
+
+`max_connections` and `max_idle_connections` apply to each pool, and the
+provider keeps one pool per database, so with many databases the sessions add
+up to about `(number of databases + 1) × max_idle_connections`.
+`max_total_connections` caps the connections the provider holds open at the
+same time across all its pools, so the number of sessions on the server no
+longer grows with the number of databases. When all slots are taken, a new
+connection replaces an idle connection of another pool; if none is idle, it
+waits up to `connect_timeout` and then fails with an error that names
+`max_total_connections`.
+
+### Sizing rule
+
+Set
+
+```
+max_total_connections >= -parallelism + number of databases
+```
+
+where the number of databases counts the provider's `database` plus every
+database named in a resource. With the default `-parallelism=10` and 4
+databases with resources, that is `10 + 5 = 15`.
+
+The reason: Terraform works on up to `-parallelism` resources at a time, each
+using at most one connection, but a connection belongs to one database. With
+the rule, every pool can keep one idle connection while all workers hold one,
+so a worker that moves to another database usually finds a free slot or an
+idle connection of its own database. With a smaller budget, connections are
+closed in one pool and opened in another all the time, and each of those
+reconnects costs a full connection setup:
+
+BENCH_TABLE
+
+At or below `-parallelism` the plan still works, and peak connections stay at
+the limit, but it is slower. The budget never makes the provider hang: a
+resource that cannot get a connection fails after `connect_timeout`. Keep the
+server's `max_connections`, minus your applications' connections, above
+`max_total_connections` times the number of provider blocks that run at the
+same time.
+
 ## `binary_parameters`: one round-trip per statement
 
 ```hcl
@@ -260,7 +311,9 @@ Before you enable it, check the connection budget: the server's
 `max_connections` (and any connection limit on the role, the database or a
 pooler in front) must leave room for about
 `(number of databases + 1) × max_idle_connections` sessions per provider block,
-next to your applications.
+next to your applications. With many databases, cap that with
+`max_total_connections` (at least `-parallelism` + number of databases, see
+above).
 
 `-parallelism` (default 10) is how many resources Terraform works on at the
 same time. Raising it can shorten plans that wait on round-trips, but every

@@ -266,6 +266,7 @@ type Config struct {
 	ConnMaxLifetimeSeconds          int
 	MaxConns                        int
 	MaxIdleConns                    int
+	MaxTotalConns                   int
 	ExpectedVersion                 semver.Version
 	SSLClientCert                   *ClientCertificateConfig
 	SSLRootCertPath                 string
@@ -499,7 +500,9 @@ func (c *Client) connectWithRetry(ctx context.Context, postgresDriverName, dsn s
 
 	connectRetryTimeout := time.Duration(c.config.ConnectionRetryTimeoutSeconds) * time.Second
 	retryError := retry.RetryContext(ctx, connectRetryTimeout, func() *retry.RetryError {
-		if c.config.Scheme == "postgres" && c.config.AuthTokens != nil {
+		if budget := c.config.connBudget(); budget != nil {
+			db, err = c.config.openBudgetedPostgresDB(dsn, budget)
+		} else if c.config.Scheme == "postgres" && c.config.AuthTokens != nil {
 			db, err = c.config.openTokenAuthDB(dsn)
 		} else if c.config.Scheme == "postgres" {
 			db, err = sql.Open(postgresDriverName, dsn)
