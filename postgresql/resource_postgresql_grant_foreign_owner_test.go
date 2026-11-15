@@ -73,7 +73,9 @@ func testCheckTablePrivilege(t *testing.T, dsn, role, table, privilege string, w
 
 func testCheckNotMemberOf(t *testing.T, dsn, member, role string) resource.TestCheckFunc {
 	return func(*terraform.State) error {
-		if testQueryBool(t, dsn, "SELECT pg_has_role($1, $2, 'MEMBER')", member, role) {
+		// pg_auth_members rather than pg_has_role, which is always true for
+		// a superuser.
+		if testQueryBool(t, dsn, "SELECT EXISTS (SELECT 1 FROM pg_auth_members m JOIN pg_roles r ON r.oid = m.roleid JOIN pg_roles u ON u.oid = m.member WHERE r.rolname = $2 AND u.rolname = $1)", member, role) {
 			return fmt.Errorf("%s is left a member of %s", member, role)
 		}
 		return nil
