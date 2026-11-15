@@ -241,6 +241,34 @@ func TestAccPostgresqlGrantReadTablePrivilegesQuery(t *testing.T) {
 	}
 }
 
+// TestGrantEmptyDatabaseIsRejected checks that an empty database (e.g. from
+// an empty data source attribute) fails validation at plan time instead of
+// reaching the server as a zero-length identifier at apply.
+func TestGrantEmptyDatabaseIsRejected(t *testing.T) {
+	resources := map[string]*schema.Resource{
+		"postgresql_grant":              resourcePostgreSQLGrant(),
+		"postgresql_default_privileges": resourcePostgreSQLDefaultPrivileges(),
+	}
+	for name, r := range resources {
+		for _, database := range []string{"", "test_db"} {
+			raw := map[string]interface{}{
+				"database":    database,
+				"role":        "public",
+				"object_type": "table",
+				"schema":      "public",
+				"privileges":  []interface{}{"SELECT"},
+			}
+			if name == "postgresql_default_privileges" {
+				raw["owner"] = "owner"
+			}
+			diags := r.Validate(terraform.NewResourceConfigRaw(raw))
+			if got, want := diags.HasError(), database == ""; got != want {
+				t.Errorf("%s with database %q: validation error = %v, want %v (%v)", name, database, got, want, diags)
+			}
+		}
+	}
+}
+
 func TestCreateGrantQuery(t *testing.T) {
 	var databaseName = "foo"
 	var roleName = "bar"
