@@ -190,7 +190,8 @@ func resourcePostgreSQLGrantCreateOrUpdate(db *DBConnection, d *schema.ResourceD
 	if err != nil {
 		return err
 	}
-	if err := withRolesGranted(db, txn, owners, func() error {
+	directGrant := func() (bool, error) { return grantableDirectly(db, txn, d) }
+	if err := withRolesGrantedOrDirect(db, txn, owners, directGrant, func() error {
 		// Revoke all privileges before granting otherwise reducing privileges will not work.
 		// We just have to revoke them in the same transaction so the role will not lose its
 		// privileges between the revoke and grant statements.
@@ -234,7 +235,8 @@ func resourcePostgreSQLGrantDelete(db *DBConnection, d *schema.ResourceData) err
 		return err
 	}
 
-	if err := withRolesGranted(db, txn, owners, func() error {
+	directGrant := func() (bool, error) { return grantableDirectly(db, txn, d) }
+	if err := withRolesGrantedOrDirect(db, txn, owners, directGrant, func() error {
 		return revokeRolePrivileges(txn, d, false)
 	}); err != nil {
 		return err

@@ -153,6 +153,18 @@ func revokeRoleMembership(db QueryAble, setOption bool, role, member string) (bo
 // and keeps them until txn ends: the caller must commit txn with commitTxn and
 // defer deferredRollback(txn).
 func withRolesGranted(db *DBConnection, txn *sql.Tx, roles []string, fn func() error) error {
+	return withRolesGrantedOrDirect(db, txn, roles, nil, fn)
+}
+
+// withRolesGrantedOrDirect is withRolesGranted for callers that may not need
+// every membership: when the current user cannot become a member of some
+// roles (on PostgreSQL 16+ granting a role needs ADMIN OPTION on it, and a
+// role that is already a member of the current user, even indirectly, cannot
+// be granted to it), directGrant is asked whether fn can run without them
+// (e.g. the current user holds the privileges WITH GRANT OPTION). directGrant
+// runs after the other memberships have been taken. A nil directGrant, or one
+// that answers false, makes it an error naming the blocked roles.
+func withRolesGrantedOrDirect(db *DBConnection, txn *sql.Tx, roles []string, directGrant func() (bool, error), fn func() error) error {
 	// No roles asked, execute the function directly
 	if len(roles) == 0 {
 		return fn()
@@ -203,8 +215,14 @@ func withRolesGranted(db *DBConnection, txn *sql.Tx, roles []string, fn func() e
 		return fmt.Errorf("withRolesGranted: transaction already holds membership locks for other roles than %v", roles)
 	}
 
+	states, err := getRoleMembershipStates(txn, setOption, currentUser, roles)
+	if err != nil {
+		return err
+	}
+
 	var grantedRoles []string
 	var revokedRoles []string
+	var blocked []blockedRole
 
 	for _, role := range roles {
 		// We need to check if the role we want to grant is a superuser
@@ -232,23 +250,67 @@ func withRolesGranted(db *DBConnection, txn *sql.Tx, roles []string, fn func() e
 		//
 		//  - REVOKE foo FROM postgres
 		//  - GRANT postgres TO foo
+		//
+		// When foo is a member of postgres through another role, or the
+		// membership cannot be granted (PostgreSQL 16+ needs ADMIN OPTION on
+		// foo), foo is blocked and directGrant decides.
+		state := states[role]
+		switch state.action() {
+		case membershipSkip:
+			log.Printf("withRolesGranted: %s can already act as %s, nothing to grant", currentUser, role)
+			continue
 
-		// Check the opposite relation and revoke currentUser from role if needed
-		revoked, err := revokeRoleMembership(txn, setOption, currentUser, role)
-		if err != nil {
-			return err
+		case membershipBlocked:
+			reason := fmt.Sprintf("%s is a member of %s", pq.QuoteIdentifier(role), pq.QuoteIdentifier(currentUser))
+			chain, err := membershipChain(txn, role, currentUser)
+			if err != nil {
+				return err
+			}
+			if len(chain) > 0 {
+				reason += " through " + strings.Join(chain, " -> ")
+			}
+			reason += ", and PostgreSQL does not allow circular memberships"
+			blocked = append(blocked, blockedRole{role: role, reason: reason, circular: true})
+			continue
+
+		case membershipTryGrant:
+			grantErr, err := tryTakeMembership(txn, currentUser, role, state.reverseDirect)
+			if err != nil {
+				return err
+			}
+			if grantErr != nil {
+				log.Printf("withRolesGranted: could not grant %s to %s: %v", role, currentUser, grantErr)
+				blocked = append(blocked, blockedRole{
+					role:   role,
+					reason: fmt.Sprintf("granting %s to it failed: %v", pq.QuoteIdentifier(role), grantErr),
+				})
+				continue
+			}
+
+		case membershipGrant:
+			if err := takeMembership(txn, currentUser, role, state.reverseDirect); err != nil {
+				return err
+			}
 		}
-		if revoked {
+
+		if state.reverseDirect {
 			revokedRoles = append(revokedRoles, role)
 		}
+		grantedRoles = append(grantedRoles, role)
+	}
 
-		// Grant the role to currentUser if needed
-		roleGranted, err := grantRoleMembership(txn, setOption, role, currentUser)
-		if err != nil {
-			return err
+	if len(blocked) > 0 {
+		ok := false
+		if directGrant != nil {
+			if ok, err = directGrant(); err != nil {
+				return err
+			}
 		}
-		if roleGranted {
-			grantedRoles = append(grantedRoles, role)
+		if !ok {
+			return blockedRolesError(currentUser, blocked, directGrant != nil)
+		}
+		for _, b := range blocked {
+			log.Printf("withRolesGranted: %s is not a member of %s but holds the privileges WITH GRANT OPTION, granting them directly", currentUser, b.role)
 		}
 	}
 
