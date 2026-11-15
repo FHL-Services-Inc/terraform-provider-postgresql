@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"reflect"
+	"slices"
 	"strings"
 
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
@@ -135,10 +136,12 @@ func resourcePostgreSQLSchemaCreate(db *DBConnection, d *schema.ResourceData) er
 	}
 	rolesToGrant = append(rolesToGrant, dbOwner)
 
-	schemaOwner := d.Get("owner").(string)
+	schemaOwner, err := resolveSchemaOwner(txn, d.Get("owner").(string))
+	if err != nil {
+		return err
+	}
 	if schemaOwner != "" && schemaOwner != dbOwner {
 		rolesToGrant = append(rolesToGrant, schemaOwner)
-
 	}
 
 	if err := withRolesGranted(db, txn, rolesToGrant, func() error {
@@ -247,7 +250,10 @@ func resourcePostgreSQLSchemaDelete(db *DBConnection, d *schema.ResourceData) er
 		return nil
 	}
 
-	owner := d.Get("owner").(string)
+	owner, err := resolveSchemaOwner(txn, d.Get("owner").(string))
+	if err != nil {
+		return err
+	}
 
 	if err = withRolesGranted(db, txn, []string{owner}, func() error {
 		dropMode := "RESTRICT"
@@ -350,21 +356,32 @@ func resourcePostgreSQLSchemaUpdate(db *DBConnection, d *schema.ResourceData) er
 	}
 	defer deferredRollback(txn)
 
-	// setSchemaPolicy takes the membership locks of the owner
-	// (withRolesGranted). Take them before the DDL below: waiting for them
-	// while holding locks on the schema could block, forever, an owner change
-	// of the database that holds them and runs REASSIGN OWNED on that schema
-	// (setAlterOwnership, see membershipLocks).
-	if owner := d.Get(schemaOwnerAttr).(string); owner != "" && d.HasChange(schemaPolicyAttr) &&
-		(d.HasChange(schemaNameAttr) || d.HasChange(schemaOwnerAttr)) {
-		lockMembershipsForTxn(txn, []string{owner})
-	}
-
-	if err := setSchemaName(txn, d, databaseName); err != nil {
+	rolesToGrant, err := schemaAlterRoles(txn, d, databaseName)
+	if err != nil {
 		return err
 	}
 
-	if err := setSchemaOwner(txn, d); err != nil {
+	// setSchemaPolicy takes the membership locks of the owner
+	// (withRolesGranted). Take them, with the ones of the rename and owner
+	// change, before the DDL below: waiting for them while holding locks on
+	// the schema could block, forever, an owner change of the database that
+	// holds them and runs REASSIGN OWNED on that schema (setAlterOwnership,
+	// see membershipLocks).
+	if owner := d.Get(schemaOwnerAttr).(string); owner != "" && d.HasChange(schemaPolicyAttr) &&
+		(d.HasChange(schemaNameAttr) || d.HasChange(schemaOwnerAttr)) {
+		policyOwner, err := resolveSchemaOwner(txn, owner)
+		if err != nil {
+			return err
+		}
+		lockMembershipsForTxn(txn, append(slices.Clone(rolesToGrant), policyOwner))
+	}
+
+	if err := withRolesGranted(db, txn, rolesToGrant, func() error {
+		if err := setSchemaName(txn, d, databaseName); err != nil {
+			return err
+		}
+		return setSchemaOwner(txn, d)
+	}); err != nil {
 		return err
 	}
 
@@ -377,6 +394,66 @@ func resourcePostgreSQLSchemaUpdate(db *DBConnection, d *schema.ResourceData) er
 	}
 
 	return resourcePostgreSQLSchemaReadImpl(db, d)
+}
+
+// schemaAlterRoles returns the roles a non-superuser provider user has to
+// take temporarily to rename the schema or change its owner: the current
+// owner (read from the catalog, as the owner in the state may have been
+// dropped and its objects reassigned in the meantime), the new owner, and
+// the database owner if the provider user has no CREATE privilege on the
+// database (both ALTER SCHEMA forms check it for the current user).
+func schemaAlterRoles(txn *sql.Tx, d *schema.ResourceData, databaseName string) ([]string, error) {
+	if !d.HasChange(schemaNameAttr) && !d.HasChange(schemaOwnerAttr) {
+		return nil, nil
+	}
+
+	oldName, _ := d.GetChange(schemaNameAttr)
+	currentOwner, err := getSchemaOwner(txn, oldName.(string))
+	if err != nil {
+		return nil, err
+	}
+	owners := []string{currentOwner}
+	if d.HasChange(schemaOwnerAttr) {
+		owners = append(owners, d.Get(schemaOwnerAttr).(string))
+	}
+
+	var canCreate bool
+	if err := txn.QueryRow("SELECT has_database_privilege(current_database(), 'CREATE')").Scan(&canCreate); err != nil {
+		return nil, fmt.Errorf("could not check CREATE privilege on database %s: %w", databaseName, err)
+	}
+	if !canCreate {
+		dbOwner, err := getDatabaseOwner(txn, databaseName)
+		if err != nil {
+			return nil, err
+		}
+		owners = append(owners, dbOwner)
+	}
+
+	owners, err = resolveOwners(txn, owners)
+	if err != nil {
+		return nil, err
+	}
+
+	var roles []string
+	for _, owner := range owners {
+		if owner != "" && !slices.Contains(roles, owner) {
+			roles = append(roles, owner)
+		}
+	}
+	return roles, nil
+}
+
+// resolveSchemaOwner resolves pg_database_owner, which cannot have explicit
+// members, to the owner of the current database.
+func resolveSchemaOwner(txn *sql.Tx, owner string) (string, error) {
+	if owner == "" {
+		return "", nil
+	}
+	owners, err := resolveOwners(txn, []string{owner})
+	if err != nil {
+		return "", err
+	}
+	return owners[0], nil
 }
 
 func setSchemaName(txn *sql.Tx, d *schema.ResourceData, databaseName string) error {
@@ -480,6 +557,10 @@ func setSchemaPolicy(db *DBConnection, txn *sql.Tx, d *schema.ResourceData) erro
 		}
 	}
 
+	owner, err := resolveSchemaOwner(txn, owner)
+	if err != nil {
+		return err
+	}
 	rolesToGrant := []string{}
 	if owner != "" {
 		rolesToGrant = append(rolesToGrant, owner)
