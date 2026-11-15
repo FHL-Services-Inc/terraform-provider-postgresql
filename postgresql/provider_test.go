@@ -128,7 +128,7 @@ func TestProviderMaxIdleConnectionsEnvDefault(t *testing.T) {
 }
 
 // TestGetRDSAuthTokenUsesRegionWithProfile checks that aws_rds_iam_region is
-// used to sign the token whether or not aws_rds_iam_profile is set. The token
+// used to sign the token whether or not aws_rds_iam_profile is set (#195). The token
 // is presigned locally from static credentials, so nothing goes on the wire.
 func TestGetRDSAuthTokenUsesRegionWithProfile(t *testing.T) {
 	dir := t.TempDir()
@@ -171,9 +171,9 @@ func TestGetRDSAuthTokenUsesRegionWithProfile(t *testing.T) {
 				t.Setenv("AWS_SECRET_ACCESS_KEY", "secret")
 			}
 
-			token, _, err := getRDSAuthToken(context.Background(), tc.region, tc.profile, "", "iam_user", "db.example.com", 5432)
+			token, _, err := newRDSAuthTokenFetcher(tc.region, tc.profile, "", "iam_user", "db.example.com", 5432).fetch(context.Background())
 			if err != nil {
-				t.Fatalf("getRDSAuthToken: %v", err)
+				t.Fatalf("fetch: %v", err)
 			}
 			_, rawQuery, ok := strings.Cut(token, "?")
 			if !ok {
