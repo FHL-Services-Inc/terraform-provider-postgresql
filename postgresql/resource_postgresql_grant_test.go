@@ -1496,11 +1496,11 @@ func TestAccPostgresqlGrantDatabaseNotOwned(t *testing.T) {
 	dbExecute(t, dsn, fmt.Sprintf("CREATE ROLE %s", roRole))
 	// The provider user needs to be a member of the owner to create the
 	// database for it, but must not stay one: that is the case under test.
-	// It keeps its own CONNECT, because the provider connects to the database
-	// it manages grants on and PUBLIC loses CONNECT below.
+	// It gets no CONNECT of its own: once PUBLIC loses CONNECT below, the
+	// provider can no longer connect to the database, so database grants
+	// must not need to (#148).
 	dbExecute(t, dsn, fmt.Sprintf("GRANT %s TO %s", ownerRole, adminUser))
 	dbExecute(t, dsn, fmt.Sprintf("CREATE DATABASE %s OWNER %s", dbName, ownerRole))
-	dbExecute(t, dsn, fmt.Sprintf("GRANT CONNECT ON DATABASE %s TO %s", dbName, adminUser))
 	dbExecute(t, dsn, fmt.Sprintf("REVOKE %s FROM %s", ownerRole, adminUser))
 	defer func() {
 		dbExecute(t, dsn, fmt.Sprintf("GRANT %s TO %s", ownerRole, adminUser))
@@ -1547,6 +1547,30 @@ resource "postgresql_grant" "ro_connect" {
 					}),
 				),
 			},
+			// Refresh, then plan: both read the ACL while the provider user
+			// has no CONNECT on the database, and must find no diff.
+			{
+				RefreshState: true,
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr("postgresql_grant.revoke_public", "privileges.#", "0"),
+					resource.TestCheckResourceAttr("postgresql_grant.ro_connect", "privileges.#", "1"),
+				),
+			},
+			{
+				Config:   fmt.Sprintf(tfConfig, `["CONNECT"]`),
+				PlanOnly: true,
+			},
+			// Import reads the grant option on the same connection.
+			{
+				ResourceName:      "postgresql_grant.ro_connect",
+				ImportState:       true,
+				ImportStateVerify: true,
+			},
+			{
+				ResourceName:      "postgresql_grant.revoke_public",
+				ImportState:       true,
+				ImportStateVerify: true,
+			},
 			// Revoke goes through the same path.
 			{
 				Config: fmt.Sprintf(tfConfig, "[]"),
@@ -1555,6 +1579,82 @@ resource "postgresql_grant" "ro_connect" {
 					testCheckDatabaseConnectACL(t, dsn, dbName, map[string]bool{
 						"public": false,
 						roRole:   false,
+					}),
+				),
+			},
+		},
+	})
+}
+
+// TestAccPostgresqlGrantDatabaseMaxConnectionsOne runs database grants on a
+// database owned by another role while the provider may open a single
+// connection. Database grants run on the maintenance database (#148), and
+// taking the owner membership (#113) happens in the same transaction: nothing
+// in a grant write may wait for a second connection from that pool.
+func TestAccPostgresqlGrantDatabaseMaxConnectionsOne(t *testing.T) {
+	skipIfNotAcc(t)
+
+	var (
+		dbName    = testUniqueName("test_grant_db_single_conn")
+		ownerRole = testUniqueName("test_grant_db_single_conn_owner")
+		roRole    = testUniqueName("test_grant_db_single_conn_ro")
+	)
+
+	config := getTestConfig(t)
+	dsn := config.connStr("postgres")
+	adminUser := pq.QuoteIdentifier(config.getDatabaseUsername())
+
+	dbExecute(t, dsn, fmt.Sprintf("CREATE ROLE %s", ownerRole))
+	dbExecute(t, dsn, fmt.Sprintf("CREATE ROLE %s", roRole))
+	dbExecute(t, dsn, fmt.Sprintf("GRANT %s TO %s", ownerRole, adminUser))
+	dbExecute(t, dsn, fmt.Sprintf("CREATE DATABASE %s OWNER %s", dbName, ownerRole))
+	dbExecute(t, dsn, fmt.Sprintf("REVOKE %s FROM %s", ownerRole, adminUser))
+	defer func() {
+		dbExecute(t, dsn, fmt.Sprintf("GRANT %s TO %s", ownerRole, adminUser))
+		dropTestDatabase(t, config, dbName)
+		dbExecute(t, dsn, fmt.Sprintf("DROP ROLE IF EXISTS %s", roRole))
+		dbExecute(t, dsn, fmt.Sprintf("REVOKE %s FROM %s", ownerRole, adminUser))
+		dbExecute(t, dsn, fmt.Sprintf("DROP ROLE IF EXISTS %s", ownerRole))
+	}()
+
+	// dbRegistry is keyed by DSN: a connect_timeout unique to this test gives
+	// the provider its own single-connection pools.
+	tfConfig := fmt.Sprintf(`
+provider "postgresql" {
+  max_connections = 1
+  connect_timeout = 175
+}
+
+resource "postgresql_grant" "revoke_public" {
+	database    = "%[1]s"
+	role        = "public"
+	object_type = "database"
+	privileges  = []
+}
+
+resource "postgresql_grant" "ro_connect" {
+	database    = "%[1]s"
+	role        = "%[2]s"
+	object_type = "database"
+	privileges  = ["CONNECT"]
+}
+`, dbName, roRole)
+
+	resource.Test(t, resource.TestCase{
+		PreCheck: func() {
+			testAccPreCheck(t)
+			testCheckCompatibleVersion(t, featurePrivileges)
+		},
+		ProviderFactories: singleConnProviderFactories,
+		Steps: []resource.TestStep{
+			{
+				Config: tfConfig,
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr("postgresql_grant.revoke_public", "privileges.#", "0"),
+					resource.TestCheckResourceAttr("postgresql_grant.ro_connect", "privileges.#", "1"),
+					testCheckDatabaseConnectACL(t, dsn, dbName, map[string]bool{
+						"public": false,
+						roRole:   true,
 					}),
 				),
 			},

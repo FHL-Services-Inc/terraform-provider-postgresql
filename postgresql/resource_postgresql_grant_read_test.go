@@ -197,7 +197,9 @@ func grantReadCases() []grantReadCase {
 		grant("column", map[string]any{"schema": "s", "object_type": "column", "objects": []any{"t"}, "columns": []any{"c"}, "privileges": []any{"UPDATE"}}, true, append([]driver.Value{"t", "c"}, priv("UPDATE")...)...),
 		grant("schema", map[string]any{"schema": "s", "object_type": "schema", "privileges": []any{"USAGE"}}, true, priv("USAGE")...),
 		grant("schema_public", map[string]any{"role": "public", "schema": "s", "object_type": "schema", "privileges": []any{"USAGE"}}, true, priv("USAGE")...),
-		grant("database", map[string]any{"object_type": "database", "privileges": []any{"CONNECT"}}, false, priv("CONNECT")...),
+		// A database grant reads on the maintenance database, where the
+		// schema_exists column reports whether the target database exists.
+		grant("database", map[string]any{"object_type": "database", "privileges": []any{"CONNECT"}}, true, priv("CONNECT")...),
 		grant("foreign_data_wrapper", map[string]any{"object_type": "foreign_data_wrapper", "objects": []any{"w"}, "privileges": []any{"USAGE"}}, false, priv("USAGE")...),
 		grant("foreign_server", map[string]any{"object_type": "foreign_server", "objects": []any{"srv"}, "privileges": []any{"USAGE"}}, false, priv("USAGE")...),
 		defaultPrivileges("schema", map[string]any{"schema": "s", "object_type": "table"}, true),
@@ -298,6 +300,29 @@ func TestGrantReadPrunesDroppedDatabase(t *testing.T) {
 				t.Errorf("Read of a grant in a dropped database kept ID %q, want it cleared", d.Id())
 			}
 		})
+	}
+}
+
+// TestGrantReadDatabaseOnMaintenanceDB pins that a database grant is read on
+// the provider's maintenance database, not on the database it grants on: a
+// provider user without CONNECT on that database (revoked from PUBLIC) must
+// still read it (#148). Only the "testdb" pool exists here, so a Read that
+// connected to "otherdb" would fail.
+func TestGrantReadDatabaseOnMaintenanceDB(t *testing.T) {
+	priv := []driver.Value{true, true, []byte("{CONNECT}")}
+	conn := newGrantReadConnection(t, priv, nil)
+	d := schema.TestResourceDataRaw(t, resourcePostgreSQLGrant().Schema, map[string]any{
+		"database": "otherdb", "role": "r", "object_type": "database", "privileges": []any{"CONNECT"},
+	})
+	d.SetId("some-id")
+	if err := resourcePostgreSQLGrantRead(conn, d); err != nil {
+		t.Fatalf("Read returned error: %v", err)
+	}
+	if _, statements := grantReadCounter.counts(); len(statements) != 1 {
+		t.Fatalf("Read issued %d statements on the maintenance database, want 1: %q", len(statements), statements)
+	}
+	if got := d.Get("privileges").(*schema.Set).Len(); d.Id() == "" || got != 1 {
+		t.Errorf("Read of an existing database grant: id=%q, %d privileges, want 1", d.Id(), got)
 	}
 }
 

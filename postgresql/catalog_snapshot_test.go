@@ -120,8 +120,8 @@ var (
 
 // catalogFixture is the canned catalog of database "testdb": roles r (grantee
 // of every resource) and o (owner), schema s with table t, sequence q and the
-// routines f (two overloads) and p, default ACLs by o, and
-// the database ACL. Privileges match the resources in grantReadCases.
+// routines f (two overloads) and p, and default ACLs by o. Privileges match
+// the resources in grantReadCases.
 func catalogFixture() [][]driver.Value {
 	acl := func(s string) driver.Value { return s }
 	return [][]driver.Value{
@@ -134,7 +134,6 @@ func catalogFixture() [][]driver.Value {
 		{"c", int64(0), int64(21), "noacl", "r", nil},
 		{"d", int64(11), int64(20), nil, "r", acl("{r=r/o}")},
 		{"d", int64(11), int64(0), nil, "S", acl("{r=r/o}")},
-		{"D", int64(0), int64(0), "testdb", nil, acl("{=Tc/o,r=c/o}")},
 	}
 }
 
@@ -223,7 +222,7 @@ func newCatalogConnection(t *testing.T, snapshot bool, rows func(string) ([][]dr
 // snapshotCovered reports whether the snapshot serves this Read case.
 func snapshotCovered(tc grantReadCase) bool {
 	switch tc.attrs["object_type"] {
-	case "column", "foreign_data_wrapper", "foreign_server":
+	case "column", "foreign_data_wrapper", "foreign_server", "database":
 		return false
 	}
 	return true
@@ -329,12 +328,6 @@ func TestCatalogSnapshotDetectsDrift(t *testing.T) {
 		if got := privilegesOfData(d); fmt.Sprint(got) != want {
 			t.Errorf("%s grant on all routines: privileges = %v, want %s", objectType, got, want)
 		}
-	}
-
-	// Database grant: PUBLIC has TEMPORARY and CONNECT, the role only CONNECT.
-	d = readCase(t, client, cases[9], map[string]any{"role": "public", "privileges": []any{"CONNECT"}})
-	if got := privilegesOfData(d); fmt.Sprint(got) != "[CONNECT TEMPORARY]" {
-		t.Errorf("database grant to public: privileges = %v, want [CONNECT TEMPORARY]", got)
 	}
 
 	if got := catalogFake.count(catalogSnapshotQuery); got != 1 {

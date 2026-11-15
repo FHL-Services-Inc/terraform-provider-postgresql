@@ -176,9 +176,7 @@ func resourcePostgreSQLGrantCreateOrUpdate(db *DBConnection, d *schema.ResourceD
 		return err
 	}
 
-	database := d.Get("database").(string)
-
-	txn, err := startTransaction(db.client, database)
+	txn, err := startTransaction(db.client, grantConnDatabase(d))
 	if err != nil {
 		return err
 	}
@@ -221,8 +219,7 @@ func resourcePostgreSQLGrantDelete(db *DBConnection, d *schema.ResourceData) err
 		return fmt.Errorf("feature is not supported: %v", err)
 	}
 
-	database := d.Get("database").(string)
-	txn, err := startTransaction(db.client, database)
+	txn, err := startTransaction(db.client, grantConnDatabase(d))
 	if err != nil {
 		return err
 	}
@@ -248,6 +245,21 @@ func resourcePostgreSQLGrantDelete(db *DBConnection, d *schema.ResourceData) err
 	}
 
 	return nil
+}
+
+// grantConnDatabase returns the database the reads and writes of a grant run
+// on. Database grants only change and read pg_database.datacl, a shared
+// catalog, so they run on the provider's maintenance database like
+// postgresql_database does ("" selects it): a provider user that does not own
+// the target database, and has no CONNECT on it once CONNECT is revoked from
+// PUBLIC, still manages them (#148). Their advisory locks are then taken there
+// too, where postgresql_database and postgresql_role take theirs. Every other
+// object type lives in the target database.
+func grantConnDatabase(d *schema.ResourceData) string {
+	if d.Get("object_type").(string) == "database" {
+		return ""
+	}
+	return d.Get("database").(string)
 }
 
 // lockGrantTargets takes the advisory locks of a grant write: the grantee
@@ -279,7 +291,8 @@ const grantReadSchemaCTE = `,
 n AS (SELECT oid FROM pg_namespace WHERE nspname = $2)`
 
 // queryGrantRead runs the single Read query of postgresql_grant or
-// postgresql_default_privileges on the resource's database, outside of any
+// postgresql_default_privileges on the resource's database (the maintenance
+// database for database grants, see grantConnDatabase), outside of any
 // transaction: the query reads only catalogs, so one statement already sees one
 // consistent snapshot.
 //
@@ -290,7 +303,9 @@ n AS (SELECT oid FROM pg_namespace WHERE nspname = $2)`
 func queryGrantRead(db *DBConnection, d *schema.ResourceData, query string, args ...any) (*sql.Rows, error) {
 	database := d.Get("database").(string)
 
-	conn, err := initConnection(db.client, database)
+	// postgresql_default_privileges has no database object_type, so this is
+	// always its target database.
+	conn, err := initConnection(db.client, grantConnDatabase(d))
 	if err == nil {
 		var rows *sql.Rows
 		if rows, err = conn.Query(query, args...); err == nil {
@@ -323,6 +338,11 @@ func grantTargetGone(d *schema.ResourceData, roleExists, schemaExists bool) bool
 		return true
 	}
 	if !schemaExists {
+		if d.Get("object_type") == "database" {
+			log.Printf("[WARN] PostgreSQL database (%s) not found, removing %s from state", d.Get("database").(string), d.Id())
+			d.SetId("")
+			return true
+		}
 		log.Printf("[DEBUG] schema %s does not exists", d.Get("schema").(string))
 		d.SetId("")
 		return true
@@ -350,9 +370,10 @@ func relationACLType(relkinds []string) string {
 
 // buildReadSingleObjectRolePrivilegesQuery builds the Read query for the object
 // types granted on one named object (database, schema, foreign data wrapper,
-// foreign server). It returns one row: role_exists, schema_exists (always true
-// when the object type is not schema-scoped) and the privileges granted to the
-// role on the object (NULL when there are none).
+// foreign server). It returns one row: role_exists, schema_exists (whether the
+// database exists for a database grant, always true for the other types that
+// are not schema-scoped) and the privileges granted to the role on the object
+// (NULL when there are none).
 func buildReadSingleObjectRolePrivilegesQuery(d *schema.ResourceData) (string, []any) {
 	role := d.Get("role").(string)
 
@@ -378,13 +399,21 @@ LEFT JOIN pg_namespace n ON n.nspname = $2
 		name = d.Get("objects").(*schema.Set).List()[0].(string)
 	}
 
+	// A database grant is read on the maintenance database (see
+	// grantConnDatabase), where a dropped target database is no connection
+	// error: the second column reports whether it still exists instead.
+	exists := "true"
+	if d.Get("object_type").(string) == "database" {
+		exists = "EXISTS (SELECT 1 FROM pg_catalog.pg_database WHERE datname = $2)"
+	}
+
 	return grantReadRoleCTE + fmt.Sprintf(`
-SELECT r.oid IS NOT NULL, true,
+SELECT r.oid IS NOT NULL, %s,
     (SELECT pg_catalog.array_agg(a.privilege_type)
      FROM pg_catalog.%s o, pg_catalog.aclexplode(COALESCE(o.%s, pg_catalog.acldefault('%s', o.%s))) a
      WHERE o.%s = $2 AND a.grantee = r.oid)
 FROM r
-`, catalog, acl, aclType, owner, nameColumn), []any{role, name}
+`, exists, catalog, acl, aclType, owner, nameColumn), []any{role, name}
 }
 
 func readSingleObjectRolePrivileges(db *DBConnection, d *schema.ResourceData) error {
@@ -1042,7 +1071,7 @@ func privilegeNames(privileges *schema.Set) *schema.Set {
 }
 
 // readRolePrivilegesFromSnapshot is readRolePrivileges (and the single-object
-// Read of schema and database grants) served from the catalog snapshot, with
+// Read of schema grants) served from the catalog snapshot, with
 // the same outcome for every input it is given (see grantReadUsesSnapshot): a
 // missing role or schema removes the resource from state, a NULL ACL reads as
 // the object's default privileges, objects are matched by name, each relation
@@ -1059,7 +1088,7 @@ func readRolePrivilegesFromSnapshot(snap *catalogSnapshot, db *DBConnection, d *
 	// drift is the privilege set to write to state, nil when every object
 	// has the configured privileges.
 	var drift *schema.Set
-	schemaExists := true
+	var schemaExists bool
 
 	single := func(acl sql.NullString) error {
 		granted, err := privilegesOf(acl, grantee)
@@ -1073,11 +1102,6 @@ func readRolePrivilegesFromSnapshot(snap *catalogSnapshot, db *DBConnection, d *
 	}
 
 	switch objectType {
-	case "database":
-		if err := single(snap.datACL); err != nil {
-			return err
-		}
-
 	case "schema":
 		ns, ok := snap.namespaces[schemaName]
 		schemaExists = ok
@@ -1165,10 +1189,12 @@ func readRolePrivilegesFromSnapshot(snap *catalogSnapshot, db *DBConnection, d *
 // catalog snapshot. Column, foreign data wrapper and foreign server grants
 // are not in it, and neither are function signature entries ("f(integer)"):
 // the direct Read resolves them with to_regprocedure, which the snapshot
-// cannot do without the server.
+// cannot do without the server. Database grants are not served from it
+// either: the snapshot is taken on the target database, which the database
+// grant Read must not connect to (see grantConnDatabase).
 func grantReadUsesSnapshot(d *schema.ResourceData) bool {
 	switch d.Get("object_type").(string) {
-	case "column", "foreign_data_wrapper", "foreign_server":
+	case "column", "foreign_data_wrapper", "foreign_server", "database":
 		return false
 	case "function", "procedure", "routine":
 		return !hasFunctionSignature(d.Get("objects").(*schema.Set))

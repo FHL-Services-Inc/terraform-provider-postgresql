@@ -43,7 +43,7 @@ resource "postgresql_grant" "read_insert_column" {
 ## Argument Reference
 
 * `role` - (Required) The name of the role to grant privileges on, Set it to "public" for all roles.
-* `database` - (Required) The database to grant privileges on for this role.
+* `database` - (Required) The database to grant privileges on for this role. With `object_type = "database"` the provider does not connect to this database: the grant is read and written on the provider's own `database`, so it keeps working after `CONNECT` is revoked from `public`.
 * `schema` - The database schema to grant privileges on for this role (Required except if object_type is "database")
 * `object_type` - (Required) The PostgreSQL object type to grant the privileges on (one of: database, schema, table, sequence, function, procedure, routine, foreign_data_wrapper, foreign_server, column).
 * `privileges` - (Required) The list of privileges to grant. There are different kinds of privileges: SELECT, INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER, CREATE, CONNECT, TEMPORARY, EXECUTE, and USAGE. An empty list could be provided to revoke all privileges for this role. When the objects covered by the grant drift apart, a refresh records a privilege held by only some of them as `"<PRIVILEGE> (on some objects only)"`, so the plan shows it until the next apply aligns every object. On refresh, an object whose privileges were never granted or revoked explicitly is read with its default privileges (`acldefault`): everything for its owner, `EXECUTE` for `public` on functions, `CONNECT` and `TEMPORARY` for `public` on databases.

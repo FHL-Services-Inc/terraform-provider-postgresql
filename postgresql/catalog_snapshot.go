@@ -29,7 +29,9 @@ var catalogSnapshotMaxBytes = 64 << 20
 //	   relkinds the grant Read handles (ownerRelkinds: tables, partitioned
 //	   tables, views, materialized views, foreign tables and sequences)
 //	d: default ACLs     (defaclrole, defaclnamespace, NULL, defaclobjtype, defaclacl)
-//	D: this database    (0, 0, datname, NULL, datacl)
+//
+// pg_database is not in it: database grants are read on the maintenance
+// database (grantConnDatabase), not on the database the snapshot is taken on.
 //
 // A NULL object ACL is read as acldefault(type, owner), exactly as the direct
 // Read queries do (see relationACLType), so an object never granted or revoked
@@ -44,7 +46,6 @@ const catalogSnapshotQuery = `SELECT 'r', oid::bigint, 0::bigint, rolname::text,
 UNION ALL SELECT 'n', oid::bigint, 0::bigint, nspname::text, NULL, COALESCE(nspacl, pg_catalog.acldefault('n', nspowner))::text FROM pg_catalog.pg_namespace
 UNION ALL SELECT 'c', 0::bigint, relnamespace::bigint, relname::text, relkind::text, COALESCE(relacl, pg_catalog.acldefault(CASE WHEN relkind = 'S' THEN 's' ELSE 'r' END::"char", relowner))::text FROM pg_catalog.pg_class WHERE relkind IN ('r', 'p', 'v', 'm', 'f', 'S')
 UNION ALL SELECT 'd', defaclrole::bigint, defaclnamespace::bigint, NULL, defaclobjtype::text, defaclacl::text FROM pg_catalog.pg_default_acl
-UNION ALL SELECT 'D', 0::bigint, 0::bigint, datname::text, NULL, COALESCE(datacl, pg_catalog.acldefault('d', datdba))::text FROM pg_catalog.pg_database WHERE datname = current_database()
 `
 
 // catalogSnapshotProcQuery loads pg_proc on demand: only Reads of function,
@@ -94,7 +95,6 @@ type catalogSnapshot struct {
 	// sequence grant covers (ownerRelkinds), by name.
 	relations  map[uint32][]catalogObject
 	defaultACL map[defaultACLKey]string
-	datACL     sql.NullString
 
 	// routines is loaded by the first Read that needs pg_proc. Overloads are
 	// adjacent entries with the same name.
@@ -267,8 +267,6 @@ func buildCatalogSnapshot(db *DBConnection, gen uint64) (*catalogSnapshot, error
 			snap.relations[uint32(namespace)] = append(snap.relations[uint32(namespace)], catalogObject{name: name.String, kind: sub.String, acl: acl})
 		case "d":
 			snap.defaultACL[defaultACLKey{owner: uint32(id), namespace: uint32(namespace), objType: sub.String}] = acl.String
-		case "D":
-			snap.datACL = acl
 		default:
 			return nil, fmt.Errorf("catalog snapshot: unexpected row kind %q", kind)
 		}
