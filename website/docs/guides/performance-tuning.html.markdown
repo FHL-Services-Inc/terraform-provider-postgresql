@@ -3,7 +3,7 @@ layout: "postgresql"
 page_title: "PostgreSQL: Performance tuning"
 sidebar_current: "docs-postgresql-guide-performance-tuning"
 description: |-
-  Provider settings that make plan and apply faster with many resources: connection reuse, single round-trip statements, and how to size and measure them.
+  Provider settings that make plan and apply faster with many resources: connection reuse, single round-trip statements, a shared catalog snapshot, and how to size and measure them.
 ---
 
 # Performance tuning
@@ -31,7 +31,9 @@ statement:
   handshake with `sslmode = require` or stricter, and the PostgreSQL startup
   and authentication exchange: several round-trips before the statement is
   even sent. In the benchmark below, a plan of 1,143 resources ran about
-  7,100 statements and opened about 2,600 connections.
+  1,160 statements and opened about 1,180 connections with the defaults
+  (before the read optimizations of this release: about 7,000 statements and
+  2,600 connections).
 * **Two round-trips per parameterized statement.** By default the driver
   ([`lib/pq`](https://pkg.go.dev/github.com/lib/pq)) prepares each statement
   that has bind parameters (almost every query the provider runs) and executes
@@ -54,8 +56,8 @@ or, without changing the configuration, `export PGMAXIDLECONNECTIONS=10`.
 
 With a value above zero, each connection pool keeps up to that many idle
 connections open and the provider reuses them instead of reconnecting. In the
-benchmark below this took a plan from about 2,600 new connections to 38, and
-the plan time at 10 ms round-trip time from 30.2 s to 17.9 s.
+benchmark below this took a plan from about 1,180 new connections to 38, and
+the plan time at 10 ms round-trip time from 12.9 s to 5.2 s.
 
 ### Recommended values
 
@@ -135,8 +137,9 @@ provider's acceptance tests pass with it enabled.
 
 The gain is small while every statement still opens a new connection (the
 handshake round-trips are not affected), and large once connections are
-reused: at 10 ms round-trip time, about 11% on its own, but 36% on top of
-`max_idle_connections = 10` (see the numbers below). Enable both together.
+reused: at 10 ms round-trip time, about 12% on its own (12.9 s to 11.3 s),
+but 29% on top of `max_idle_connections = 10` (5.2 s to 3.7 s; see the numbers
+below). Enable both together.
 
 ### Connection poolers
 
@@ -150,6 +153,86 @@ Independently of this setting, the provider takes session-level advisory locks
 operations, which a pooler in transaction mode (for example PgBouncer with
 `pool_mode = transaction`) does not keep on one server connection. Connect the
 provider to PostgreSQL directly or through a pooler in session mode.
+
+## `catalog_snapshot`: one catalog read per database
+
+```hcl
+provider "postgresql" {
+  # ...
+  catalog_snapshot = true
+}
+```
+
+or `export PGCATALOGSNAPSHOT=true`. Off by default.
+
+Without it, every `postgresql_grant` and `postgresql_default_privileges`
+resource reads its privileges with its own catalog query: one statement (and,
+without `max_idle_connections`, one new connection) per resource and per plan.
+A grant on all tables of a schema also scans `pg_class` each time, which gets
+slower as the database holds more relations.
+
+With `catalog_snapshot = true`, the first read of a database takes a snapshot
+of the catalogs those reads need (roles, schemas, relations, default ACLs and
+the database ACL) in one statement and keeps it in memory; every other grant
+and default privileges read of that database is answered from it. The first
+function, procedure or routine grant read adds `pg_proc` with a second
+statement. The statements for these resources go from one per resource to one
+or two per database.
+
+It covers `postgresql_default_privileges` and `postgresql_grant` with every
+object type except `column`, `foreign_data_wrapper` and `foreign_server`.
+Function, procedure and routine grants whose `objects` carry an argument list
+(`f(integer)`) are read directly too. Other resources (roles, memberships,
+schemas, databases) are not affected.
+
+### How it stays correct
+
+* **One snapshot per database**, kept per connection settings (like the
+  connection pools) in the memory of the provider process, so each `provider`
+  block has its own.
+* **Every Terraform command starts without snapshots.** A plan sees each
+  database as it was when its first grant or default privileges read ran.
+* **Writes drop it.** Any create, update or delete of a grant, default
+  privileges, schema, function or extension drops the snapshot of the database
+  it wrote to, whether the write succeeded or not; roles, role memberships and
+  databases drop every snapshot. The reads that follow a create or update
+  always query the database.
+* **It expires** after `catalog_snapshot_ttl_seconds` (default `30`,
+  `PGCATALOGSNAPSHOTTTL`) and is taken again by the next read.
+* **It falls back** to the direct read, with a `[WARN]` in the provider log,
+  when the snapshot cannot be taken (for the next
+  `catalog_snapshot_ttl_seconds`), when the catalog text of the database
+  (names and ACLs) exceeds 64 MiB, or when one resource's ACL cannot be parsed
+  (that resource only).
+
+### Caveats
+
+* **Out-of-band changes during a run.** A `GRANT` or `REVOKE` made by another
+  tool while Terraform runs may not be seen until the snapshot expires or the
+  next command. The same holds for writes made by another `provider` block
+  (alias) to the same database: they run in another process and do not drop
+  this block's snapshot.
+* **Memory.** The provider holds the catalog text of each database it reads
+  privileges in: a few MB for a database with about 20,000 relations, at most
+  64 MiB per database.
+* **Few grants, little gain.** The snapshot reads every relation of the
+  database once. With only a handful of grant resources on a large database,
+  the direct reads can be cheaper.
+
+### When to enable it
+
+Enable it when a configuration has many `postgresql_grant` or
+`postgresql_default_privileges` resources per database, especially schema-wide
+grants on databases with many relations, or when the server is far away. Leave
+it off if other tools change privileges in the same databases while Terraform
+runs and the run must see those changes.
+
+It was not part of the benchmark in [Measured numbers](#measured-numbers). In
+the measurements of the pull request that added it
+([#98](https://github.com/FHL-Services-Inc/terraform-provider-postgresql/pull/98)),
+on an earlier build without connection reuse, a plan of the same 1,143-resource
+fixture at 10 ms round-trip time went from 12.8 s to 6.4 s and from 1,203 to
+504 statements (median of 2, PostgreSQL 16).
 
 ## Recommended settings for large configurations
 
@@ -168,6 +251,10 @@ provider "postgresql" {
   binary_parameters    = true
 }
 ```
+
+Add `catalog_snapshot = true` if the configuration has many grant or default
+privileges resources and nothing else changes privileges while Terraform runs
+(see above).
 
 Before you enable it, check the connection budget: the server's
 `max_connections` (and any connection limit on the role, the database or a
@@ -265,45 +352,47 @@ server, TLS, the number of databases and the resource mix.
 
 All numbers below come from that benchmark: 1,143 resources (220 roles, 200
 role memberships, 600 grants, 100 default privileges, schemas and databases),
-`terraform plan` with refresh, `-parallelism=10`, PostgreSQL 16 in a local
-container on an Apple-silicon laptop, `sslmode = disable`, median of 3 runs. The
-"RTT" is the round-trip time added by the benchmark's latency proxy. Real
-servers with TLS pay more round-trips per new connection, so the gain from
-connection reuse there is larger, not smaller. Absolute times vary with the
-load on the machine, so compare within a table, not across tables.
+`-parallelism=10`, PostgreSQL 17 in a local container on an Apple-silicon
+laptop, `sslmode = disable`. The "RTT" is the round-trip time added by the
+benchmark's latency proxy. Real servers with TLS pay more round-trips per new
+connection, so the gain from connection reuse there is larger, not smaller.
+Absolute times vary with the load on the machine, so compare within a table,
+not across tables.
 
-**`max_idle_connections`**, same build, before the other read
-optimizations of this release:
+"base" is `main` at `9ac7399`, before the performance changes of this release.
+"main" is `main` at `e313310`, with the read optimizations and connection
+reuse of this release. It predates later merges, among them `catalog_snapshot`
+([#98](https://github.com/FHL-Services-Inc/terraform-provider-postgresql/pull/98)),
+which was not benchmarked here (see the `catalog_snapshot` section above for
+the numbers measured in that pull request).
 
-| RTT | `max_idle_connections = 0` | `= 10` |
-|---:|---:|---:|
-| 0 ms | 10.6 s | 8.7 s |
-| 2 ms | 13.3 s | 8.7 s |
-| 10 ms | 30.2 s | **17.9 s** |
-| statements per plan | 7,103 | 7,103 |
-| connections per plan | 2,583 | **38** |
+**`terraform plan`** with refresh, 10 ms RTT, median of 3 runs:
 
-**`binary_parameters`** on its own, same build, `max_idle_connections = 0`
-(this run was on a busy machine, hence the higher absolute times):
+| build | plan | statements per plan | connections per plan |
+|---|---:|---:|---:|
+| base | 35.0 s | 7,005 | 2,587 |
+| main, defaults | 12.9 s | 1,163 | 1,183 |
+| main, `max_idle_connections = 10` | 5.2 s | 1,163 | **38** |
+| main, `binary_parameters = true` | 11.3 s | 1,163 | 1,183 |
+| main, both | **3.7 s** | 1,163 | **38** |
 
-| RTT | default | `binary_parameters = true` |
-|---:|---:|---:|
-| 0 ms | 25.2 s | 25.0 s |
-| 2 ms | 25.3 s | 24.2 s |
-| 10 ms | 36.4 s | **32.4 s** |
+Without added latency (0 ms RTT, one run) the same plans took 6.0 s, 4.0 s,
+2.2 s, 3.5 s and 2.2 s.
 
-**Both together**, on a branch with the read optimizations of this release
-and a few changes still in review, single database:
+**`terraform apply`** of the whole fixture into an empty server, 10 ms RTT,
+`-parallelism=1`, one run:
 
-| RTT | v1.28.0 | branch, defaults | `max_idle_connections = 10` | `+ binary_parameters` |
-|---:|---:|---:|---:|---:|
-| 0 ms | 8.9 s | 4.7 s | 2.4 s | **2.3 s** |
-| 10 ms | 30.9 s | 31.5 s | 18.2 s | **11.6 s** |
-| connections per plan | 2,587 | 2,583 | 38 | 38 |
-| peak connections | 10 | 10 | 20 | 20 |
+| build | apply |
+|---|---:|
+| base | 417 s |
+| main, defaults | 367 s |
+| main, `max_idle_connections = 10` | 226 s |
+| main, `binary_parameters = true` | 316 s |
+| main, both | **174 s** |
 
-**Pool size trade-off** at 10 ms RTT, same branch, single database (run
-in parallel with another benchmark, so the times are higher than above):
+**Pool size trade-off** at 10 ms RTT, single database, on an earlier branch
+(PostgreSQL 16, run in parallel with another benchmark, so the times are
+higher than they would be on an idle machine):
 
 | setting | plan | connections per plan | peak connections |
 |---|---:|---:|---:|
