@@ -74,6 +74,8 @@ The `policy` block supports:
 
 ~> **NOTE on `policy`:** The permissions of a role specified in multiple policy blocks is cumulative.  For example, if the same role is specified in two different `policy` each with different permissions (e.g. `create` and `usage_with_grant`, respectively), then the specified role with have both `create` and `usage_with_grant` privileges.
 
+~> **NOTE on removing policies:** Removing a `policy` block of a role, or changing it, revokes the privileges it granted (including the privileges themselves, not only their grant option) and then grants the new ones. Removing every `policy` block revokes nothing: `policy` is optional and computed, so an absent block keeps the privileges already in place. Use the `postgresql_grant` resource to manage schema privileges explicitly.
+
 ## Import Example
 
 `postgresql_schema` supports importing resources.  Supposing the following

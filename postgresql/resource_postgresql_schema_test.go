@@ -906,3 +906,116 @@ func testAccDropDatabase(t *testing.T, dbName string) resource.TestCheckFunc {
 		return nil
 	}
 }
+
+// testCheckSchemaPrivilege checks has_schema_privilege(role, schemaName,
+// privilege) in database.
+func testCheckSchemaPrivilege(database, role, schemaName, privilege string, want bool) resource.TestCheckFunc {
+	return func(*terraform.State) error {
+		db, err := testAccProvider.Meta().(*Client).config.NewClient(database).Connect()
+		if err != nil {
+			return err
+		}
+		var got bool
+		if err := db.QueryRow("SELECT has_schema_privilege($1, $2, $3)", role, schemaName, privilege).Scan(&got); err != nil {
+			return fmt.Errorf("could not check privilege %s of %s on schema %s: %w", privilege, role, schemaName, err)
+		}
+		if got != want {
+			return fmt.Errorf("has_schema_privilege(%s, %s, %s) = %v, want %v", role, schemaName, privilege, got, want)
+		}
+		return nil
+	}
+}
+
+// TestAccPostgresqlSchema_RevokePolicyWithGrantOption checks that removing or
+// changing a policy held WITH GRANT OPTION revokes the privilege itself, not
+// only the grant option (#184).
+func TestAccPostgresqlSchema_RevokePolicyWithGrantOption(t *testing.T) {
+	schemaName := testUniqueName("revoke_grant_option")
+	dropped := testUniqueName("revoke_go_dropped")
+	added := testUniqueName("revoke_go_added")
+	toCreate := testUniqueName("revoke_go_to_create")
+	toUsage := testUniqueName("revoke_go_to_usage")
+
+	config := func(step2 bool) string {
+		var policies string
+		if !step2 {
+			policies = `
+  policy {
+    role              = postgresql_role.dropped.name
+    create_with_grant = true
+    usage_with_grant  = true
+  }
+  policy {
+    role             = postgresql_role.to_create.name
+    usage_with_grant = true
+  }
+  policy {
+    role             = postgresql_role.to_usage.name
+    usage_with_grant = true
+  }`
+		} else {
+			policies = `
+  policy {
+    role  = postgresql_role.added.name
+    usage = true
+  }
+  policy {
+    role   = postgresql_role.to_create.name
+    create = true
+  }
+  policy {
+    role  = postgresql_role.to_usage.name
+    usage = true
+  }`
+		}
+		return fmt.Sprintf(`
+resource "postgresql_role" "dropped" {
+  name = "%[2]s"
+}
+resource "postgresql_role" "added" {
+  name = "%[3]s"
+}
+resource "postgresql_role" "to_create" {
+  name = "%[4]s"
+}
+resource "postgresql_role" "to_usage" {
+  name = "%[5]s"
+}
+
+resource "postgresql_schema" "test" {
+  name = "%[1]s"
+%[6]s
+}
+`, schemaName, dropped, added, toCreate, toUsage, policies)
+	}
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:     func() { testAccPreCheck(t) },
+		Providers:    testAccProviders,
+		CheckDestroy: testAccCheckPostgresqlSchemaDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config: config(false),
+				Check: resource.ComposeTestCheckFunc(
+					testCheckSchemaPrivilege("postgres", dropped, schemaName, "USAGE WITH GRANT OPTION", true),
+					testCheckSchemaPrivilege("postgres", dropped, schemaName, "CREATE WITH GRANT OPTION", true),
+					testCheckSchemaPrivilege("postgres", toCreate, schemaName, "USAGE WITH GRANT OPTION", true),
+					testCheckSchemaPrivilege("postgres", toUsage, schemaName, "USAGE WITH GRANT OPTION", true),
+				),
+			},
+			{
+				Config: config(true),
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr("postgresql_schema.test", "policy.#", "3"),
+					testCheckSchemaPrivilege("postgres", dropped, schemaName, "USAGE", false),
+					testCheckSchemaPrivilege("postgres", dropped, schemaName, "CREATE", false),
+					testCheckSchemaPrivilege("postgres", added, schemaName, "USAGE", true),
+					testCheckSchemaPrivilege("postgres", toCreate, schemaName, "USAGE", false),
+					testCheckSchemaPrivilege("postgres", toCreate, schemaName, "CREATE", true),
+					testCheckSchemaPrivilege("postgres", toUsage, schemaName, "USAGE", true),
+					testCheckSchemaPrivilege("postgres", toUsage, schemaName, "USAGE WITH GRANT OPTION", false),
+				),
+			},
+		},
+	})
+}
