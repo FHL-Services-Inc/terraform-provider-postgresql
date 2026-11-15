@@ -388,3 +388,56 @@ func TestConnectWithRetryRedactsEscapedPassword(t *testing.T) {
 		}
 	}
 }
+
+// TestParseServerVersionNum pins the conversion of server_version_num to a
+// semver version. The fingerprint no longer parses SELECT VERSION(), whose
+// text carries vendor suffixes such as "13.23-rds.20250508" on RDS Extended
+// Support that semver rejects (#140); server_version_num is a plain integer
+// on PostgreSQL, RDS, Aurora and the other managed services alike.
+func TestParseServerVersionNum(t *testing.T) {
+	tests := []struct {
+		input   string
+		want    string
+		wantErr bool
+	}{
+		// PostgreSQL 10+: major * 10000 + minor.
+		{"170006", "17.6.0", false},
+		{"180000", "18.0.0", false},
+		{"160011", "16.11.0", false},
+		{"100023", "10.23.0", false},
+		// RDS Extended Support "PostgreSQL 13.23-rds.20250508 on aarch64-unknown-linux-gnu, ...".
+		{"130023", "13.23.0", false},
+		// RDS Extended Support "PostgreSQL 12.22-rds.20250220 on x86_64-pc-linux-gnu, ...".
+		{"120022", "12.22.0", false},
+		// Aurora PostgreSQL 17.11: "PostgreSQL 17.11 on aarch64-linux, compiled by gcc-10.5.0, 64-bit".
+		{"170011", "17.11.0", false},
+		// Aurora PostgreSQL 16.6.
+		{"160006", "16.6.0", false},
+		// Before 10: major * 10000 + minor * 100 + patch.
+		{"90621", "9.6.21", false},
+		{"90224", "9.2.24", false},
+		{" 170006\n", "17.6.0", false},
+		{"", "", true},
+		{"17.6", "", true},
+		{"13.23-rds.20250508", "", true},
+		{"-170006", "", true},
+		{"0", "", true},
+	}
+
+	for _, test := range tests {
+		got, err := parseServerVersionNum(test.input)
+		if test.wantErr {
+			if err == nil {
+				t.Errorf("parseServerVersionNum(%q) = %v, want an error", test.input, got)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("parseServerVersionNum(%q) returned unexpected error: %v", test.input, err)
+			continue
+		}
+		if got.String() != test.want {
+			t.Errorf("parseServerVersionNum(%q) = %v, want %v", test.input, got, test.want)
+		}
+	}
+}
