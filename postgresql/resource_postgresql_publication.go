@@ -102,6 +102,12 @@ func resourcePostgreSQLPublicationUpdate(db *DBConnection, d *schema.ResourceDat
 		)
 	}
 
+	// If the update fails, keep the previous state. Otherwise the SDK saves
+	// the new name, and the next Read looks the publication up by it: it
+	// loses the publication, or takes over another one that already has that
+	// name.
+	d.Partial(true)
+
 	database := getDatabaseForPublication(d, db.client.databaseName)
 	txn, err := startTransaction(db.client, database)
 	if err != nil {
@@ -129,6 +135,9 @@ func resourcePostgreSQLPublicationUpdate(db *DBConnection, d *schema.ResourceDat
 	if err = txn.Commit(); err != nil {
 		return fmt.Errorf("error updating publication: %w", err)
 	}
+	d.Partial(false)
+
+	// Read sets the ID from the new name.
 	return resourcePostgreSQLPublicationReadImpl(db, d)
 }
 
@@ -139,12 +148,10 @@ func setPubName(txn *sql.Tx, d *schema.ResourceData) error {
 	oraw, nraw := d.GetChange(pubNameAttr)
 	o := oraw.(string)
 	n := nraw.(string)
-	database := d.Get(pubDatabaseAttr).(string)
 	sql := fmt.Sprintf("ALTER PUBLICATION %s RENAME TO %s", pq.QuoteIdentifier(o), pq.QuoteIdentifier(n))
 	if _, err := txn.Exec(sql); err != nil {
 		return fmt.Errorf("error updating publication name: %w", err)
 	}
-	d.SetId(generatePublicationID(d, database))
 	return nil
 }
 

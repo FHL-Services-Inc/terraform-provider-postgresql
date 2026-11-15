@@ -149,6 +149,11 @@ resources, 10 ms round-trip time) went from 39.9 s to 14.6 s; with
   keeps the name (#186, #122, #123).
 - **`postgresql_server`**: option values containing `=` are read back intact
   (#196, #190).
+- **Failed renames**: when a rename of a `postgresql_schema`,
+  `postgresql_publication`, `postgresql_server` or `postgresql_role` fails (or
+  the update fails after the rename), the state keeps the previous name and ID.
+  Before, the next refresh lost the object or took over another object that
+  already had the new name, which destroy then dropped (#203, #193).
 - **`postgresql_function`**: argument defaults and types containing commas are
   read from the catalog; IDs are parsed up to the argument list, so argument
   types can be schema-qualified (#192, #126, #127).

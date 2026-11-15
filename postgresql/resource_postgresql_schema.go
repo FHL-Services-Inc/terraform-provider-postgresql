@@ -348,6 +348,11 @@ func resourcePostgreSQLSchemaReadImpl(db *DBConnection, d *schema.ResourceData) 
 }
 
 func resourcePostgreSQLSchemaUpdate(db *DBConnection, d *schema.ResourceData) error {
+	// If the update fails, keep the previous state. Otherwise the SDK saves
+	// the new name, and the next Read looks the schema up by it: it loses the
+	// schema, or takes over another one that already has that name.
+	d.Partial(true)
+
 	databaseName := getDatabase(d, db.client.databaseName)
 
 	txn, err := startTransaction(db.client, databaseName)
@@ -377,7 +382,7 @@ func resourcePostgreSQLSchemaUpdate(db *DBConnection, d *schema.ResourceData) er
 	}
 
 	if err := withRolesGranted(db, txn, rolesToGrant, func() error {
-		if err := setSchemaName(txn, d, databaseName); err != nil {
+		if err := setSchemaName(txn, d); err != nil {
 			return err
 		}
 		return setSchemaOwner(txn, d)
@@ -392,7 +397,9 @@ func resourcePostgreSQLSchemaUpdate(db *DBConnection, d *schema.ResourceData) er
 	if err := commitTxn(txn); err != nil {
 		return fmt.Errorf("error committing schema: %w", err)
 	}
+	d.Partial(false)
 
+	// Read sets the ID from the new name.
 	return resourcePostgreSQLSchemaReadImpl(db, d)
 }
 
@@ -456,7 +463,7 @@ func resolveSchemaOwner(txn *sql.Tx, owner string) (string, error) {
 	return owners[0], nil
 }
 
-func setSchemaName(txn *sql.Tx, d *schema.ResourceData, databaseName string) error {
+func setSchemaName(txn *sql.Tx, d *schema.ResourceData) error {
 	if !d.HasChange(schemaNameAttr) {
 		return nil
 	}
@@ -472,7 +479,6 @@ func setSchemaName(txn *sql.Tx, d *schema.ResourceData, databaseName string) err
 	if _, err := txn.Exec(sql); err != nil {
 		return fmt.Errorf("error updating schema NAME: %w", err)
 	}
-	d.SetId(generateSchemaID(d, databaseName))
 
 	return nil
 }
