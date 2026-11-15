@@ -1,6 +1,7 @@
 package postgresql
 
 import (
+	"database/sql"
 	"fmt"
 	"strings"
 	"testing"
@@ -8,6 +9,7 @@ import (
 	"github.com/lib/pq"
 
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/resource"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/terraform"
 )
 
@@ -136,12 +138,13 @@ func TestAccPostgresqlDefaultPrivileges_GrantOwner(t *testing.T) {
 
 	config := getTestConfig(t)
 	dbName, roleName := getTestDBNames(dbSuffix)
+	ownerName := testUniqueName("test_owner")
 
 	// We set PGUSER as owner as he will create the test table
 	var stateConfig = fmt.Sprintf(`
 
 resource postgresql_role "test_owner" {
-    name = "test_owner"
+    name = "%s"
 }
 
 // From PostgreSQL 15, schema public is not wild open anymore
@@ -161,7 +164,7 @@ resource "postgresql_default_privileges" "test_ro" {
 	object_type = "table"
 	privileges  = ["SELECT"]
 }
-	`, dbName, dbName, roleName)
+	`, ownerName, dbName, dbName, roleName)
 
 	resource.Test(t, resource.TestCase{
 		PreCheck: func() {
@@ -177,7 +180,7 @@ resource "postgresql_default_privileges" "test_ro" {
 						tables := []string{"public.test_table"}
 						// To test default privileges, we need to create a table
 						// after having apply the state.
-						dropFunc := createTestTables(t, dbSuffix, tables, "test_owner")
+						dropFunc := createTestTables(t, dbSuffix, tables, ownerName)
 						defer dropFunc()
 
 						return testCheckTablesPrivileges(t, dbName, roleName, tables, []string{"SELECT"})
@@ -187,7 +190,7 @@ resource "postgresql_default_privileges" "test_ro" {
 					resource.TestCheckResourceAttr("postgresql_default_privileges.test_ro", "privileges.0", "SELECT"),
 
 					// check if connected user does not have test_owner granted anymore.
-					checkUserMembership(t, config.Username, "test_owner", false),
+					checkUserMembership(t, config.Username, ownerName, false),
 				),
 			},
 		},
@@ -429,8 +432,9 @@ func TestAccPostgresqlDefaultPrivileges_ReverseMembershipManyDatabases(t *testin
 	}
 
 	const databases = 3
-	const owner = "tf_tests_dp_reverse_owner"
-	const reader = "tf_tests_dp_reverse_reader"
+	owner := testUniqueName("tf_tests_dp_reverse_owner")
+	reader := testUniqueName("tf_tests_dp_reverse_reader")
+	dbSuffix := testUniqueName("dp_reverse")
 
 	config := getTestConfig(t)
 	dsn := config.connStr("postgres")
@@ -445,9 +449,9 @@ func TestAccPostgresqlDefaultPrivileges_ReverseMembershipManyDatabases(t *testin
 
 	dbNames := make([]string, databases)
 	for i := range databases {
-		dbNames[i], _ = getTestDBNames(fmt.Sprintf("dp_reverse_%d", i))
+		dbNames[i], _ = getTestDBNames(fmt.Sprintf("%s_%d", dbSuffix, i))
 		dbExecute(t, dsn, fmt.Sprintf("CREATE DATABASE %s", dbNames[i]))
-		defer dbExecute(t, dsn, fmt.Sprintf("DROP DATABASE %s", dbNames[i]))
+		defer dropTestDatabase(t, config, dbNames[i])
 	}
 
 	tfConfig := func(tablePrivileges, sequencePrivileges string) string {
@@ -504,4 +508,357 @@ resource "postgresql_default_privileges" "sequences" {
 			},
 		},
 	})
+}
+
+// TestAccPostgresqlDefaultPrivileges_BuiltinDefaults applies global default
+// privileges (no schema) that equal the built-in defaults: everything for the
+// owner itself, EXECUTE on functions and USAGE on types for PUBLIC. PostgreSQL
+// stores no pg_default_acl row for such an entry, so the Read must take the
+// missing row as acldefault instead of "resource gone" (#117), directly and
+// with catalog_snapshot.
+func TestAccPostgresqlDefaultPrivileges_BuiltinDefaults(t *testing.T) {
+	skipIfNotAcc(t)
+
+	for _, tc := range []struct{ name, snapshot string }{
+		{"direct", ""},
+		{"catalog_snapshot", "1"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("PGCATALOGSNAPSHOT", tc.snapshot)
+			isolateDBRegistry(t)
+			testAccDefaultPrivilegesBuiltinDefaults(t, tc.snapshot != "")
+		})
+	}
+}
+
+func testAccDefaultPrivilegesBuiltinDefaults(t *testing.T, snapshotOn bool) {
+	config := getTestConfig(t)
+	dbSuffix, teardown := setupTestDatabase(t, true, true)
+	dbName, _ := getTestDBNames(dbSuffix)
+	ownerName := testUniqueName("tf_dp_builtin_owner")
+
+	// The owner is created out of band, so the pg_default_acl check after
+	// destroy runs while it still exists.
+	dbExecute(t, config.connStr("postgres"), fmt.Sprintf("CREATE ROLE %s", pq.QuoteIdentifier(ownerName)))
+	defer func() {
+		teardown()
+		dbExecute(t, config.connStr("postgres"), fmt.Sprintf("DROP ROLE IF EXISTS %s", pq.QuoteIdentifier(ownerName)))
+	}()
+
+	stateConfig := fmt.Sprintf(`
+resource "postgresql_default_privileges" "owner_tables" {
+	database    = "%[1]s"
+	role        = "%[2]s"
+	owner       = "%[2]s"
+	object_type = "table"
+	privileges  = ["ALL"]
+}
+
+resource "postgresql_default_privileges" "owner_sequences" {
+	database    = "%[1]s"
+	role        = "%[2]s"
+	owner       = "%[2]s"
+	object_type = "sequence"
+	privileges  = ["ALL"]
+}
+
+resource "postgresql_default_privileges" "owner_schemas" {
+	database    = "%[1]s"
+	role        = "%[2]s"
+	owner       = "%[2]s"
+	object_type = "schema"
+	privileges  = ["USAGE", "CREATE"]
+}
+
+resource "postgresql_default_privileges" "public_functions" {
+	database    = "%[1]s"
+	role        = "public"
+	owner       = "%[2]s"
+	object_type = "function"
+	privileges  = ["EXECUTE"]
+}
+
+resource "postgresql_default_privileges" "public_types" {
+	database    = "%[1]s"
+	role        = "public"
+	owner       = "%[2]s"
+	object_type = "type"
+	privileges  = ["USAGE"]
+}
+`, dbName, ownerName)
+
+	clearCatalogSnapshots()
+	builds := catalogSnapshotBuilds()
+	checkSnapshotUsed := func(*terraform.State) error {
+		now := catalogSnapshotBuilds()
+		if snapshotOn && now == builds {
+			return fmt.Errorf("no catalog snapshot built, the Reads did not use it")
+		}
+		if !snapshotOn && now != builds {
+			return fmt.Errorf("%d catalog snapshot(s) built with catalog_snapshot off", now-builds)
+		}
+		return nil
+	}
+
+	resource.Test(t, resource.TestCase{
+		PreCheck: func() {
+			testAccPreCheck(t)
+			testCheckCompatibleVersion(t, featurePrivilegesOnSchemas)
+		},
+		Providers: testAccProviders,
+		// Destroy gives the built-in defaults back, so no entry is left
+		// (#182).
+		CheckDestroy: testCheckDefaultACLCount(t, dbName, ownerName, 0),
+		Steps: []resource.TestStep{
+			{
+				Config: stateConfig,
+				Check: resource.ComposeTestCheckFunc(
+					// PostgreSQL removed every entry: they equal acldefault.
+					testCheckDefaultACLCount(t, dbName, ownerName, 0),
+					resource.TestCheckResourceAttr("postgresql_default_privileges.owner_tables", "privileges.#", "1"),
+					resource.TestCheckResourceAttr("postgresql_default_privileges.public_functions", "privileges.#", "1"),
+				),
+			},
+			{
+				// The Reads of the next plan see the built-in defaults.
+				Config:   stateConfig,
+				PlanOnly: true,
+			},
+			{
+				// A change out of band is still drift. The connected role
+				// needs the owner's membership for it (rds profile).
+				PreConfig: func() {
+					dbExecute(t, config.connStr(dbName), fmt.Sprintf(
+						"GRANT %[1]s TO CURRENT_USER; "+
+							"ALTER DEFAULT PRIVILEGES FOR ROLE %[1]s REVOKE INSERT ON TABLES FROM %[1]s; "+
+							"REVOKE %[1]s FROM CURRENT_USER", pq.QuoteIdentifier(ownerName)))
+				},
+				Config:             stateConfig,
+				PlanOnly:           true,
+				ExpectNonEmptyPlan: true,
+			},
+			{
+				Config: stateConfig,
+				Check: resource.ComposeTestCheckFunc(
+					testCheckDefaultACLCount(t, dbName, ownerName, 0),
+					checkSnapshotUsed,
+				),
+			},
+		},
+	})
+}
+
+// TestAccPostgresqlDefaultPrivileges_DestroyRestoresBuiltin destroys global
+// default privileges (no schema) of the owner itself and of PUBLIC on
+// functions and types. Destroy must give back the built-in defaults instead
+// of revoking them, so PostgreSQL drops the pg_default_acl rows and the owner
+// can be dropped (#182). An entry that also holds another role's privileges
+// stays, but with the owner's built-in privileges back in it.
+func TestAccPostgresqlDefaultPrivileges_DestroyRestoresBuiltin(t *testing.T) {
+	skipIfNotAcc(t)
+
+	config := getTestConfig(t)
+	dbSuffix, teardown := setupTestDatabase(t, true, true)
+	dbName, _ := getTestDBNames(dbSuffix)
+	ownerName := testUniqueName("tf_dp_destroy_owner")
+	readerName := testUniqueName("tf_dp_destroy_reader")
+
+	for _, role := range []string{ownerName, readerName} {
+		dbExecute(t, config.connStr("postgres"), fmt.Sprintf("CREATE ROLE %s", pq.QuoteIdentifier(role)))
+	}
+	defer func() {
+		teardown()
+		for _, role := range []string{ownerName, readerName} {
+			dbExecute(t, config.connStr("postgres"), fmt.Sprintf("DROP ROLE IF EXISTS %s", pq.QuoteIdentifier(role)))
+		}
+	}()
+
+	readerConfig := fmt.Sprintf(`
+resource "postgresql_default_privileges" "reader_tables" {
+	database    = "%[1]s"
+	role        = "%[2]s"
+	owner       = "%[3]s"
+	object_type = "table"
+	privileges  = ["SELECT"]
+}
+`, dbName, readerName, ownerName)
+
+	fullConfig := readerConfig + fmt.Sprintf(`
+resource "postgresql_default_privileges" "owner_tables" {
+	database    = "%[1]s"
+	role        = "%[2]s"
+	owner       = "%[2]s"
+	object_type = "table"
+	privileges  = ["SELECT", "INSERT"]
+}
+
+resource "postgresql_default_privileges" "owner_schemas" {
+	database    = "%[1]s"
+	role        = "%[2]s"
+	owner       = "%[2]s"
+	object_type = "schema"
+	privileges  = []
+}
+
+resource "postgresql_default_privileges" "public_functions" {
+	database    = "%[1]s"
+	role        = "public"
+	owner       = "%[2]s"
+	object_type = "function"
+	privileges  = []
+}
+
+resource "postgresql_default_privileges" "public_types" {
+	database    = "%[1]s"
+	role        = "public"
+	owner       = "%[2]s"
+	object_type = "type"
+	privileges  = []
+}
+`, dbName, ownerName)
+
+	resource.Test(t, resource.TestCase{
+		PreCheck: func() {
+			testAccPreCheck(t)
+			testCheckCompatibleVersion(t, featurePrivilegesOnSchemas)
+		},
+		Providers: testAccProviders,
+		// After the last destroy no entry is left, and the owner can be
+		// dropped while the database still exists.
+		CheckDestroy: resource.ComposeTestCheckFunc(
+			testCheckDefaultACLCount(t, dbName, ownerName, 0),
+			func(*terraform.State) error {
+				db, err := sql.Open("postgres", config.connStr(dbName))
+				if err != nil {
+					return err
+				}
+				defer closeDB(t, db)
+				if _, err := db.Exec(fmt.Sprintf("DROP ROLE %s", pq.QuoteIdentifier(ownerName))); err != nil {
+					return fmt.Errorf("could not drop the owner after destroy: %w", err)
+				}
+				return nil
+			},
+		),
+		Steps: []resource.TestStep{
+			{
+				Config: fullConfig,
+				// tables (owner + reader), schemas, functions, types
+				Check: testCheckDefaultACLCount(t, dbName, ownerName, 4),
+			},
+			{
+				// Destroys the owner and PUBLIC resources. Only the table
+				// entry stays, for the reader, and it holds the owner's
+				// built-in privileges again.
+				Config: readerConfig,
+				Check: resource.ComposeTestCheckFunc(
+					testCheckDefaultACLCount(t, dbName, ownerName, 1),
+					testCheckOwnerDefaultACLIsBuiltin(t, dbName, ownerName, "r"),
+				),
+			},
+		},
+	})
+}
+
+// testCheckOwnerDefaultACLIsBuiltin checks that the global pg_default_acl entry
+// of owner for objType grants the owner exactly what acldefault grants it.
+func testCheckOwnerDefaultACLIsBuiltin(t *testing.T, dbName, owner, objType string) resource.TestCheckFunc {
+	return func(*terraform.State) error {
+		config := getTestConfig(t)
+		db, err := sql.Open("postgres", config.connStr(dbName))
+		if err != nil {
+			return err
+		}
+		defer closeDB(t, db)
+
+		var got, want string
+		if err := db.QueryRow(`
+SELECT
+  COALESCE((SELECT string_agg(privilege_type, ',' ORDER BY privilege_type)
+            FROM aclexplode(a.defaclacl) WHERE grantee = a.defaclrole), ''),
+  (SELECT string_agg(privilege_type, ',' ORDER BY privilege_type)
+   FROM aclexplode(acldefault($2, a.defaclrole)) WHERE grantee = a.defaclrole)
+FROM pg_default_acl a
+WHERE a.defaclrole = (SELECT oid FROM pg_roles WHERE rolname = $1)
+  AND a.defaclnamespace = 0 AND a.defaclobjtype = $2`, owner, objType).Scan(&got, &want); err != nil {
+			return fmt.Errorf("could not read the default ACL of %s: %w", owner, err)
+		}
+		if got != want {
+			return fmt.Errorf("owner %s default privileges on %q: got %q, want the built-in %q", owner, objType, got, want)
+		}
+		return nil
+	}
+}
+
+// testCheckDefaultACLCount checks the number of pg_default_acl entries of
+// owner in dbName.
+func testCheckDefaultACLCount(t *testing.T, dbName, owner string, want int) resource.TestCheckFunc {
+	return func(*terraform.State) error {
+		config := getTestConfig(t)
+		db, err := sql.Open("postgres", config.connStr(dbName))
+		if err != nil {
+			return err
+		}
+		defer closeDB(t, db)
+
+		var got int
+		if err := db.QueryRow(
+			"SELECT count(*) FROM pg_default_acl WHERE defaclrole = (SELECT oid FROM pg_roles WHERE rolname = $1)", owner,
+		).Scan(&got); err != nil {
+			return fmt.Errorf("could not count default ACLs: %w", err)
+		}
+		if got != want {
+			return fmt.Errorf("pg_default_acl entries of %s: got %d, want %d", owner, got, want)
+		}
+		return nil
+	}
+}
+
+// isolateDBRegistry gives the test an empty dbRegistry and restores the
+// previous one afterwards. A pooled DBConnection keeps the Client, and so the
+// provider settings, of the configure that opened it, so a test that changes
+// a setting such as catalog_snapshot between runs needs pools of its own.
+func isolateDBRegistry(t *testing.T) {
+	t.Helper()
+	dbRegistryLock.Lock()
+	saved := dbRegistry
+	dbRegistry = make(map[string]*DBConnection)
+	dbRegistryLock.Unlock()
+	t.Cleanup(func() {
+		dbRegistryLock.Lock()
+		own := dbRegistry
+		dbRegistry = saved
+		dbRegistryLock.Unlock()
+		for _, conn := range own {
+			_ = conn.Close()
+		}
+	})
+}
+
+// TestBuildReadRoleDefaultPrivilegesQueryBuiltin checks that only a global
+// entry falls back to acldefault, with the acldefault type of the object type.
+func TestBuildReadRoleDefaultPrivilegesQueryBuiltin(t *testing.T) {
+	for _, tc := range []struct {
+		schema, objectType, want string
+	}{
+		{"", "table", "acldefault('r', "},
+		{"", "sequence", "acldefault('s', "},
+		{"", "function", "acldefault('f', "},
+		{"", "routine", "acldefault('f', "},
+		{"", "type", "acldefault('T', "},
+		{"", "schema", "acldefault('n', "},
+		{"test_schema", "table", ""},
+	} {
+		d := schema.TestResourceDataRaw(t, resourcePostgreSQLDefaultPrivileges().Schema, map[string]any{
+			"database": "db", "role": "r", "owner": "o", "schema": tc.schema,
+			"object_type": tc.objectType, "privileges": []any{},
+		})
+		query, _ := buildReadRoleDefaultPrivilegesQuery(d)
+		if tc.want == "" {
+			if strings.Contains(query, "acldefault") {
+				t.Errorf("schema %q, %s: a per-schema entry must not fall back to acldefault:\n%s", tc.schema, tc.objectType, query)
+			}
+		} else if !strings.Contains(query, tc.want) {
+			t.Errorf("schema %q, %s: query does not contain %q:\n%s", tc.schema, tc.objectType, tc.want, query)
+		}
+	}
 }

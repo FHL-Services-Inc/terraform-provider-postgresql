@@ -6,12 +6,14 @@
 # See tests/bench/README.md for the full description. Short version:
 #
 #   tests/bench/run.sh -p base=/path/to/old/checkout -p new=. -l "0 2 10" -n 3
+#   tests/bench/run.sh -r            # Terraform core only: terraform_data, no database
 #
 set -euo pipefail
 
 usage() {
 	cat <<'EOF'
 Usage: run.sh -p label=path [-p label=path ...] [options]
+       run.sh -r [options]
 
   -p label=path  provider to measure (repeatable). path is either a directory that
                  contains a terraform-provider-postgresql binary, or a provider source
@@ -27,6 +29,9 @@ Usage: run.sh -p label=path [-p label=path ...] [options]
   -P n           terraform -parallelism (default 10, the terraform default)
   -w dir         work dir (default ${TMPDIR:-/tmp}/pg-tf-bench)
   -S             skip setup: reuse the fixture and state from a previous run in -w
+  -r             core reference only: plan the same config shape with terraform_data
+                 in place of every provider resource. No provider, no PostgreSQL.
+  -R             skip the core reference that otherwise runs before the provider plans
   -h             help
 
 Environment:
@@ -39,9 +44,13 @@ Environment:
                                    more connections than this (default 500); 0 pauses
                                    before every plan
   GEN_ARGS                         extra flags for genfixture, e.g. "-roles 400 -tables 2000",
-                                   or "-fixture-dbs 4" to spread the fixture over 4 databases
+                                   "-fixture-dbs 4" to spread the fixture over 4 databases,
+                                   "-shape count" for one block with count per resource kind,
+                                   or "-preset large" (2,000 roles, 50 schemas, 10,000 tables)
   SAMPLE_INTERVAL                  how often connsampler polls pg_stat_activity during a plan
                                    (default 100ms)
+  CORE_STATE                       1: apply the core reference config once and plan it
+                                   against that state (default: plan against an empty state)
   TERRAFORM                        terraform binary (default: terraform from PATH)
 EOF
 }
@@ -61,8 +70,10 @@ parallelism=10
 workdir="${TMPDIR:-/tmp}"
 workdir="${workdir%/}/pg-tf-bench"
 skip_setup=0
+core_only=0
+core_ref=1
 
-while getopts "p:a:l:n:P:w:Sh" opt; do
+while getopts "p:a:l:n:P:w:SrRh" opt; do
 	case $opt in
 	p) providers+=("$OPTARG") ;;
 	a) extra_args+=("$OPTARG") ;;
@@ -71,11 +82,18 @@ while getopts "p:a:l:n:P:w:Sh" opt; do
 	P) parallelism=$OPTARG ;;
 	w) workdir=$OPTARG ;;
 	S) skip_setup=1 ;;
+	r) core_only=1 ;;
+	R) core_ref=0 ;;
 	h) usage; exit 0 ;;
 	*) usage >&2; exit 2 ;;
 	esac
 done
-[ ${#providers[@]} -gt 0 ] || { usage >&2; exit 2; }
+if [ $core_only = 1 ]; then
+	[ ${#providers[@]} = 0 ] || die "-r measures Terraform core alone and takes no -p"
+	[ $core_ref = 1 ] || die "-r and -R exclude each other"
+else
+	[ ${#providers[@]} -gt 0 ] || { usage >&2; exit 2; }
+fi
 
 export PGHOST=${PGHOST:-127.0.0.1} PGPORT=${PGPORT:-25445} PGUSER=${PGUSER:-postgres} PGPASSWORD=${PGPASSWORD:-postgres}
 export PGDATABASE=postgres PGSSLMODE=${PGSSLMODE:-disable}
@@ -83,18 +101,110 @@ PROXY_PORT=${PROXY_PORT:-$((PGPORT + 1))}
 TERRAFORM=${TERRAFORM:-terraform}
 export TF_IN_AUTOMATION=1 CHECKPOINT_DISABLE=1
 
-command -v psql >/dev/null || die "psql not found"
 command -v "$TERRAFORM" >/dev/null || die "terraform not found"
-psql -qAtc 'select 1' >/dev/null || die "cannot connect to PostgreSQL at $PGHOST:$PGPORT"
 
 mkdir -p "$workdir"/{bin,tf,logs}
 workdir=$(cd "$workdir" && pwd)
 
-sql() { psql -qAtX -v ON_ERROR_STOP=1 -c "$1"; }
-
 # --- tools -------------------------------------------------------------------
 log "building genfixture, latencyproxy and connsampler"
 (cd "$REPO_DIR" && go build -o "$workdir/bin/" ./tests/bench/genfixture ./tests/bench/latencyproxy ./tests/bench/connsampler)
+
+results="$workdir/results.csv"
+echo "provider,rtt_ms,run,seconds,exit_code,queries,connections,peak_conns,p95_conns,peak_idle,peak_by_db" >"$results"
+
+# --- core reference ----------------------------------------------------------
+# The same config (same GEN_ARGS: shape, sizes) with terraform_data in place of every
+# provider resource: what Terraform core alone costs for this shape. No provider and
+# no database; terraform_data is built in, so no init either. Rows go into
+# results.csv as provider "core" with RTT "-".
+#
+# By default the reference plans against an empty state (a plan that creates
+# everything), which needs no apply. CORE_STATE=1 applies once and then plans
+# against that state like the provider runs do, but the apply itself grows much
+# faster than the instance count (minutes at a few thousand instances).
+core_apply_secs=""
+core_resources=""
+core_ok=2
+[ "${CORE_STATE:-0}" = 1 ] && core_ok=0
+core_reference() {
+	local cdir="$workdir/core" run t0 rc secs out blocks
+	local -a tfc=(env TF_CLI_CONFIG_FILE=/dev/null "$TERRAFORM" -chdir="$cdir")
+	if [ $skip_setup = 0 ] || [ ! -f "$cdir/main.tf" ] || { [ $core_ok = 0 ] && [ ! -f "$cdir/terraform.tfstate" ]; }; then
+		rm -rf "$cdir"
+		mkdir -p "$cdir"
+		# shellcheck disable=SC2086
+		out=$("$workdir/bin/genfixture" -core-only -out "$cdir" ${GEN_ARGS:-})
+		log "$out"
+		if [ $core_ok = 0 ]; then
+			log "core reference: terraform apply (-parallelism=$parallelism)"
+			t0=$(now)
+			"${tfc[@]}" apply -auto-approve -input=false -no-color -parallelism="$parallelism" \
+				>"$workdir/logs/core-apply.log" 2>&1 || die "core apply failed, see $workdir/logs/core-apply.log"
+			core_apply_secs=$(echo "$(now) - $t0" | bc)
+			log "core apply took ${core_apply_secs}s"
+		fi
+	fi
+	if [ $core_ok = 2 ]; then rm -f "$cdir"/terraform.tfstate*; fi
+	# Instances: blocks without count count once, blocks with count count N times.
+	blocks=$(grep -c '^resource ' "$cdir/main.tf" || true)
+	core_resources="$blocks blocks, $(sed -n 's/^  count = //p' "$cdir/main.tf" |
+		awk -v b="$blocks" '{ c += $1; n++ } END { print c + b - n }') instances"
+	for run in $(seq 1 "$runs"); do
+		t0=$(now)
+		rc=0
+		"${tfc[@]}" plan -refresh=true -input=false -no-color -lock=false -detailed-exitcode \
+			-parallelism="$parallelism" >"$workdir/logs/plan-core-$run.log" 2>&1 || rc=$?
+		secs=$(echo "$(now) - $t0" | bc)
+		echo "core,-,$run,$secs,$rc,n/a,n/a,n/a,n/a,n/a,-" >>"$results"
+		log "core run $run/$runs: ${secs}s exit=$rc"
+		[ "$rc" = $core_ok ] || log "  plan exit code $rc, want $core_ok, see $workdir/logs/plan-core-$run.log"
+	done
+}
+
+# core_row prints the summary table row for the core reference.
+core_row() {
+	awk -F, -v ok="$core_ok" '
+		BEGIN { n = 0; all = 0 }
+		NR > 1 && $1 == "core" { all++ }
+		NR > 1 && $1 == "core" && $5 == ok { t[n++] = $4 }
+		END {
+			if (!all) exit
+			if (!n) { printf "| core (terraform_data) | - | - | - | - | - | - | - | - | 0/%d |\n", all; exit }
+			for (i = 1; i < n; i++) { x = t[i]; for (j = i - 1; j >= 0 && t[j] > x; j--) t[j + 1] = t[j]; t[j + 1] = x }
+			m = n % 2 ? t[int(n / 2)] : (t[n / 2 - 1] + t[n / 2]) / 2
+			printf "| core (terraform_data) | - | %.2f | %.2f-%.2f | - | - | - | - | - | %d/%d |\n", m, t[0], t[n - 1], n, all
+		}' "$results"
+}
+
+core_note() {
+	local against="an empty state (the plan creates everything)"
+	[ $core_ok = 2 ] || against="its applied state${core_apply_secs:+ (the apply took ${core_apply_secs}s)}"
+	echo "core (terraform_data): Terraform core alone for the same config shape ($core_resources),"
+	echo "no provider, no database, planned against $against."
+}
+
+if [ $core_only = 1 ]; then
+	core_reference
+	summary="$workdir/summary.md"
+	{
+		echo "core reference only, GEN_ARGS=${GEN_ARGS:-}, $runs runs, -parallelism=$parallelism"
+		echo
+		core_note
+		echo
+		echo "| provider | added RTT | plan median (s) | min-max (s) | queries | connections | peak conns (max) | p95 conns | peak idle | ok runs |"
+		echo "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|"
+		core_row
+	} >"$summary"
+	cat "$summary"
+	log "raw results: $results, logs: $workdir/logs"
+	exit 0
+fi
+
+command -v psql >/dev/null || die "psql not found"
+psql -qAtc 'select 1' >/dev/null || die "cannot connect to PostgreSQL at $PGHOST:$PGPORT"
+
+sql() { psql -qAtX -v ON_ERROR_STOP=1 -c "$1"; }
 
 # --- providers ---------------------------------------------------------------
 labels=()
@@ -275,8 +385,8 @@ if [ -z "${COOLDOWN:-}" ]; then
 	if [ -n "$msl" ]; then COOLDOWN=$((2 * msl / 1000 + 5)); else COOLDOWN=65; fi
 fi
 
-results="$workdir/results.csv"
-echo "provider,rtt_ms,run,seconds,exit_code,queries,connections,peak_conns,p95_conns,peak_idle,peak_by_db" >"$results"
+# Terraform core alone first: CPU only, no connections, so no cooldown needed.
+[ $core_ref = 0 ] || core_reference
 
 # The setup apply opened thousands of connections, so the first plan always waits.
 last_conns=999999
@@ -330,8 +440,9 @@ stop_proxy
 # --- summary -----------------------------------------------------------------
 summary="$workdir/summary.md"
 {
-	echo "$resources resources, $runs runs each, -parallelism=$parallelism"
+	echo "$resources resources, $runs runs each, -parallelism=$parallelism, GEN_ARGS=${GEN_ARGS:-}"
 	echo
+	[ $core_ref = 0 ] || { core_note; echo; }
 	echo "Only runs that exited 0 (no changes, no errors) count towards the medians."
 	echo "peak / p95 / idle: concurrent provider connections sampled every ${SAMPLE_INTERVAL:-100ms}"
 	echo "during the plan (median of the runs; peak also shows the highest run)."
@@ -360,6 +471,7 @@ summary="$workdir/summary.md"
 				}' "$results"
 		done
 	done
+	[ $core_ref = 0 ] || core_row
 	echo
 	echo "Connections per database at the peak sample, one entry per ok run:"
 	echo

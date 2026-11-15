@@ -5,6 +5,12 @@ on:
     branches:
     - main
   pull_request:
+
+# Cancel superseded PR runs; runs on main get a group of their own.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   lint:
     runs-on: ubuntu-latest

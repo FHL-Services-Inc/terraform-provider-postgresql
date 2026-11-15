@@ -16,10 +16,12 @@ automatically run a [`REASSIGN
 OWNED`](https://www.postgresql.org/docs/current/static/sql-reassign-owned.html)
 and [`DROP
 OWNED`](https://www.postgresql.org/docs/current/static/sql-drop-owned.html) to
-the `CURRENT_USER` (normally the connected user for the provider).  If the
-specified PostgreSQL ROLE owns objects in multiple PostgreSQL databases in the
-same PostgreSQL Cluster, one PostgreSQL provider per database must be created
-and all but the final ``postgresql_role`` must specify a `skip_drop_role`.
+the `CURRENT_USER` (normally the connected user for the provider).  This runs
+in every database of the cluster where the role owns objects or holds
+privileges (found through the shared `pg_shdepend` catalog), one database at a
+time, and then in the provider's database before the `DROP ROLE`. The provider
+user must be able to connect to these databases. Databases that do not allow
+connections are skipped.
 
 ~> **Note:** All arguments including role name and password will be stored in the raw state as plain-text.
 [Read more about sensitive data in state](https://www.terraform.io/docs/state/sensitive-data.html).
@@ -126,7 +128,12 @@ resource "postgresql_role" "app_user" {
   [PostgreSQL's `password_encryption` setting](https://www.postgresql.org/docs/current/static/runtime-config-connection.html#GUC-PASSWORD-ENCRYPTION).
 
 * `password` - (Optional) Sets the role's password. A password is only of use
-  for roles having the `login` attribute set to true.
+  for roles having the `login` attribute set to true. The value is stored
+  exactly as configured, including backslashes. Earlier versions of the
+  provider doubled every backslash in a password (with the default
+  `standard_conforming_strings = on`); such a role gets the configured
+  password the next time the provider sets it, for example when the
+  password in the configuration changes.
 
 * `password_wo` - (Optional) Sets the role's password without storing it in the state file.
   This is useful for managing passwords securely. Must be used together with `password_wo_version`.
@@ -141,6 +148,13 @@ resource "postgresql_role" "app_user" {
   On update, only the roles added to or removed from the list are granted or
   revoked; memberships that stay in the list (and their `ADMIN OPTION`) are not
   touched, and an update that does not change `roles` does not touch memberships.
+  The list is still authoritative: after a refresh, a membership granted
+  outside of Terraform shows up as a change and is revoked by the next apply.
+  A membership granted outside of Terraform after the last refresh (for
+  example with `-refresh=false`) is left in place by an update. If you manage
+  memberships of the same role with `postgresql_grant_role`, add `roles` to
+  `ignore_changes` (see
+  [`postgresql_grant_role`](postgresql_grant_role.html)).
 
 * `search_path` - (Optional) Alters the search path of this new role. Note that
   due to limitations in the implementation, values cannot contain the substring
@@ -168,6 +182,8 @@ resource "postgresql_role" "app_user" {
   second steps taken when removing a ROLE from a database (the second step being
   an implicit
   [`DROP OWNED`](https://www.postgresql.org/docs/current/static/sql-drop-owned.html)).
+  By default both run in every database where the role owns objects or holds
+  privileges; set this option to true to skip them in all databases.
 
 * `statement_timeout` - (Optional) Defines [`statement_timeout`](https://www.postgresql.org/docs/current/runtime-config-client.html#RUNTIME-CONFIG-CLIENT-STATEMENT) setting for this role which allows to abort any statement that takes more than the specified amount of time.
 

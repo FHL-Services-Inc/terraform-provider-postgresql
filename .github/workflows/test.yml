@@ -1,18 +1,149 @@
 name: test
 
+# Pull requests test PG 12, 16 and 18 (16 changed role membership semantics:
+# grantor identity, CREATEROLE). Pushes to main, the nightly schedule, manual
+# runs and PRs labelled `full-matrix` (see test-full-matrix.yml) test 12-18.
+#
+# The acceptance suite of each version is split into shards by
+# scripts/test-shard.sh: SHARDS_PR on the PR subset (fast feedback), and
+# SHARDS_FULL on the full matrix (each shard has ~1.5 min of fixed setup, so
+# fewer shards are cheaper where nobody is waiting). Every shard runs both the
+# superuser and the rds profile. The `unit` job checks that the shards cover
+# every test for both shard counts.
+#
+# PRs that only touch docs (website/**, docs/**, *.md) or tests/bench/** skip
+# the acceptance jobs. `test summary` always runs and is the job to mark as
+# required: it passes when every job that should have run succeeded.
+
 on:
   push:
     branches:
     - main
   pull_request:
+  schedule:
+    - cron: '23 3 * * *'
+  workflow_dispatch:
+    inputs:
+      full_matrix:
+        description: Test every PostgreSQL version
+        type: boolean
+        default: true
+  workflow_call:
+    inputs:
+      full_matrix:
+        type: boolean
+        default: false
+
+# Superseded PR runs are cancelled. Other runs get a group of their own, so
+# runs on main are never cancelled (nor dropped while pending).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  SHARDS_PR: 3
+  SHARDS_FULL: 2
 
 jobs:
-  test:
+  changes:
     runs-on: ubuntu-latest
+    outputs:
+      go: ${{ steps.plan.outputs.go }}
+      acc: ${{ steps.plan.outputs.acc }}
+      versions: ${{ steps.plan.outputs.versions }}
+      shards: ${{ steps.plan.outputs.shards }}
+      shard_total: ${{ steps.plan.outputs.shard_total }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          # On a PR this is the merge commit; HEAD^1 is the base branch.
+          fetch-depth: 2
+
+      - name: Plan
+        id: plan
+        env:
+          EVENT: ${{ github.event_name }}
+          FULL_INPUT: ${{ inputs.full_matrix }}
+          FULL_LABEL: ${{ contains(github.event.pull_request.labels.*.name, 'full-matrix') }}
+        run: |
+          go=true acc=true
+          if [ "$EVENT" = pull_request ]; then
+            files=$(git diff --name-only HEAD^1 HEAD)
+            if [ -n "$files" ]; then
+              go=false acc=false
+              while IFS= read -r f; do
+                case "$f" in
+                  website/* | docs/* | *.md) ;;
+                  tests/bench/*) go=true ;;
+                  *) go=true acc=true ;;
+                esac
+              done <<< "$files"
+            fi
+            echo "Changed files:"; echo "$files"
+          fi
+
+          if [ "$EVENT" != pull_request ] || [ "$FULL_INPUT" = true ] || [ "$FULL_LABEL" = true ]; then
+            versions='[18, 17, 16, 15, 14, 13, 12]'
+            n=$SHARDS_FULL
+          else
+            versions='[18, 16, 12]'
+            n=$SHARDS_PR
+          fi
+          shards=$(jq -cn --argjson n "$n" '[range(1; $n + 1)]')
+
+          {
+            echo "go=$go"
+            echo "acc=$acc"
+            echo "versions=$versions"
+            echo "shards=$shards"
+            echo "shard_total=$n"
+          } | tee -a "$GITHUB_OUTPUT"
+
+  unit:
+    needs: changes
+    if: needs.changes.outputs.go == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: '1.26'
+
+      - name: test
+        run: make test
+
+      - name: vet
+        run: make vet
+
+      - name: build (incl. tests/bench)
+        run: |
+          go build ./...
+          bash -n tests/bench/run.sh
+
+      - name: check that the shards cover every test
+        run: |
+          scripts/test-shard.sh verify "$SHARDS_PR"
+          scripts/test-shard.sh verify "$SHARDS_FULL"
+
+  acc:
+    name: acc (PG ${{ matrix.pgversion }}, shard ${{ matrix.shard }}/${{ needs.changes.outputs.shard_total }})
+    needs: changes
+    if: needs.changes.outputs.acc == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     strategy:
       matrix:
-        pgversion: [18, 17, 16, 15, 14, 13, 12]
+        pgversion: ${{ fromJSON(needs.changes.outputs.versions) }}
+        shard: ${{ fromJSON(needs.changes.outputs.shards) }}
 
     env:
       PGVERSION: ${{ matrix.pgversion }}
@@ -32,11 +163,57 @@ jobs:
           terraform_version: '1.15.4'
           terraform_wrapper: false
 
-      - name: test
-        run: make test
+      - name: select tests
+        env:
+          SHARD: ${{ matrix.shard }}
+          SHARD_TOTAL: ${{ needs.changes.outputs.shard_total }}
+        run: |
+          scripts/test-shard.sh tests "$((SHARD - 1))" "$SHARD_TOTAL"
+          echo "TEST_RUN=$(scripts/test-shard.sh regex "$((SHARD - 1))" "$SHARD_TOTAL")" >> "$GITHUB_ENV"
 
-      - name: vet
-        run: make vet
+      # Build the test image (tests/build) through the Actions cache instead of
+      # running apt-get in every shard; docker compose then uses the loaded
+      # tests-postgres image as is. Only the first shard writes the cache.
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: build test image
+        uses: docker/build-push-action@v6
+        with:
+          context: tests/build
+          build-args: PGVERSION=${{ matrix.pgversion }}
+          tags: tests-postgres:latest
+          load: true
+          cache-from: type=gha,scope=pg${{ matrix.pgversion }}
+          cache-to: ${{ matrix.shard == 1 && format('type=gha,mode=max,scope=pg{0}', matrix.pgversion) || '' }}
 
       - name: testacc
         run: make testacc
+
+  summary:
+    name: test summary
+    needs: [changes, unit, acc]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check results
+        env:
+          CHANGES: ${{ needs.changes.result }}
+          UNIT: ${{ needs.unit.result }}
+          ACC: ${{ needs.acc.result }}
+          WANT_UNIT: ${{ needs.changes.outputs.go }}
+          WANT_ACC: ${{ needs.changes.outputs.acc }}
+        run: |
+          echo "changes=$CHANGES unit=$UNIT (wanted: $WANT_UNIT) acc=$ACC (wanted: $WANT_ACC)"
+          expect() { # name result wanted
+            if [ "$3" = true ]; then want=success; else want=skipped; fi
+            if [ "$2" != "$want" ]; then
+              echo "::error::$1 is $2, expected $want"
+              return 1
+            fi
+          }
+          [ "$CHANGES" = success ] || { echo "::error::changes is $CHANGES"; exit 1; }
+          rc=0
+          expect unit "$UNIT" "$WANT_UNIT" || rc=1
+          expect acc "$ACC" "$WANT_ACC" || rc=1
+          exit $rc

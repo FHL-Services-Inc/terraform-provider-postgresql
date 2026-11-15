@@ -12,6 +12,12 @@ The PostgreSQL provider gives the ability to deploy and configure resources in a
 
 Use the navigation to the left to read about the available resources.
 
+For large configurations, see the [performance tuning
+guide](guides/performance-tuning.html): connection reuse
+(`max_idle_connections`), `binary_parameters` and `catalog_snapshot` can make
+plans and applies with many resources much faster, especially against a remote
+server.
+
 ## Usage
 
 ```hcl
@@ -168,54 +174,154 @@ The following arguments are supported:
   * `key` - (Required) - The SSL client certificate private key file path. The file must contain PEM encoded data.
   * `sslinline` - (Optional) - If set to `true`, arguments accept inline ssl cert and key rather than a filename. Defaults to `false`.
 * `sslrootcert` - (Optional) - The SSL server root certificate file path. The file must contain PEM encoded data.
-* `connect_timeout` - (Optional) Maximum wait for connection, in seconds. The
-  default is `180s`.  Zero or not specified means wait indefinitely.
-* `max_conn_retries` - (Optional) Maximum number of connection retries. Zero
-  means no retries. The default is `0`.
+* `connect_timeout` - (Optional) Maximum wait for a new connection to be
+  established, in seconds. The default is `180`. Zero (or `-1`) means wait
+  indefinitely. Only used with the `postgres` scheme; the GoCloud schemes
+  ignore it. Can also be set with the `PGCONNECT_TIMEOUT` environment variable.
+* `max_conn_retries` - (Optional) Maximum number of retries when opening a
+  connection fails. Authentication errors and unknown databases are not
+  retried. Zero means no retries. The default is `0`.
 * `connection_retry_timeout_seconds` - (Optional) Maximum total wait, in
   seconds, across all connection retries. The default is `5`.
-* `max_connections` - (Optional) Set the maximum number of open connections to
-  the database. The default is `20`.  Zero means unlimited open connections.
-* `max_idle_connections` - (Optional) Maximum number of idle connections kept
-  open for reuse, per database the provider connects to. The default is `0`:
-  every connection is closed once it is returned, so each query opens a new
-  connection. Setting it above zero avoids a new connection (TCP, TLS and
-  authentication handshake) for most queries, which noticeably speeds up plans
-  and applies with many resources. Idle connections are closed after 30
-  seconds. Each database the provider connects to gets its own pool, so the
-  limit applies per database, not in total. `postgresql_database` closes the provider's own connections to a
-  database before dropping or renaming it, or before using it as the
-  `template` of another database. While Terraform runs, a plain
-  `DROP DATABASE`, `ALTER DATABASE ... RENAME` or `CREATE DATABASE ... TEMPLATE`
-  issued outside of the provider can fail with "database is being accessed by
-  other users" because of these idle connections; terminate them first
-  (`pg_terminate_backend`) or use `DROP DATABASE ... WITH (FORCE)` on
-  PostgreSQL 13+. The value is capped to `max_connections` when the latter is
-  non-zero. It can also be set with the `PGMAXIDLECONNECTIONS` environment
+* `max_connections` - (Optional) Maximum number of open connections in each
+  connection pool. The default is `20`. Zero means unlimited.
+
+  The provider keeps one pool per database it connects to: the `database`
+  above (used for roles, databases and other cluster-wide objects) plus every
+  database named in the `database` argument of a resource. The limit applies
+  to each pool, not to the server as a whole, so a configuration that manages
+  objects in 4 databases can open up to 5 × `max_connections` connections. The
+  number of connections in use at the same time is also bounded by Terraform's
+  `-parallelism` (default 10), so there is rarely a reason to set
+  `max_connections` below `-parallelism`; doing so makes resources wait for a
+  free connection. To limit the connections to the server as a whole, use
+  `max_total_connections`.
+* `max_idle_connections` - (Optional) Maximum number of idle connections each
+  pool keeps open for reuse. The default is `0`: every connection is closed as
+  soon as it is returned to the pool, so almost every statement outside a
+  transaction opens a new connection (TCP, TLS and authentication handshake).
+  Setting it above zero reuses connections instead, which makes plans and
+  applies with many resources considerably faster, especially when the server
+  is not close to where Terraform runs. See the
+  [performance tuning guide](guides/performance-tuning.html) for numbers and
+  recommended values. Can also be set with the `PGMAXIDLECONNECTIONS`
+  environment variable.
+
+  Things to know when it is enabled:
+
+  * The limit applies per pool, so per database, not in total. Idle
+    connections are closed after 30 seconds without use, and when they reach
+    `conn_max_lifetime_seconds`. The value is capped to `max_connections` when
+    the latter is non-zero.
+  * The idle connections are real sessions on the server: they count against
+    the server's `max_connections` setting while Terraform runs.
+  * `postgresql_database` closes the provider's own pooled connections to a
+    database before dropping or renaming it, and before using it as the
+    `template` of another database.
+  * A `DROP DATABASE`, `ALTER DATABASE ... RENAME` or
+    `CREATE DATABASE ... TEMPLATE` run outside of the provider while Terraform
+    runs can fail with "database is being accessed by other users" because
+    of these idle connections. They stay open until 30 seconds after the
+    provider last used them, or until Terraform exits. Terminate them first
+    (`pg_terminate_backend`) or use `DROP DATABASE ... WITH (FORCE)` on
+    PostgreSQL 13+.
+  * Terraform runs every `provider` block, aliases included, in its own
+    plugin process, so every block has its own pools even when two blocks
+    connect to the same server, user and database. Their connections add up.
+    `postgresql_database` only closes the pools of its own provider block
+    before a drop, rename or template copy. Idle connections of another block
+    to that database are terminated by the `pg_terminate_backend` that runs
+    before `DROP DATABASE`, but they can make a rename or a template copy
+    fail.
+* `max_total_connections` - (Optional) Maximum number of connections the
+  provider keeps open to the server at the same time, across all its
+  per-database pools. The default is `0`: no limit beyond `max_connections`
+  per pool. Can also be set with the `PGMAXTOTALCONNECTIONS` environment
   variable.
+
+  Use it to bound the sessions a configuration with many databases opens,
+  for example with `max_idle_connections` above zero. Set it to at least
+  Terraform's `-parallelism` plus the number of databases the provider
+  connects to (the provider's `database` plus every database named in a
+  resource): with `-parallelism=10` and 4 databases with resources, at least
+  `15`; about twice the number of databases on top of `-parallelism` (`20`)
+  keeps almost all of the speed of no limit. See the
+  [performance tuning guide](guides/performance-tuning.html)
+  for why.
+
+  * A connection takes a slot before it is opened and gives it back when it
+    is closed. When all slots are taken, the provider closes an idle
+    connection of one of its pools and opens the new one in its place. If no
+    connection is idle, it waits for one to be returned, up to
+    `connect_timeout` (180 seconds when `connect_timeout` is `0`), and then
+    fails with an error that names `max_total_connections`.
+  * Below `-parallelism + 1` a `postgresql_database` that changes owners
+    (it holds a connection to the maintenance database while it connects to
+    the database itself) can wait for `connect_timeout` and fail.
+  * Every `provider` block runs in its own plugin process and has its own
+    limit; add them up across blocks.
+  * Only the `postgres` scheme supports it. With `awspostgres` and
+    `gcppostgres` the setting is ignored and a warning is logged.
 * `conn_max_lifetime_seconds` - (Optional) Maximum lifetime of a connection,
-  in seconds. The default is `0`.  Zero means unlimited.
+  in seconds. Older connections are closed instead of being reused (a running
+  statement is not interrupted). The default is `0`. Zero means unlimited.
 * `binary_parameters` - (Optional) If set to `true`, adds `binary_parameters=yes`
-  to the connection string. The driver then sends each statement that has bind
-  parameters (almost every query the provider runs) in a single round-trip
-  instead of two (a separate prepare step followed by the execution). This
-  mostly helps when the database is far from where Terraform runs. Only
-  `[]byte` parameters are sent in binary format, which the provider does not
-  use, and results are still read as text. Can also be set with the
-  `PGBINARYPARAMETERS` environment variable. The default is `false`.
-* `expected_version` - (Optional) Specify a hint to Terraform regarding the
-  expected version that the provider will be talking with.  This is a required
-  hint in order for Terraform to talk with an ancient version of PostgreSQL.
-  This parameter is expected to be a [PostgreSQL
-  Version](https://www.postgresql.org/support/versioning/) or `current`.  Once a
-  connection has been established, Terraform will fingerprint the actual
-  version.  Default: `9.0.0`.
+  to the connection string. The driver ([`lib/pq`][libpq]) then sends each
+  statement that has bind parameters (almost every query the provider runs) in
+  a single round-trip instead of two (a separate prepare step followed by the
+  execution). The number of statements and connections does not change; only
+  the round-trips per statement do, so it mostly helps when the database is far
+  from where Terraform runs. Despite its name, only `[]byte` parameters are sent
+  in binary format, which the provider does not use; all other parameters and
+  all results are still sent as text. Works with every `scheme`. Can also be
+  set with the `PGBINARYPARAMETERS` environment variable. The default is
+  `false`.
+* `expected_version` - (Optional) The PostgreSQL version of the server, as a
+  version number such as `16`, `15.4` or `9.6.24`. By default (`9.0.0`) the
+  provider detects the version with `SELECT version()` on each new pool and
+  enables the features the server supports. When it is set to anything else,
+  the provider skips the detection and uses the given version instead, so it
+  must not be newer than the real server: features of a newer version would be
+  used against an older server. Set it to talk to a server whose version
+  string cannot be parsed. Default: `9.0.0`.
+* `catalog_snapshot` - (Optional) Opt-in, off by default. If set to `true`,
+  `postgresql_grant` (all object types but `column`, `foreign_data_wrapper` and
+  `foreign_server`; function, procedure and routine grants whose `objects`
+  carry an argument list are also read directly) and
+  `postgresql_default_privileges` are read from one snapshot of the catalogs per
+  database instead of one catalog query per resource. The snapshot (`pg_roles`,
+  `pg_namespace`, `pg_class`, `pg_default_acl` and the database's own ACL) is
+  taken by one statement the first time a resource of that database is read and
+  shared by every other read of that database; `pg_proc` is added by a second
+  statement the first time a function, procedure or routine grant of that
+  database is read. Snapshots are kept per database and connection settings, in
+  memory of the provider process, so every `provider` block has its own.
+  Every Terraform command starts without snapshots. A snapshot is dropped after
+  every create, update or delete this provider makes to that database (roles,
+  memberships and databases drop every snapshot), and after
+  `catalog_snapshot_ttl_seconds`; the reads that follow a create or update
+  always query the database. Changes made out-of-band (by another tool or
+  another `provider` block) while a Terraform run is in progress may only be
+  seen by the next run. A database whose catalog text (names and ACLs) exceeds
+  64 MiB, or whose snapshot cannot be taken, is read directly. See the
+  [performance tuning guide](guides/performance-tuning.html)
+  for when to enable it. Can also be set with the `PGCATALOGSNAPSHOT`
+  environment variable. The default is `false`.
+* `catalog_snapshot_ttl_seconds` - (Optional) Maximum age, in seconds, of a catalog
+  snapshot before it is taken again; also how long reads go direct after the
+  snapshot of a database could not be taken. Only used with `catalog_snapshot`.
+  Must be at least `1`. Can also be set with the `PGCATALOGSNAPSHOTTTL`
+  environment variable. The default is `30`.
 * `aws_rds_iam_auth` - (Optional) If set to `true`, call the AWS RDS API to grab a temporary password, using AWS Credentials
-  from the environment (or the given profile, see `aws_rds_iam_profile`)
+  from the environment (or the given profile, see `aws_rds_iam_profile`). With `scheme = "postgres"` (the default) the
+  token is cached and renewed before it expires (RDS tokens are valid for 15 minutes), and every new connection uses
+  a current one, so long-running applies keep working. With the GoCloud schemes the token obtained at provider
+  configuration is used for the whole run.
 * `aws_rds_iam_profile` - (Optional) The AWS IAM Profile to use while using AWS RDS IAM Auth.
 * `aws_rds_iam_region` - (Optional) The AWS region to use while using AWS RDS IAM Auth.
 * `aws_rds_iam_provider_role_arn` - (Optional) AWS IAM role to assume while using AWS RDS IAM Auth.
-* `azure_identity_auth` - (Optional) If set to `true`, call the Azure OAuth token endpoint for temporary token
+* `azure_identity_auth` - (Optional) If set to `true`, call the Azure OAuth token endpoint for temporary token. As with
+  `aws_rds_iam_auth`, the token is renewed before it expires and every new connection uses a current one.
 * `azure_tenant_id` - (Optional) (Required if `azure_identity_auth` is `true`) Azure tenant ID [read more](https://registry.terraform.io/providers/hashicorp/azurerm/latest/docs/data-sources/client_config.html)
 
 ## GoCloud

@@ -2,9 +2,13 @@ package postgresql
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 	"log"
+	"regexp"
+	"slices"
 	"strings"
+	"unicode"
 
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/validation"
@@ -39,10 +43,10 @@ type ResourceSchemeGetter func(string) any
 
 func resourcePostgreSQLGrant() *schema.Resource {
 	return &schema.Resource{
-		Create: PGResourceFunc(resourcePostgreSQLGrantCreate),
-		Update: PGResourceFunc(resourcePostgreSQLGrantUpdate),
+		Create: PGResourceWriteFunc(retryOnConcurrentCatalogUpdate(resourcePostgreSQLGrantCreate)),
+		Update: PGResourceWriteFunc(retryOnConcurrentCatalogUpdate(resourcePostgreSQLGrantUpdate)),
 		Read:   PGResourceFunc(resourcePostgreSQLGrantRead),
-		Delete: PGResourceFunc(resourcePostgreSQLGrantDelete),
+		Delete: PGResourceWriteFunc(retryOnConcurrentCatalogUpdate(resourcePostgreSQLGrantDelete)),
 		Importer: &schema.ResourceImporter{
 			StateContext: resourcePostgreSQLGrantImport,
 		},
@@ -55,10 +59,11 @@ func resourcePostgreSQLGrant() *schema.Resource {
 				Description: "The name of the role to grant privileges on",
 			},
 			"database": {
-				Type:        schema.TypeString,
-				Required:    true,
-				ForceNew:    true,
-				Description: "The database to grant privileges on for this role",
+				Type:         schema.TypeString,
+				Required:     true,
+				ForceNew:     true,
+				ValidateFunc: validation.StringIsNotEmpty,
+				Description:  "The database to grant privileges on for this role",
 			},
 			"schema": {
 				Type:        schema.TypeString,
@@ -112,6 +117,23 @@ func resourcePostgreSQLGrantRead(db *DBConnection, d *schema.ResourceData) error
 		return fmt.Errorf("feature is not supported: %v", err)
 	}
 
+	// With catalog_snapshot, the Reads the snapshot covers are served from
+	// it; the others, and any Read the snapshot cannot serve, query the
+	// database as before. Create and Update read directly after their write.
+	if grantReadUsesSnapshot(d) {
+		snap, gone := grantReadSnapshot(db, d)
+		if gone {
+			return nil
+		}
+		if snap != nil {
+			err := readRolePrivilegesFromSnapshot(snap, db, d)
+			if err == nil {
+				return nil
+			}
+			log.Printf("[WARN] could not read %s from the catalog snapshot, reading directly: %v", d.Id(), err)
+		}
+	}
+
 	return readRolePrivileges(db, d)
 }
 
@@ -155,30 +177,22 @@ func resourcePostgreSQLGrantCreateOrUpdate(db *DBConnection, d *schema.ResourceD
 		return err
 	}
 
-	database := d.Get("database").(string)
-
-	txn, err := startTransaction(db.client, database)
+	txn, err := startTransaction(db.client, grantConnDatabase(d))
 	if err != nil {
 		return err
 	}
 	defer deferredRollback(txn)
 
-	role := d.Get("role").(string)
-	if err := pgLockRole(txn, role); err != nil {
+	if err := lockGrantTargets(txn, d); err != nil {
 		return err
-	}
-
-	if objectType == "database" {
-		if err := pgLockDatabase(txn, database); err != nil {
-			return err
-		}
 	}
 
 	owners, err := getRolesToGrant(txn, d)
 	if err != nil {
 		return err
 	}
-	if err := withRolesGranted(txn, owners, func() error {
+	directGrant := func() (bool, error) { return grantableDirectly(db, txn, d) }
+	if err := withRolesGrantedOrDirect(db, txn, owners, directGrant, func() error {
 		// Revoke all privileges before granting otherwise reducing privileges will not work.
 		// We just have to revoke them in the same transaction so the role will not lose its
 		// privileges between the revoke and grant statements.
@@ -207,23 +221,14 @@ func resourcePostgreSQLGrantDelete(db *DBConnection, d *schema.ResourceData) err
 		return fmt.Errorf("feature is not supported: %v", err)
 	}
 
-	database := d.Get("database").(string)
-	txn, err := startTransaction(db.client, database)
+	txn, err := startTransaction(db.client, grantConnDatabase(d))
 	if err != nil {
 		return err
 	}
 	defer deferredRollback(txn)
 
-	role := d.Get("role").(string)
-	if err := pgLockRole(txn, role); err != nil {
+	if err := lockGrantTargets(txn, d); err != nil {
 		return err
-	}
-
-	objectType := d.Get("object_type").(string)
-	if objectType == "database" {
-		if err := pgLockDatabase(txn, database); err != nil {
-			return err
-		}
 	}
 
 	owners, err := getRolesToGrant(txn, d)
@@ -231,7 +236,8 @@ func resourcePostgreSQLGrantDelete(db *DBConnection, d *schema.ResourceData) err
 		return err
 	}
 
-	if err := withRolesGranted(txn, owners, func() error {
+	directGrant := func() (bool, error) { return grantableDirectly(db, txn, d) }
+	if err := withRolesGrantedOrDirect(db, txn, owners, directGrant, func() error {
 		return revokeRolePrivileges(txn, d, false)
 	}); err != nil {
 		return err
@@ -242,6 +248,33 @@ func resourcePostgreSQLGrantDelete(db *DBConnection, d *schema.ResourceData) err
 	}
 
 	return nil
+}
+
+// grantConnDatabase returns the database the reads and writes of a grant run
+// on. Database grants only change and read pg_database.datacl, a shared
+// catalog, so they run on the provider's maintenance database like
+// postgresql_database does ("" selects it): a provider user that does not own
+// the target database, and has no CONNECT on it once CONNECT is revoked from
+// PUBLIC, still manages them (#148). Their advisory locks are then taken there
+// too, where postgresql_database and postgresql_role take theirs. Every other
+// object type lives in the target database.
+func grantConnDatabase(d *schema.ResourceData) string {
+	if d.Get("object_type").(string) == "database" {
+		return ""
+	}
+	return d.Get("database").(string)
+}
+
+// lockGrantTargets takes the advisory locks of a grant write: the grantee
+// role (not its members: a grant changes no membership) and, for a database
+// grant, the database, in one statement ordered by OID; then the objects whose
+// ACL the grant changes (see grant_locks.go for the keys and the lock order).
+func lockGrantTargets(txn *sql.Tx, d *schema.ResourceData) error {
+	var database string
+	if d.Get("object_type").(string) == "database" {
+		database = d.Get("database").(string)
+	}
+	return pgLockGranteeAndObjects(txn, d.Get("role").(string), database, grantLockKeys(d.Get))
 }
 
 // grantReadRoleCTE resolves the grantee inside the Read query instead of with a
@@ -261,7 +294,8 @@ const grantReadSchemaCTE = `,
 n AS (SELECT oid FROM pg_namespace WHERE nspname = $2)`
 
 // queryGrantRead runs the single Read query of postgresql_grant or
-// postgresql_default_privileges on the resource's database, outside of any
+// postgresql_default_privileges on the resource's database (the maintenance
+// database for database grants, see grantConnDatabase), outside of any
 // transaction: the query reads only catalogs, so one statement already sees one
 // consistent snapshot.
 //
@@ -272,7 +306,9 @@ n AS (SELECT oid FROM pg_namespace WHERE nspname = $2)`
 func queryGrantRead(db *DBConnection, d *schema.ResourceData, query string, args ...any) (*sql.Rows, error) {
 	database := d.Get("database").(string)
 
-	conn, err := initConnection(db.client, database)
+	// postgresql_default_privileges has no database object_type, so this is
+	// always its target database.
+	conn, err := initConnection(db.client, grantConnDatabase(d))
 	if err == nil {
 		var rows *sql.Rows
 		if rows, err = conn.Query(query, args...); err == nil {
@@ -305,6 +341,11 @@ func grantTargetGone(d *schema.ResourceData, roleExists, schemaExists bool) bool
 		return true
 	}
 	if !schemaExists {
+		if d.Get("object_type") == "database" {
+			log.Printf("[WARN] PostgreSQL database (%s) not found, removing %s from state", d.Get("database").(string), d.Id())
+			d.SetId("")
+			return true
+		}
 		log.Printf("[DEBUG] schema %s does not exists", d.Get("schema").(string))
 		d.SetId("")
 		return true
@@ -312,43 +353,70 @@ func grantTargetGone(d *schema.ResourceData, roleExists, schemaExists bool) bool
 	return false
 }
 
+// relationACLType returns the acldefault object type of the relkinds an object
+// type covers (ownerRelkinds): sequences have their own default privileges,
+// every other relation those of a table. No object type mixes the two.
+//
+// Default ACLs in the grant Read queries: an object whose ACL column is NULL was never granted or revoked on explicitly
+// and carries its default privileges: everything for the owner, plus EXECUTE
+// for PUBLIC on functions and CONNECT/TEMPORARY for PUBLIC on databases. The
+// Read queries explode COALESCE(acl, acldefault(type, owner)) instead of the
+// ACL column, so a NULL ACL reads like the explicit ACL a first GRANT or REVOKE
+// writes (which starts from the same defaults). Column ACLs need no default:
+// columns have no default privileges.
+func relationACLType(relkinds []string) string {
+	if len(relkinds) == 1 && relkinds[0] == "S" {
+		return "s"
+	}
+	return "r"
+}
+
 // buildReadSingleObjectRolePrivilegesQuery builds the Read query for the object
 // types granted on one named object (database, schema, foreign data wrapper,
-// foreign server). It returns one row: role_exists, schema_exists (always true
-// when the object type is not schema-scoped) and the privileges granted to the
-// role on the object (NULL when there are none).
+// foreign server). It returns one row: role_exists, schema_exists (whether the
+// database exists for a database grant, always true for the other types that
+// are not schema-scoped) and the privileges granted to the role on the object
+// (NULL when there are none).
 func buildReadSingleObjectRolePrivilegesQuery(d *schema.ResourceData) (string, []any) {
 	role := d.Get("role").(string)
 
 	if d.Get("object_type").(string) == "schema" {
 		return grantReadRoleCTE + `
 SELECT r.oid IS NOT NULL, n.oid IS NOT NULL,
-    (SELECT array_agg(a.privilege_type) FROM aclexplode(n.nspacl) a WHERE a.grantee = r.oid)
+    (SELECT array_agg(a.privilege_type) FROM aclexplode(COALESCE(n.nspacl, acldefault('n', n.nspowner))) a WHERE a.grantee = r.oid)
 FROM r
 LEFT JOIN pg_namespace n ON n.nspname = $2
 `, []any{role, d.Get("schema").(string)}
 	}
 
-	var catalog, acl, nameColumn, name string
+	var catalog, acl, aclType, owner, nameColumn, name string
 	switch d.Get("object_type").(string) {
 	case "database":
-		catalog, acl, nameColumn = "pg_database", "datacl", "datname"
+		catalog, acl, aclType, owner, nameColumn = "pg_database", "datacl", "d", "datdba", "datname"
 		name = d.Get("database").(string)
 	case "foreign_data_wrapper":
-		catalog, acl, nameColumn = "pg_foreign_data_wrapper", "fdwacl", "fdwname"
+		catalog, acl, aclType, owner, nameColumn = "pg_foreign_data_wrapper", "fdwacl", "F", "fdwowner", "fdwname"
 		name = d.Get("objects").(*schema.Set).List()[0].(string)
 	case "foreign_server":
-		catalog, acl, nameColumn = "pg_foreign_server", "srvacl", "srvname"
+		catalog, acl, aclType, owner, nameColumn = "pg_foreign_server", "srvacl", "S", "srvowner", "srvname"
 		name = d.Get("objects").(*schema.Set).List()[0].(string)
 	}
 
+	// A database grant is read on the maintenance database (see
+	// grantConnDatabase), where a dropped target database is no connection
+	// error: the second column reports whether it still exists instead.
+	exists := "true"
+	if d.Get("object_type").(string) == "database" {
+		exists = "EXISTS (SELECT 1 FROM pg_catalog.pg_database WHERE datname = $2)"
+	}
+
 	return grantReadRoleCTE + fmt.Sprintf(`
-SELECT r.oid IS NOT NULL, true,
+SELECT r.oid IS NOT NULL, %s,
     (SELECT pg_catalog.array_agg(a.privilege_type)
-     FROM pg_catalog.%s o, pg_catalog.aclexplode(o.%s) a
+     FROM pg_catalog.%s o, pg_catalog.aclexplode(COALESCE(o.%s, pg_catalog.acldefault('%s', o.%s))) a
      WHERE o.%s = $2 AND a.grantee = r.oid)
 FROM r
-`, catalog, acl, nameColumn), []any{role, name}
+`, exists, catalog, acl, aclType, owner, nameColumn), []any{role, name}
 }
 
 func readSingleObjectRolePrivileges(db *DBConnection, d *schema.ResourceData) error {
@@ -514,8 +582,9 @@ func readColumnRolePrivileges(db *DBConnection, d *schema.ResourceData) error {
 // than in a subquery over the whole pg_class joined back by name: with the
 // relname filter the planner turned that join into a nested loop that re-ran
 // aclexplode over every relation in the catalog once per matched object.
-// Relations without an ACL entry for the role (including a NULL relacl) still
-// produce a row with an empty privilege array.
+// A NULL relacl stands for the default privileges (see relationACLType);
+// relations without an ACL entry for the role still produce a row with an empty
+// privilege array.
 //
 // relkinds is the set of pg_class.relkind values the object type covers
 // (ownerRelkinds): ON TABLE also applies to views, materialized views,
@@ -529,7 +598,7 @@ LEFT JOIN LATERAL (
     FROM pg_class c
     JOIN n ON n.oid = c.relnamespace
     LEFT JOIN LATERAL (
-        SELECT privilege_type FROM aclexplode(c.relacl) WHERE grantee = r.oid
+        SELECT privilege_type FROM aclexplode(COALESCE(c.relacl, acldefault('` + relationACLType(relkinds) + `', c.relowner))) WHERE grantee = r.oid
     ) a ON true
     WHERE c.relkind = ANY($3)`
 	args := []interface{}{role, schemaName, pq.Array(relkinds)}
@@ -550,27 +619,286 @@ LEFT JOIN LATERAL (
 	return query, args
 }
 
+// functionProkindFilter returns the pg_proc.prokind condition matching what a
+// GRANT of the object type applies to: ON FUNCTION / ALL FUNCTIONS covers plain,
+// aggregate and window functions but not procedures, ON PROCEDURE only
+// procedures, ON ROUTINE all of them. Before PostgreSQL 11 (no procedures, no
+// prokind column) every routine is a function and no filter is needed.
+func functionProkindFilter(objectType string, hasProkind bool) string {
+	if !hasProkind {
+		return ""
+	}
+	switch objectType {
+	case "function":
+		return "p.prokind <> 'p'"
+	case "procedure":
+		return "p.prokind = 'p'"
+	}
+	return ""
+}
+
+// isFunctionSignature reports whether an objects entry of a function/
+// procedure/routine grant carries an argument list, e.g. "f(integer)". The
+// GRANT splits such entries on the first "(" (see quoteIdentifyIdent).
+func isFunctionSignature(entry string) bool {
+	return strings.Contains(entry, "(")
+}
+
+// multiWordArgType matches the SQL standard type names made of several words
+// (and their typmods / array suffixes). Their first word must not be taken for
+// an argument name when reducing a signature to its types.
+var multiWordArgType = regexp.MustCompile(`(?i)^(` +
+	`double\s+precision` +
+	`|(character|char|nchar|national\s+(character|char)|bit)\s+varying(\s*\(\s*\d+\s*\))?` +
+	`|national\s+(character|char)(\s*\(\s*\d+\s*\))?` +
+	`|(timestamp|time)(\s*\(\s*\d+\s*\))?(\s+(with|without)\s+time\s+zone)?` +
+	`|interval(\s*\(\s*\d+\s*\))?(\s+(year|month|day|hour|minute|second)(\s+to\s+(month|hour|minute|second))?)?(\s*\(\s*\d+\s*\))?` +
+	`)(\s*\[\s*\d*\s*\])*$`)
+
+// splitSQLTopLevel splits s on the separator runes found outside of
+// parentheses, brackets, double-quoted identifiers and single-quoted literals.
+// Empty parts are dropped when skipEmpty is set.
+func splitSQLTopLevel(s string, isSep func(rune) bool, skipEmpty bool) []string {
+	var parts []string
+	var cur strings.Builder
+	depth := 0
+	var quote rune
+	flush := func() {
+		part := strings.TrimSpace(cur.String())
+		if part != "" || !skipEmpty {
+			parts = append(parts, part)
+		}
+		cur.Reset()
+	}
+	for _, r := range s {
+		switch {
+		case quote != 0:
+			if r == quote {
+				quote = 0
+			}
+		case r == '"' || r == '\'':
+			quote = r
+		case r == '(' || r == '[':
+			depth++
+		case r == ')' || r == ']':
+			depth--
+		case depth == 0 && isSep(r):
+			flush()
+			continue
+		}
+		cur.WriteRune(r)
+	}
+	flush()
+	return parts
+}
+
+// functionArgType reduces one argument of a GRANT signature,
+// "[argmode] [argname] argtype [DEFAULT expr]", to its type. ok is false for
+// an OUT argument, which is not part of the signature.
+func functionArgType(arg string) (argType string, ok bool) {
+	tokens := splitSQLTopLevel(arg, unicode.IsSpace, true)
+
+	// Drop a default value ("DEFAULT expr" or "= expr").
+	for i, tok := range tokens {
+		if strings.EqualFold(tok, "default") || strings.HasPrefix(tok, "=") {
+			tokens = tokens[:i]
+			break
+		}
+		if before, _, found := strings.Cut(tok, "="); found && !strings.ContainsAny(before, "\"'") {
+			tokens = append(tokens[:i:i], before)
+			break
+		}
+	}
+
+	if len(tokens) > 1 {
+		switch strings.ToUpper(tokens[0]) {
+		case "OUT":
+			return "", false
+		case "IN", "INOUT", "VARIADIC":
+			tokens = tokens[1:]
+		}
+	}
+
+	// "name type": the first token is an argument name unless the tokens
+	// form a multi-word type name or the second one only continues the type
+	// ("integer []", "numeric (10,2)").
+	if len(tokens) > 1 && !multiWordArgType.MatchString(strings.Join(tokens, " ")) &&
+		!strings.HasPrefix(tokens[1], "[") && !strings.HasPrefix(tokens[1], "(") {
+		tokens = tokens[1:]
+	}
+	return strings.Join(tokens, " "), true
+}
+
+// functionLookupSignature reduces a function/procedure/routine objects entry
+// to the form to_regprocedure accepts: GRANT takes argument modes, names (and
+// ignores OUT arguments), to_regprocedure only a list of types. "f(IN x
+// integer, OUT y text)" becomes "f(integer)"; the types are kept as written.
+// An entry without a complete argument list is returned unchanged.
+func functionLookupSignature(entry string) string {
+	name, rest, found := strings.Cut(entry, "(")
+	if !found || !strings.HasSuffix(strings.TrimSpace(rest), ")") {
+		return entry
+	}
+	rest = strings.TrimSpace(rest)
+	args := rest[:len(rest)-1]
+
+	var types []string
+	for _, arg := range splitSQLTopLevel(args, func(r rune) bool { return r == ',' }, true) {
+		if argType, ok := functionArgType(arg); ok {
+			types = append(types, argType)
+		}
+	}
+	return name + "(" + strings.Join(types, ", ") + ")"
+}
+
+// hasFunctionSignature reports whether any objects entry carries an argument
+// list.
+func hasFunctionSignature(objects *schema.Set) bool {
+	for _, o := range objects.List() {
+		if isFunctionSignature(o.(string)) {
+			return true
+		}
+	}
+	return false
+}
+
 // buildReadFunctionRolePrivilegesQuery builds the Read query for the
 // function/procedure/routine object types: role_exists and schema_exists on
-// every row, then one row per function name in the schema (overloads merged)
-// with the privileges granted to the role, or a single row with a NULL name.
-// Every function of the schema is returned: the resource's objects may carry
-// argument signatures, so they are still matched by name in Go.
-func buildReadFunctionRolePrivilegesQuery(role, schemaName string) (string, []interface{}) {
+// every row, then one row per routine (overload) of the kinds granted by the
+// object type (prokindFilter, see functionProkindFilter) with the privileges
+// granted to the role, or a single row with a NULL name. Each row is reported
+// under the objects entry that selected it, so readRolePrivileges compares
+// every overload a grant covers.
+//
+// With an empty objects set every routine of the schema is returned (GRANT ON
+// ALL ... IN SCHEMA). Otherwise:
+//   - bare entries ("f") select every overload of that name in the schema
+//     ("proname = ANY($3)", served by the pg_proc name index);
+//   - entries with an argument list ("f(integer)") are resolved with
+//     to_regprocedure on the text the GRANT uses ("schema"."f"(integer)), once
+//     reduced to the argument types (functionLookupSignature drops argument
+//     modes, names and OUT arguments, which GRANT accepts and to_regprocedure
+//     does not), so any spelling PostgreSQL accepts selects the same overload,
+//     and an entry that resolves to nothing (dropped routine) yields no row, like
+//     a missing bare name. resolveSignatures=false leaves them out of the query
+//     (they are then not compared).
+//
+// It is still one statement: the signature entries and their rendering are
+// bound as two parallel text arrays.
+func buildReadFunctionRolePrivilegesQuery(
+	role, schemaName, prokindFilter string, objects *schema.Set, resolveSignatures bool,
+) (string, []any) {
+	args := []any{role, schemaName}
+
+	where := func(conds ...string) string {
+		var parts []string
+		for _, c := range conds {
+			if c != "" {
+				parts = append(parts, c)
+			}
+		}
+		if len(parts) == 0 {
+			return ""
+		}
+		return "\n        WHERE " + strings.Join(parts, " AND ")
+	}
+
+	var routines string
+	if objects.Len() == 0 {
+		routines = `
+        SELECT p.proname AS name, p.oid, p.proacl, p.proowner
+        FROM pg_proc p
+        JOIN n ON n.oid = p.pronamespace` + where(prokindFilter)
+	} else {
+		bare := []string{}
+		var sigEntries, signatures []string
+		for _, o := range objects.List() {
+			entry := o.(string)
+			if !isFunctionSignature(entry) {
+				bare = append(bare, entry)
+			} else if resolveSignatures {
+				sigEntries = append(sigEntries, entry)
+				signatures = append(signatures, pq.QuoteIdentifier(schemaName)+"."+quoteIdentifyIdent(functionLookupSignature(entry)))
+			}
+		}
+
+		args = append(args, pq.Array(bare))
+		routines = `
+        SELECT p.proname AS name, p.oid, p.proacl, p.proowner
+        FROM pg_proc p
+        JOIN n ON n.oid = p.pronamespace` + where("p.proname = ANY($3)", prokindFilter)
+
+		if len(sigEntries) > 0 {
+			args = append(args, pq.Array(sigEntries), pq.Array(signatures))
+			routines += `
+        UNION ALL
+        SELECT e.entry, p.oid, p.proacl, p.proowner
+        FROM unnest($4::text[], $5::text[]) AS e(entry, signature)
+        JOIN pg_proc p ON p.oid = to_regprocedure(e.signature)
+        JOIN n ON n.oid = p.pronamespace` + where(prokindFilter)
+		}
+	}
+
 	query := grantReadRoleCTE + grantReadSchemaCTE + `
-SELECT r.oid IS NOT NULL, EXISTS (SELECT 1 FROM n), o.proname, o.privileges
+SELECT r.oid IS NOT NULL, EXISTS (SELECT 1 FROM n), o.name, o.privileges
 FROM r
 LEFT JOIN LATERAL (
-    SELECT p.proname, array_remove(array_agg(a.privilege_type), NULL) AS privileges
-    FROM pg_proc p
-    JOIN n ON n.oid = p.pronamespace
+    SELECT o.name, array_remove(array_agg(a.privilege_type), NULL) AS privileges
+    FROM (` + routines + `
+    ) o
     LEFT JOIN LATERAL (
-        SELECT privilege_type FROM aclexplode(p.proacl) WHERE grantee = r.oid
+        SELECT privilege_type FROM aclexplode(COALESCE(o.proacl, acldefault('f', o.proowner))) WHERE grantee = r.oid
     ) a ON true
-    GROUP BY p.proname
+    GROUP BY o.name, o.oid
 ) o ON true
 `
-	return query, []interface{}{role, schemaName}
+	return query, args
+}
+
+// grantReadRow is one row of the table/sequence/function Read queries.
+type grantReadRow struct {
+	roleExists, schemaExists bool
+	objName                  sql.NullString
+	privileges               pq.ByteaArray
+}
+
+// fetchGrantReadRows runs one Read query through queryGrantRead and returns all
+// its rows. Reading them up front means an error raised while the statement
+// executes (reported by rows.Next/rows.Err, not by Query) is returned here.
+// gone is true when the database no longer exists (the resource was removed
+// from state).
+func fetchGrantReadRows(db *DBConnection, d *schema.ResourceData, query string, args []any) (result []grantReadRow, gone bool, err error) {
+	rows, err := queryGrantRead(db, d, query, args...)
+	if err != nil {
+		return nil, false, err
+	}
+	if rows == nil {
+		return nil, true, nil
+	}
+	defer closeGrantReadRows(rows)
+
+	for rows.Next() {
+		var row grantReadRow
+		if err := rows.Scan(&row.roleExists, &row.schemaExists, &row.objName, &row.privileges); err != nil {
+			return nil, false, err
+		}
+		result = append(result, row)
+	}
+	return result, false, rows.Err()
+}
+
+// isFunctionSignatureError reports whether the function Read failed because
+// to_regprocedure could not parse one of the signature entries: before
+// PostgreSQL 16 an unknown type name raises instead of returning NULL, and so
+// does, on every version, an argument list functionLookupSignature could not
+// reduce to plain types.
+func isFunctionSignatureError(err error) bool {
+	var pqErr *pq.Error
+	if !errors.As(err, &pqErr) {
+		return false
+	}
+	class := pqErr.Code.Class()
+	return class == "42" || class == "22"
 }
 
 // readRolePrivileges reads the privileges granted to the role with a single
@@ -584,7 +912,9 @@ func readRolePrivileges(db *DBConnection, d *schema.ResourceData) error {
 	objects := d.Get("objects").(*schema.Set)
 
 	var query string
-	var args []interface{}
+	var args []any
+	var prokindFilter string
+	isFunction := false
 
 	switch objectType {
 	case "database", "schema", "foreign_data_wrapper", "foreign_server":
@@ -594,7 +924,11 @@ func readRolePrivileges(db *DBConnection, d *schema.ResourceData) error {
 		return readColumnRolePrivileges(db, d)
 
 	case "function", "procedure", "routine":
-		query, args = buildReadFunctionRolePrivilegesQuery(role, d.Get("schema").(string))
+		isFunction = true
+		prokindFilter = functionProkindFilter(objectType, db.featureSupported(featureProcedure))
+		query, args = buildReadFunctionRolePrivilegesQuery(
+			role, d.Get("schema").(string), prokindFilter, objects, true,
+		)
 
 	default:
 		query, args = buildReadTableRolePrivilegesQuery(
@@ -607,67 +941,268 @@ func readRolePrivileges(db *DBConnection, d *schema.ResourceData) error {
 	// with the list of the currently applied privileges (aggregation of privilege_type)
 	//
 	// Our goal is to check that every object has the same privileges as saved in the state.
-	rows, err := queryGrantRead(db, d, query, args...)
+	rows, gone, err := fetchGrantReadRows(db, d, query, args)
+	if err != nil && isFunction && isFunctionSignatureError(err) && hasFunctionSignature(objects) {
+		// A signature entry the Read cannot resolve (see
+		// isFunctionSignatureError) must not break the refresh: read again
+		// without the signature entries, which are then not compared.
+		log.Printf(
+			"[WARN] could not resolve the argument signatures in %v on refresh, they are not compared: %v",
+			objects.List(), err,
+		)
+		query, args = buildReadFunctionRolePrivilegesQuery(
+			role, d.Get("schema").(string), prokindFilter, objects, false,
+		)
+		rows, gone, err = fetchGrantReadRows(db, d, query, args)
+	}
 	if err != nil {
 		return err
 	}
-	if rows == nil {
+	if gone {
 		return nil
 	}
-	defer closeGrantReadRows(rows)
 
+	var objectPrivileges []*schema.Set
 	checked := false
-	for rows.Next() {
-		var roleExists, schemaExists bool
-		var objName sql.NullString
-		var privileges pq.ByteaArray
-
-		if err := rows.Scan(&roleExists, &schemaExists, &objName, &privileges); err != nil {
-			return err
-		}
-
+	for _, row := range rows {
 		if !checked {
-			if grantTargetGone(d, roleExists, schemaExists) {
+			if grantTargetGone(d, row.roleExists, row.schemaExists) {
 				return nil
 			}
 			d.SetId(generateGrantID(d))
 			checked = true
 		}
 
-		if !objName.Valid {
+		if !row.objName.Valid {
 			// The schema has no object of this type: only the existence flags
 			// were returned.
 			continue
 		}
 
-		// For the table/sequence path this set is already filtered in SQL
-		// above; the check is kept because the function/procedure/routine path
-		// still fetches every object in the schema (its object names may carry
-		// argument signatures, so it is filtered here rather than in SQL).
-		if objects.Len() > 0 && !objects.Contains(objName.String) {
+		// The objects filter already runs in SQL for every object type; this
+		// check only keeps the Read independent of the exact query shape.
+		if objects.Len() > 0 && !objects.Contains(row.objName.String) {
 			continue
 		}
 
-		privilegesSet := pgArrayToSet(privileges)
+		privilegesSet := pgArrayToSet(row.privileges)
 		if !resourcePrivilegesEqual(privilegesSet, db, d) {
-			// If any object doesn't have the same privileges as saved in the state,
-			// we return its privileges to force an update.
 			log.Printf(
 				"[DEBUG] %s %s has not the expected privileges %v for role %s",
-				strings.ToTitle(objectType), objName.String, privileges, d.Get("role"),
+				strings.ToTitle(objectType), row.objName.String, row.privileges, d.Get("role"),
 			)
-			d.Set("privileges", privilegesSet)
-			break
 		}
-	}
-	if err := rows.Err(); err != nil {
-		return err
+		objectPrivileges = append(objectPrivileges, privilegesSet)
 	}
 	if !checked {
 		return fmt.Errorf("could not read privileges: query returned no row")
 	}
 
-	return rows.Err()
+	// If any object doesn't have the same privileges as saved in the state,
+	// store a value that forces an update.
+	drifted, drift := grantReadDriftPrivileges(
+		objectPrivileges, d.Get("privileges").(*schema.Set),
+		func(granted, _ *schema.Set) bool { return resourcePrivilegesEqual(granted, db, d) },
+	)
+	if drift {
+		d.Set("privileges", drifted)
+	}
+
+	return nil
+}
+
+// partialPrivilegeSuffix marks, in the privileges the Read stores on drift, a
+// privilege that only some of the objects covered by the grant hold.
+const partialPrivilegeSuffix = " (on some objects only)"
+
+// grantReadDriftPrivileges decides what the Read stores in privileges for a
+// grant covering several objects, given each object's privileges and the
+// privileges currently stored (wanted). It returns drift=false when every
+// object matches (equal).
+//
+// Otherwise the stored value must differ from the wanted privileges and stay
+// the same on the next refresh, which compares against it. Storing the
+// privileges of the first object that differs does neither reliably: with one
+// table missing a privilege and another one matching, the next refresh finds
+// the matching table different from the stored value and stores the wanted
+// privileges back, so the drift vanishes from the plan. Instead:
+//   - when all objects hold the same privileges, those are stored;
+//   - otherwise the privileges all objects hold are stored as they are, and
+//     every privilege only some objects hold is stored with
+//     partialPrivilegeSuffix ("INSERT (on some objects only)").
+//
+// No object can hold a marked privilege, so a marked value never matches on
+// the next refresh and is recomputed identically, and no configuration can
+// equal it, so missing and extra privileges both stay visible until applied.
+// The plan shows the marked privileges going away; the REVOKE of the update
+// (which revokes the stored privileges, see createRevokeQuery) removes them
+// from every object.
+func grantReadDriftPrivileges(
+	objects []*schema.Set, wanted *schema.Set, equal func(granted, wanted *schema.Set) bool,
+) (*schema.Set, bool) {
+	drift := false
+	for _, o := range objects {
+		if !equal(o, wanted) {
+			drift = true
+			break
+		}
+	}
+	if !drift {
+		return nil, false
+	}
+
+	common, all := objects[0], objects[0]
+	for _, o := range objects[1:] {
+		common = common.Intersection(o)
+		all = all.Union(o)
+	}
+	stored := schema.NewSet(schema.HashString, common.List())
+	for _, p := range all.Difference(common).List() {
+		stored.Add(p.(string) + partialPrivilegeSuffix)
+	}
+	return stored, true
+}
+
+// privilegeNames returns the privileges of a stored privileges set without
+// the partialPrivilegeSuffix markers the Read may have added.
+func privilegeNames(privileges *schema.Set) *schema.Set {
+	names := schema.NewSet(schema.HashString, nil)
+	for _, p := range privileges.List() {
+		names.Add(strings.TrimSuffix(p.(string), partialPrivilegeSuffix))
+	}
+	return names
+}
+
+// readRolePrivilegesFromSnapshot is readRolePrivileges (and the single-object
+// Read of schema grants) served from the catalog snapshot, with
+// the same outcome for every input it is given (see grantReadUsesSnapshot): a
+// missing role or schema removes the resource from state, a NULL ACL reads as
+// the object's default privileges, objects are matched by name, each relation
+// or routine overload is compared on its own, and on drift the value of
+// grantReadDriftPrivileges is written to state. Nothing is written to d before
+// every ACL it needs has been parsed, so on an error the caller can fall back
+// to the direct Read.
+func readRolePrivilegesFromSnapshot(snap *catalogSnapshot, db *DBConnection, d *schema.ResourceData) error {
+	objectType := d.Get("object_type").(string)
+	schemaName := d.Get("schema").(string)
+	objects := d.Get("objects").(*schema.Set)
+	grantee, roleExists := snap.granteeOf(d.Get("role").(string))
+
+	// drift is the privilege set to write to state, nil when every object
+	// has the configured privileges.
+	var drift *schema.Set
+	var schemaExists bool
+
+	single := func(acl sql.NullString) error {
+		granted, err := privilegesOf(acl, grantee)
+		if err != nil {
+			return err
+		}
+		if !resourcePrivilegesEqual(granted, db, d) {
+			drift = granted
+		}
+		return nil
+	}
+
+	switch objectType {
+	case "schema":
+		ns, ok := snap.namespaces[schemaName]
+		schemaExists = ok
+		if ok {
+			if err := single(ns.acl); err != nil {
+				return err
+			}
+		}
+
+	default:
+		ns, ok := snap.namespaces[schemaName]
+		schemaExists = ok
+		// candidates are the routines of the schema or its relations;
+		// keep is the kind filter of the direct Read: the prokinds of the
+		// object type (functionProkindFilter) or its relkinds
+		// (ownerRelkinds).
+		var candidates []catalogObject
+		var keep func(kind string) bool
+		if ok {
+			switch objectType {
+			case "function", "procedure", "routine":
+				var err error
+				if candidates, err = snap.routinesOf(ns.oid); err != nil {
+					return err
+				}
+				hasProkind := db.featureSupported(featureProcedure)
+				keep = func(kind string) bool {
+					switch {
+					case !hasProkind:
+						return true
+					case objectType == "function":
+						return kind != "p"
+					case objectType == "procedure":
+						return kind == "p"
+					}
+					return true
+				}
+			default:
+				candidates = snap.relations[ns.oid]
+				relkinds := ownerRelkinds[objectType]
+				keep = func(kind string) bool { return slices.Contains(relkinds, kind) }
+			}
+		}
+
+		var objectPrivileges []*schema.Set
+		for _, object := range candidates {
+			if !keep(object.kind) {
+				continue
+			}
+			if objects.Len() > 0 && !objects.Contains(object.name) {
+				continue
+			}
+			granted, err := privilegesOf(object.acl, grantee)
+			if err != nil {
+				return err
+			}
+			if !resourcePrivilegesEqual(granted, db, d) {
+				log.Printf(
+					"[DEBUG] %s %s has not the expected privileges %v for role %s",
+					strings.ToTitle(objectType), object.name, granted.List(), d.Get("role"),
+				)
+			}
+			objectPrivileges = append(objectPrivileges, granted)
+		}
+
+		if drifted, ok := grantReadDriftPrivileges(
+			objectPrivileges, d.Get("privileges").(*schema.Set),
+			func(granted, _ *schema.Set) bool { return resourcePrivilegesEqual(granted, db, d) },
+		); ok {
+			drift = drifted
+		}
+	}
+
+	if grantTargetGone(d, roleExists, schemaExists) {
+		return nil
+	}
+	d.SetId(generateGrantID(d))
+	if drift != nil {
+		return d.Set("privileges", drift)
+	}
+	return nil
+}
+
+// grantReadUsesSnapshot reports whether the Read of d may be served from the
+// catalog snapshot. Column, foreign data wrapper and foreign server grants
+// are not in it, and neither are function signature entries ("f(integer)"):
+// the direct Read resolves them with to_regprocedure, which the snapshot
+// cannot do without the server. Database grants are not served from it
+// either: the snapshot is taken on the target database, which the database
+// grant Read must not connect to (see grantConnDatabase).
+func grantReadUsesSnapshot(d *schema.ResourceData) bool {
+	switch d.Get("object_type").(string) {
+	case "column", "foreign_data_wrapper", "foreign_server", "database":
+		return false
+	case "function", "procedure", "routine":
+		return !hasFunctionSignature(d.Get("objects").(*schema.Set))
+	}
+	return true
 }
 
 func createGrantQuery(d *schema.ResourceData, privileges []string) string {
@@ -789,7 +1324,9 @@ func createRevokeQuery(getter ResourceSchemeGetter) string {
 		}
 	case "TABLE", "SEQUENCE", "FUNCTION", "PROCEDURE", "ROUTINE":
 		objects := getter("objects").(*schema.Set)
-		privileges := getter("privileges").(*schema.Set)
+		// The stored privileges may carry drift markers (see
+		// grantReadDriftPrivileges).
+		privileges := privilegeNames(getter("privileges").(*schema.Set))
 		if objects.Len() > 0 {
 			if privileges.Len() > 0 {
 				// Revoking specific privileges instead of all privileges

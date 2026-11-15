@@ -9,6 +9,7 @@ description: |-
 # postgresql\_tables
 
 The ``postgresql_tables`` data source retrieves a list of table names from a specified PostgreSQL database.
+Tables, views and foreign tables are read from ``pg_class``, so the list includes relations the provider user has no privileges on. Results are ordered by schema and table name.
 
 
 ## Usage
@@ -43,5 +44,5 @@ The `tables` block consists of:
 
 * `schema_name` - The parent schema.
 
-* `table_type` - The table type as defined in ``information_schema.tables``.
+* `table_type` - The table type, with the same values as ``information_schema.tables``: `BASE TABLE` (including partitioned tables), `VIEW`, `FOREIGN` or `LOCAL TEMPORARY`.
 

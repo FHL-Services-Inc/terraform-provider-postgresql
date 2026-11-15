@@ -48,6 +48,14 @@ resource "postgresql_grant_role" "bob_admin" {
 * `grant_role` - (Required) The name of the role that is added to `role`.
 * `with_admin_option` - (Optional) Giving ability to grant membership to others or not for `role`. (Default: false)
 
+Since PostgreSQL 16, the same membership can be granted several times by
+different grantors, each with its own `ADMIN OPTION`. For example, a role
+created by a non-superuser with `CREATEROLE` is automatically granted to its
+creator with `ADMIN OPTION`. The provider reads back the membership granted by
+its own user (the one this resource creates and revokes) and only falls back to
+another grantor's membership when there is none, so `with_admin_option`
+reflects the membership this resource manages.
+
 ## Import
 
 `postgresql_grant_role` can be imported using the resource ID,

@@ -3,7 +3,9 @@ package postgresql
 import (
 	"context"
 	"fmt"
+	"log"
 	"os"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/sts"
@@ -24,6 +26,8 @@ import (
 const (
 	defaultProviderMaxOpenConnections            = 20
 	defaultProviderMaxIdleConnections            = 0
+	defaultProviderMaxTotalConnections           = 0 // no limit across databases
+	defaultProviderConnectTimeoutSeconds         = 180
 	defaultProviderConnMaxLifetimeSeconds        = 0 // unlimited
 	defaultProviderMaxConnRetries                = 0
 	defaultProviderConnectionRetryTimeoutSeconds = 5
@@ -186,7 +190,7 @@ func Provider() *schema.Provider {
 			"connect_timeout": {
 				Type:         schema.TypeInt,
 				Optional:     true,
-				DefaultFunc:  schema.EnvDefaultFunc("PGCONNECT_TIMEOUT", 180),
+				DefaultFunc:  schema.EnvDefaultFunc("PGCONNECT_TIMEOUT", defaultProviderConnectTimeoutSeconds),
 				Description:  "Maximum wait for connection, in seconds. Zero or not specified means wait indefinitely.",
 				ValidateFunc: validation.IntAtLeast(-1),
 			},
@@ -218,6 +222,13 @@ func Provider() *schema.Provider {
 				Description:  "Maximum number of idle connections kept open per database for reuse. Zero (the default) means connections are closed after each use. Capped to max_connections when the latter is non-zero.",
 				ValidateFunc: validation.IntAtLeast(0),
 			},
+			"max_total_connections": {
+				Type:         schema.TypeInt,
+				Optional:     true,
+				DefaultFunc:  schema.EnvDefaultFunc("PGMAXTOTALCONNECTIONS", defaultProviderMaxTotalConnections),
+				Description:  "Maximum number of connections open at once to the server, across all databases. Zero (the default) means no limit beyond max_connections per database. Only applies to the postgres scheme.",
+				ValidateFunc: validation.IntAtLeast(0),
+			},
 			"conn_max_lifetime_seconds": {
 				Type:         schema.TypeInt,
 				Optional:     true,
@@ -237,6 +248,19 @@ func Provider() *schema.Provider {
 				Default:      defaultExpectedPostgreSQLVersion,
 				Description:  "Specify the expected version of PostgreSQL.",
 				ValidateFunc: validateExpectedVersion,
+			},
+			"catalog_snapshot": {
+				Type:        schema.TypeBool,
+				Optional:    true,
+				DefaultFunc: schema.EnvDefaultFunc("PGCATALOGSNAPSHOT", false),
+				Description: "Read postgresql_grant and postgresql_default_privileges from one catalog snapshot per database, built once per plan and dropped after any write by this provider, instead of one catalog query per resource.",
+			},
+			"catalog_snapshot_ttl_seconds": {
+				Type:         schema.TypeInt,
+				Optional:     true,
+				DefaultFunc:  schema.EnvDefaultFunc("PGCATALOGSNAPSHOTTTL", defaultCatalogSnapshotTTLSeconds),
+				Description:  "Maximum age, in seconds, of a catalog snapshot before it is rebuilt. Only used with catalog_snapshot.",
+				ValidateFunc: validation.IntAtLeast(1),
 			},
 		},
 
@@ -275,13 +299,17 @@ func validateExpectedVersion(v any, key string) (warnings []string, errors []err
 	return
 }
 
-func getRDSAuthToken(region string, profile string, role string, username string, host string, port int) (string, error) {
+// getRDSAuthToken builds an RDS IAM auth token and returns it with its expiry:
+// the presigned URL's own expiry, or earlier if the signing credentials expire
+// first (the token stops working with them).
+func getRDSAuthToken(ctx context.Context, region string, profile string, role string, username string, host string, port int) (string, time.Time, error) {
 	endpoint := fmt.Sprintf("%s:%d", host, port)
-
-	ctx := context.Background()
 
 	var awscfg aws.Config
 	var err error
+	// sessionExpiry is when the assumed role session ends: the static
+	// credentials provider built from it doesn't know.
+	var sessionExpiry *time.Time
 
 	if profile != "" {
 		awscfg, err = awsConfig.LoadDefaultConfig(ctx, awsConfig.WithSharedConfigProfile(profile))
@@ -291,7 +319,7 @@ func getRDSAuthToken(region string, profile string, role string, username string
 		awscfg, err = awsConfig.LoadDefaultConfig(ctx)
 	}
 	if err != nil {
-		return "", err
+		return "", time.Time{}, err
 	}
 
 	if role != "" {
@@ -303,7 +331,7 @@ func getRDSAuthToken(region string, profile string, role string, username string
 
 		roleOutput, err := stsClient.AssumeRole(ctx, roleInput)
 		if err != nil {
-			return "", fmt.Errorf("could not assume AWS role: %w", err)
+			return "", time.Time{}, fmt.Errorf("could not assume AWS role: %w", err)
 		}
 
 		awscfg, err = awsConfig.LoadDefaultConfig(ctx,
@@ -316,13 +344,26 @@ func getRDSAuthToken(region string, profile string, role string, username string
 			),
 		)
 		if err != nil {
-			return "", fmt.Errorf("could not load AWS default config: %w", err)
+			return "", time.Time{}, fmt.Errorf("could not load AWS default config: %w", err)
 		}
+		sessionExpiry = roleOutput.Credentials.Expiration
 	}
 
+	issuedAt := time.Now()
 	token, err := auth.BuildAuthToken(ctx, endpoint, awscfg.Region, username, awscfg.Credentials)
-
-	return token, err
+	if err != nil {
+		return "", time.Time{}, err
+	}
+	expiresAt := rdsAuthTokenExpiry(token, issuedAt)
+	if sessionExpiry != nil && sessionExpiry.Before(expiresAt) {
+		expiresAt = *sessionExpiry
+	}
+	// BuildAuthToken retrieved the credentials through the cache, so this
+	// doesn't call out again.
+	if creds, err := awscfg.Credentials.Retrieve(ctx); err == nil && creds.CanExpire && creds.Expires.Before(expiresAt) {
+		expiresAt = creds.Expires
+	}
+	return token, expiresAt, nil
 }
 
 func createGoogleCredsFileIfNeeded() error {
@@ -353,20 +394,22 @@ func createGoogleCredsFileIfNeeded() error {
 	return os.Setenv("GOOGLE_APPLICATION_CREDENTIALS", tmpFile.Name())
 }
 
-func acquireAzureOauthToken(tenantId string) (string, error) {
+// acquireAzureOauthToken gets an Azure AD access token for Azure Database for
+// PostgreSQL and returns it with its expiry.
+func acquireAzureOauthToken(ctx context.Context, tenantId string) (string, time.Time, error) {
 	credential, err := azidentity.NewDefaultAzureCredential(
 		&azidentity.DefaultAzureCredentialOptions{TenantID: tenantId})
 	if err != nil {
-		return "", err
+		return "", time.Time{}, err
 	}
-	token, err := credential.GetToken(context.Background(), policy.TokenRequestOptions{
+	token, err := credential.GetToken(ctx, policy.TokenRequestOptions{
 		Scopes:   []string{"https://ossrdbms-aad.database.windows.net/.default"},
 		TenantID: tenantId,
 	})
 	if err != nil {
-		return "", err
+		return "", time.Time{}, err
 	}
-	return token.Token, nil
+	return token.Token, token.ExpiresOn, nil
 }
 
 func providerConfigure(d *schema.ResourceData) (any, error) {
@@ -386,32 +429,47 @@ func providerConfigure(d *schema.ResourceData) (any, error) {
 	port := d.Get("port").(int)
 	username := d.Get("username").(string)
 
+	scheme := d.Get("scheme").(string)
+
 	var password string
+	var authTokens *authTokenSource
 	if d.Get("aws_rds_iam_auth").(bool) {
 		profile := d.Get("aws_rds_iam_profile").(string)
 		region := d.Get("aws_rds_iam_region").(string)
 		role := d.Get("aws_rds_iam_provider_role_arn").(string)
-		var err error
-		password, err = getRDSAuthToken(region, profile, role, username, host, port)
-		if err != nil {
-			return nil, err
-		}
+		authTokens = newAuthTokenSource("AWS RDS IAM", func(ctx context.Context) (string, time.Time, error) {
+			return getRDSAuthToken(ctx, region, profile, role, username, host, port)
+		})
 	} else if d.Get("azure_identity_auth").(bool) {
 		tenantId := d.Get("azure_tenant_id").(string)
 		if tenantId == "" {
 			return nil, fmt.Errorf("postgresql: azure_identity_auth is enabled, azure_tenant_id must be provided also")
 		}
-		var err error
-		password, err = acquireAzureOauthToken(tenantId)
-		if err != nil {
-			return nil, err
-		}
+		authTokens = newAuthTokenSource("Azure AD", func(ctx context.Context) (string, time.Time, error) {
+			return acquireAzureOauthToken(ctx, tenantId)
+		})
 	} else {
 		password = d.Get("password").(string)
 	}
 
+	if authTokens != nil {
+		// Fetch the first token now: bad credentials still fail here, as
+		// before, and the first connection doesn't have to wait for it.
+		token, err := authTokens.Token(context.Background())
+		if err != nil {
+			return nil, err
+		}
+		if scheme != "postgres" {
+			// The gocloud schemes open their connections themselves from the
+			// DSN, so the token can't be refreshed per connection there; keep
+			// passing the first one as the password.
+			password = token
+			authTokens = nil
+		}
+	}
+
 	config := Config{
-		Scheme:                          d.Get("scheme").(string),
+		Scheme:                          scheme,
 		Host:                            host,
 		Port:                            port,
 		Username:                        username,
@@ -425,11 +483,15 @@ func providerConfigure(d *schema.ResourceData) (any, error) {
 		ConnectionRetryTimeoutSeconds:   d.Get("connection_retry_timeout_seconds").(int),
 		MaxConns:                        d.Get("max_connections").(int),
 		MaxIdleConns:                    d.Get("max_idle_connections").(int),
+		MaxTotalConns:                   d.Get("max_total_connections").(int),
 		ConnMaxLifetimeSeconds:          d.Get("conn_max_lifetime_seconds").(int),
 		ExpectedVersion:                 version,
 		SSLRootCertPath:                 d.Get("sslrootcert").(string),
 		GCPIAMImpersonateServiceAccount: d.Get("gcp_iam_impersonate_service_account").(string),
 		BinaryParameters:                d.Get("binary_parameters").(bool),
+		AuthTokens:                      authTokens,
+		CatalogSnapshot:                 d.Get("catalog_snapshot").(bool),
+		CatalogSnapshotTTLSeconds:       d.Get("catalog_snapshot_ttl_seconds").(int),
 	}
 
 	if value, ok := d.GetOk("clientcert"); ok {
@@ -442,11 +504,19 @@ func providerConfigure(d *schema.ResourceData) (any, error) {
 		}
 	}
 
+	if config.MaxTotalConns > 0 && config.Scheme != "postgres" {
+		log.Printf("[WARN] max_total_connections only applies to the postgres scheme; ignoring it for %s", config.Scheme)
+	}
+
 	if config.Scheme == "gcppostgres" {
 		if err := createGoogleCredsFileIfNeeded(); err != nil {
 			return nil, err
 		}
 	}
+
+	// Terraform configures the provider at the start of every command, so a
+	// run never reads a catalog snapshot taken by a previous one.
+	invalidateCatalogSnapshots()
 
 	client := config.NewClient(d.Get("database").(string))
 	return client, nil

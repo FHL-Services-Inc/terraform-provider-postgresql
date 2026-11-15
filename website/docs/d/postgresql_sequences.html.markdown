@@ -9,6 +9,7 @@ description: |-
 # postgresql\_sequences
 
 The ``postgresql_sequences`` data source retrieves a list of sequence names from a specified PostgreSQL database.
+Sequences are read from ``pg_class``, so the list includes identity column sequences and sequences the provider user has no privileges on. Results are ordered by schema and sequence name.
 
 
 ## Usage

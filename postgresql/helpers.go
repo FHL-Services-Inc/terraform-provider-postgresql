@@ -43,6 +43,31 @@ func PGResourceFunc(fn func(*DBConnection, *schema.ResourceData) error) func(*sc
 	}
 }
 
+// PGResourceWriteFunc wraps the Create/Update/Delete function of a resource
+// that writes to the database named by its `database` attribute (the provider
+// database when unset). After fn returns, whatever its outcome, the catalog
+// snapshot of that database is dropped, so no later Read is served privileges
+// from before the write. Resources whose writes touch none of the snapshot's
+// catalogs (publications, subscriptions, replication slots, servers, user
+// mappings, security labels) keep using PGResourceFunc.
+func PGResourceWriteFunc(fn func(*DBConnection, *schema.ResourceData) error) func(*schema.ResourceData, any) error {
+	return func(d *schema.ResourceData, meta any) error {
+		client := meta.(*Client)
+		defer invalidateCatalogSnapshot(client, getDatabase(d, client.databaseName))
+		return PGResourceFunc(fn)(d, meta)
+	}
+}
+
+// PGResourceClusterWriteFunc is PGResourceWriteFunc for resources that write
+// cluster-wide catalogs (roles, memberships, databases): every catalog
+// snapshot is dropped after fn returns.
+func PGResourceClusterWriteFunc(fn func(*DBConnection, *schema.ResourceData) error) func(*schema.ResourceData, any) error {
+	return func(d *schema.ResourceData, meta any) error {
+		defer invalidateCatalogSnapshots()
+		return PGResourceFunc(fn)(d, meta)
+	}
+}
+
 // QueryAble is a DB connection (sql.DB/Tx)
 type QueryAble interface {
 	Exec(query string, args ...any) (sql.Result, error)
@@ -50,27 +75,15 @@ type QueryAble interface {
 	QueryRow(query string, args ...any) *sql.Row
 }
 
-func isMemberOfRole(db QueryAble, role, member string) (bool, error) {
+func isMemberOfRole(db QueryAble, setOption bool, role, member string) (bool, error) {
 	var _rez int
-	setOption := true
-
-	err := db.QueryRow(
-		"SELECT 1 FROM information_schema.columns WHERE table_name='pg_auth_members' AND column_name = 'set_option'",
-	).Scan(&_rez)
-
-	switch {
-	case err == sql.ErrNoRows:
-		setOption = false
-	case err != nil:
-		return false, fmt.Errorf("could not read setOption column: %w", err)
-	}
 
 	query := "SELECT 1 FROM pg_auth_members WHERE pg_get_userbyid(roleid) = $1 AND pg_get_userbyid(member) = $2"
 	if setOption {
 		query += " AND set_option"
 	}
 
-	err = db.QueryRow(query, role, member).Scan(&_rez)
+	err := db.QueryRow(query, role, member).Scan(&_rez)
 	switch {
 	case err == sql.ErrNoRows:
 		return false, nil
@@ -84,12 +97,12 @@ func isMemberOfRole(db QueryAble, role, member string) (bool, error) {
 // grantRoleMembership grants the role *role* to the user *member*.
 // It returns false if the grant is not needed because the user is already
 // a member of this role.
-func grantRoleMembership(db QueryAble, role, member string) (bool, error) {
+func grantRoleMembership(db QueryAble, setOption bool, role, member string) (bool, error) {
 	if member == role {
 		return false, nil
 	}
 
-	isMember, err := isMemberOfRole(db, role, member)
+	isMember, err := isMemberOfRole(db, setOption, role, member)
 	if err != nil {
 		return false, err
 	}
@@ -110,12 +123,12 @@ func grantRoleMembership(db QueryAble, role, member string) (bool, error) {
 
 // revokeRoleMembership revokes the role *role* from the user *member*.
 // It returns false if the revoke is not needed because the user is not a member of this role.
-func revokeRoleMembership(db QueryAble, role, member string) (bool, error) {
+func revokeRoleMembership(db QueryAble, setOption bool, role, member string) (bool, error) {
 	if member == role {
 		return false, nil
 	}
 
-	isMember, err := isMemberOfRole(db, role, member)
+	isMember, err := isMemberOfRole(db, setOption, role, member)
 	if err != nil {
 		return false, err
 	}
@@ -139,27 +152,56 @@ func revokeRoleMembership(db QueryAble, role, member string) (bool, error) {
 // For a non-superuser it takes the membership locks of roles (membershipLocks)
 // and keeps them until txn ends: the caller must commit txn with commitTxn and
 // defer deferredRollback(txn).
-func withRolesGranted(txn *sql.Tx, roles []string, fn func() error) error {
+func withRolesGranted(db *DBConnection, txn *sql.Tx, roles []string, fn func() error) error {
+	return withRolesGrantedOrDirect(db, txn, roles, nil, fn)
+}
+
+// withRolesGrantedOrDirect is withRolesGranted for callers that may not need
+// every membership: when the current user cannot become a member of some
+// roles (on PostgreSQL 16+ granting a role needs ADMIN OPTION on it, and a
+// role that is already a member of the current user, even indirectly, cannot
+// be granted to it), directGrant is asked whether fn can run without them
+// (e.g. the current user holds the privileges WITH GRANT OPTION). directGrant
+// runs after the other memberships have been taken. A nil directGrant, or one
+// that answers false, makes it an error naming the blocked roles.
+func withRolesGrantedOrDirect(db *DBConnection, txn *sql.Tx, roles []string, directGrant func() (bool, error), fn func() error) error {
 	// No roles asked, execute the function directly
 	if len(roles) == 0 {
 		return fn()
 	}
 
-	currentUser, err := getCurrentUser(txn)
+	setOption := db.featureSupported(featureAuthMembersSetOption)
+
+	currentUser, err := db.currentUser(txn)
 	if err != nil {
 		return err
 	}
 
-	// Fetch rolsuper for the current user and all the requested roles in a
-	// single round-trip instead of one query per role.
-	superusers, err := getRolesSuperuser(txn, append([]string{currentUser}, roles...))
+	// The rolsuper of the login role is memoized per pool; when it is not
+	// known yet, fetch it together with the requested roles.
+	superuser, known := db.cachedSuperuser()
+	if known && superuser {
+		log.Printf("withRolesGranted: current user %s is superuser, no need to grant roles", currentUser)
+		return fn()
+	}
+
+	// Fetch rolsuper for the requested roles (and the current user if needed)
+	// in a single round-trip instead of one query per role.
+	lookup := roles
+	if !known {
+		lookup = append([]string{currentUser}, roles...)
+	}
+	superusers, err := getRolesSuperuser(txn, lookup)
 	if err != nil {
 		return err
 	}
 
-	superuser, err := lookupSuperuser(superusers, currentUser)
-	if err != nil {
-		return err
+	if !known {
+		superuser, err = lookupSuperuser(superusers, currentUser)
+		if err != nil {
+			return err
+		}
+		db.storeSuperuser(superuser)
 	}
 	if superuser {
 		log.Printf("withRolesGranted: current user %s is superuser, no need to grant roles", currentUser)
@@ -173,8 +215,14 @@ func withRolesGranted(txn *sql.Tx, roles []string, fn func() error) error {
 		return fmt.Errorf("withRolesGranted: transaction already holds membership locks for other roles than %v", roles)
 	}
 
+	states, err := getRoleMembershipStates(txn, setOption, currentUser, roles)
+	if err != nil {
+		return err
+	}
+
 	var grantedRoles []string
 	var revokedRoles []string
+	var blocked []blockedRole
 
 	for _, role := range roles {
 		// We need to check if the role we want to grant is a superuser
@@ -202,23 +250,67 @@ func withRolesGranted(txn *sql.Tx, roles []string, fn func() error) error {
 		//
 		//  - REVOKE foo FROM postgres
 		//  - GRANT postgres TO foo
+		//
+		// When foo is a member of postgres through another role, or the
+		// membership cannot be granted (PostgreSQL 16+ needs ADMIN OPTION on
+		// foo), foo is blocked and directGrant decides.
+		state := states[role]
+		switch state.action() {
+		case membershipSkip:
+			log.Printf("withRolesGranted: %s can already act as %s, nothing to grant", currentUser, role)
+			continue
 
-		// Check the opposite relation and revoke currentUser from role if needed
-		revoked, err := revokeRoleMembership(txn, currentUser, role)
-		if err != nil {
-			return err
+		case membershipBlocked:
+			reason := fmt.Sprintf("%s is a member of %s", pq.QuoteIdentifier(role), pq.QuoteIdentifier(currentUser))
+			chain, err := membershipChain(txn, role, currentUser)
+			if err != nil {
+				return err
+			}
+			if len(chain) > 0 {
+				reason += " through " + strings.Join(chain, " -> ")
+			}
+			reason += ", and PostgreSQL does not allow circular memberships"
+			blocked = append(blocked, blockedRole{role: role, reason: reason, circular: true})
+			continue
+
+		case membershipTryGrant:
+			grantErr, err := tryTakeMembership(txn, currentUser, role, state.reverseDirect)
+			if err != nil {
+				return err
+			}
+			if grantErr != nil {
+				log.Printf("withRolesGranted: could not grant %s to %s: %v", role, currentUser, grantErr)
+				blocked = append(blocked, blockedRole{
+					role:   role,
+					reason: fmt.Sprintf("granting %s to it failed: %v", pq.QuoteIdentifier(role), grantErr),
+				})
+				continue
+			}
+
+		case membershipGrant:
+			if err := takeMembership(txn, currentUser, role, state.reverseDirect); err != nil {
+				return err
+			}
 		}
-		if revoked {
+
+		if state.reverseDirect {
 			revokedRoles = append(revokedRoles, role)
 		}
+		grantedRoles = append(grantedRoles, role)
+	}
 
-		// Grant the role to currentUser if needed
-		roleGranted, err := grantRoleMembership(txn, role, currentUser)
-		if err != nil {
-			return err
+	if len(blocked) > 0 {
+		ok := false
+		if directGrant != nil {
+			if ok, err = directGrant(); err != nil {
+				return err
+			}
 		}
-		if roleGranted {
-			grantedRoles = append(grantedRoles, role)
+		if !ok {
+			return blockedRolesError(currentUser, blocked, directGrant != nil)
+		}
+		for _, b := range blocked {
+			log.Printf("withRolesGranted: %s is not a member of %s but holds the privileges WITH GRANT OPTION, granting them directly", currentUser, b.role)
 		}
 	}
 
@@ -229,7 +321,7 @@ func withRolesGranted(txn *sql.Tx, roles []string, fn func() error) error {
 
 	// Revoke the temporary granted roles.
 	for _, role := range grantedRoles {
-		if _, err := revokeRoleMembership(txn, role, currentUser); err != nil {
+		if _, err := revokeRoleMembership(txn, setOption, role, currentUser); err != nil {
 			return err
 		}
 	}
@@ -244,7 +336,7 @@ func withRolesGranted(txn *sql.Tx, roles []string, fn func() error) error {
 		if !exists {
 			continue
 		}
-		if _, err := grantRoleMembership(txn, currentUser, role); err != nil {
+		if _, err := grantRoleMembership(txn, setOption, currentUser, role); err != nil {
 			return err
 		}
 	}
@@ -360,15 +452,14 @@ func quoteIdentifyIdent(ident string) string {
 	// https://en.wikipedia.org/wiki/Function_overloading
 	// https://stackoverflow.com/a/48640797
 
-	s := strings.Split(ident, "(")
-
-	functionArgTypes := ""
-
-	if len(s) > 1 {
-		functionArgTypes = "(" + s[1]
+	// Split on the first "(" only: the argument list may itself contain
+	// parentheses (e.g. "f(numeric(10,2))").
+	name, args, hasArgs := strings.Cut(ident, "(")
+	if !hasArgs {
+		return pq.QuoteIdentifier(name)
 	}
 
-	return fmt.Sprintf("%s%s", pq.QuoteIdentifier(s[0]), functionArgTypes)
+	return pq.QuoteIdentifier(name) + "(" + args
 }
 
 func setToPgIdentList(schema string, idents *schema.Set) string {
@@ -723,7 +814,10 @@ func roleOIDAndExists(db QueryAble, role string) (uint32, bool, error) {
 	return oid, true, nil
 }
 
-// Lock a role and all his members to avoid concurrent updates on some resources
+// pgLockRole locks a role and all its members, for the paths that change role
+// memberships (dropping or altering a role). Grant and default privileges
+// writes change ACLs, not memberships: they lock the role alone, then the
+// objects they change (pgLockGranteeAndObjects, grant_locks.go).
 func pgLockRole(txn *sql.Tx, role string) error {
 	// Disable statement timeout for this connection otherwise the lock could fail
 	if _, err := txn.Exec("SET statement_timeout = 0"); err != nil {
@@ -850,23 +944,10 @@ func discardConn(conn *sql.Conn) {
 // revokeRoleMembershipDeferred revokes a membership granted for the duration
 // of an operation, to be deferred. A failure is logged and does not fail the
 // operation.
-func revokeRoleMembershipDeferred(db QueryAble, role, member string) {
-	if _, err := revokeRoleMembership(db, role, member); err != nil {
+func revokeRoleMembershipDeferred(db QueryAble, setOption bool, role, member string) {
+	if _, err := revokeRoleMembership(db, setOption, role, member); err != nil {
 		log.Printf("[ERR] could not revoke role %s from %s: %v", role, member, err)
 	}
-}
-
-// Lock a database and all his members to avoid concurrent updates on some resources
-func pgLockDatabase(txn *sql.Tx, database string) error {
-	// Disable statement timeout for this connection otherwise the lock could fail
-	if _, err := txn.Exec("SET statement_timeout = 0"); err != nil {
-		return fmt.Errorf("could not disable statement_timeout: %w", err)
-	}
-	if _, err := txn.Exec("SELECT pg_advisory_xact_lock(oid::bigint) FROM pg_database WHERE datname = $1", database); err != nil {
-		return fmt.Errorf("could not get advisory lock for database %s: %w", database, err)
-	}
-
-	return nil
 }
 
 func arrayDifference(a, b []any) (diff []any) {

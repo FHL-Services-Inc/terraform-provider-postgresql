@@ -59,8 +59,8 @@ func (k *keyedMutex) lock(keys ...string) (unlock func()) {
 // membership changes withRolesGranted makes, per role name.
 //
 // pg_auth_members is a cluster-wide catalog, while the advisory locks taken
-// before withRolesGranted (pgLockRole, pgLockDatabase) only exist in the
-// database of the resource. Two resources in different databases with the
+// before withRolesGranted (pgLockRole, pgLockGranteeAndObjects) only exist in
+// the database of the resource. Two resources in different databases with the
 // same owner therefore both revoke, grant and restore the same membership rows
 // at the same time; when one of them revokes a row the other one deleted and
 // re-created in a transaction that is not committed yet, PostgreSQL (up to 15)
@@ -68,9 +68,9 @@ func (k *keyedMutex) lock(keys ...string) (unlock func()) {
 //
 // Invariants:
 //   - advisory locks are taken before these mutexes, never while holding one:
-//     every caller takes its pgLockRole/pgLockDatabase before withRolesGranted,
-//     and nothing between withRolesGranted and the end of its transaction takes
-//     an advisory lock or calls withRolesGranted again;
+//     every caller takes its pgLockRole/pgLockGranteeAndObjects before
+//     withRolesGranted, and nothing between withRolesGranted and the end of
+//     its transaction takes an advisory lock or calls withRolesGranted again;
 //   - the mutexes are held from before the first membership change until the
 //     transaction that made the changes commits or rolls back (commitTxn,
 //     deferredRollback), so anything waiting on those rows in PostgreSQL is a
@@ -79,7 +79,54 @@ func (k *keyedMutex) lock(keys ...string) (unlock func()) {
 // PostgreSQL already serializes these transactions on the unique index of
 // pg_auth_members (the second GRANT of the same membership waits for the first
 // transaction to end), so holding the mutexes costs no parallelism.
+//
+// The postgresql_database operations (createDatabase, resourcePostgreSQLDatabaseDelete,
+// setDBOwner, setAlterOwnership) take the same mutexes, for the roles they
+// grant to the provider user in autocommit, from before the GRANT until after
+// the REVOKE (lockDatabaseMemberships). Without that, withRolesGranted could
+// see such a membership, skip its own GRANT and run its statements after the
+// REVOKE, where GRANT/REVOKE on an object only emit a WARNING ("no privileges
+// were granted"); or grant it itself and then revoke the other one's
+// membership (#152). Their rules:
+//   - the role lock (lockRoleConn) and every connection they need are taken
+//     before the mutexes; nothing waits for a pool connection while holding
+//     one, so a transaction that waits for the mutex while holding the last
+//     connection of its pool cannot block the holder;
+//   - a transaction waiting for the mutexes holds nothing the holder can wait
+//     for in PostgreSQL other than advisory locks, which the database
+//     operations do not take under the mutex. Callers of withRolesGranted that
+//     run DDL before it (resourcePostgreSQLSchemaUpdate) take the mutexes
+//     first with lockMembershipsForTxn.
+//
+// The paths added since keep these rules:
+//   - withRolesGrantedOrDirect takes the mutexes before it reads the
+//     membership states, so a membership another operation granted in
+//     autocommit is never seen as "already a member". Everything it runs
+//     under them (the savepointed GRANT, the circular-chain lookup, the
+//     directGrant check of postgresql_grant) uses the caller's transaction:
+//     no new connection, no advisory lock;
+//   - postgresql_role Delete runs REASSIGN/DROP OWNED in one transaction per
+//     database, each one opened on its pool and holding pgLockRole before
+//     withRolesGranted, and committed before the next database starts; the
+//     transaction in the provider's database is only opened after them;
+//   - with max_total_connections the connections of every pool share one
+//     budget, so "no pool connection is awaited under a mutex" now means no
+//     new connection at all. None of the paths above dials under a mutex.
+//
+// Limit: the mutexes are keyed by the roles the caller names. A membership
+// the provider user inherits through another role (pg_has_role) is not
+// serialized when that other role is the one a postgresql_database operation
+// grants.
 var membershipLocks = newKeyedMutex()
+
+// lockDatabaseMemberships takes the membership locks of roles for a
+// postgresql_database operation that grants them to the provider user outside
+// of a transaction, and returns the function that releases them. The caller
+// must already hold every connection it needs (see membershipLocks) and
+// release the locks only after it has revoked the memberships again.
+func lockDatabaseMemberships(roles ...string) (unlock func()) {
+	return membershipLocks.lock(slices.DeleteFunc(slices.Clone(roles), func(r string) bool { return r == "" })...)
+}
 
 // txnMembershipUnlocks holds the release function of the membership locks
 // taken on a transaction (*sql.Tx), until the transaction ends.

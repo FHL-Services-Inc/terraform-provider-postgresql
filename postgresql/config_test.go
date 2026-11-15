@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"database/sql/driver"
 	"errors"
+	"net/url"
 	"reflect"
 	"sort"
 	"strings"
@@ -76,6 +77,23 @@ func TestConfigConnStr(t *testing.T) {
 			t.Errorf("Config.connStr(%+v) returned %#v, want %#v", test.input, connParams, test.wantDbParams)
 		}
 
+	}
+}
+
+// TestConfigConnStrIsStable pins that connStr returns the same string on
+// every call: it is the key of dbRegistry and of the catalog snapshots, and
+// the connection parameters come from a map.
+func TestConfigConnStrIsStable(t *testing.T) {
+	config := &Config{
+		Scheme: "postgres", Host: "localhost", Port: 5432, Username: "u", Password: "p",
+		SSLMode: "require", ConnectTimeoutSec: 10, SSLRootCertPath: "/root.pem",
+		ExpectedVersion: semver.MustParse("9.0.0"), ApplicationName: "Terraform provider",
+	}
+	want := config.connStr("db")
+	for i := 0; i < 100; i++ {
+		if got := config.connStr("db"); got != want {
+			t.Fatalf("connStr differs between calls:\n%s\n%s", want, got)
+		}
 	}
 }
 
@@ -256,5 +274,170 @@ func TestConfigEvictDBConnection(t *testing.T) {
 	}
 	if !inRegistry(dsn) {
 		t.Error("evictDBConnection() removed a pool without idle connections")
+	}
+}
+
+// TestConfigConnStrUserinfo pins that the username and password survive the
+// round trip through the DSN, including characters with a meaning in URL
+// userinfo such as ':' in an AWS-style role session name (#129).
+func TestConfigConnStrUserinfo(t *testing.T) {
+	tests := []struct {
+		username string
+		password string
+	}{
+		{"postgres_user", "postgres_password"},
+		{"AROA123:me", "p387"},
+		{"user@example.com", "pa:ss@w/rd?#% x"},
+		{"spaced user", ""},
+	}
+
+	for _, test := range tests {
+		c := &Config{Scheme: "postgres", Host: "localhost", Port: 5432, Username: test.username, Password: test.password, SSLMode: "disable"}
+		dsn := c.connStr("postgres")
+		u, err := url.Parse(dsn)
+		if err != nil {
+			t.Fatalf("connStr() for user %q returned an unparsable DSN: %v", test.username, err)
+		}
+		if got := u.User.Username(); got != test.username {
+			t.Errorf("username: got %q, want %q", got, test.username)
+		}
+		if got, _ := u.User.Password(); got != test.password {
+			t.Errorf("password for user %q: got %q, want %q", test.username, got, test.password)
+		}
+		if u.Host != "localhost:5432" {
+			t.Errorf("host for user %q: got %q, want %q", test.username, u.Host, "localhost:5432")
+		}
+	}
+}
+
+// TestConfigConnStrHost pins that IPv6 literals are bracketed in the DSN
+// (#130), with or without brackets in the provider host, while host names,
+// IPv4 addresses and GCP instance names keep their form.
+func TestConfigConnStrHost(t *testing.T) {
+	tests := []struct {
+		scheme string
+		host   string
+		want   string
+	}{
+		{"postgres", "localhost", "localhost:5432"},
+		{"postgres", "127.0.0.1", "127.0.0.1:5432"},
+		{"postgres", "::1", "[::1]:5432"},
+		{"postgres", "[::1]", "[::1]:5432"},
+		{"postgres", "2001:db8::10", "[2001:db8::10]:5432"},
+		{"awspostgres", "fd00::5", "[fd00::5]:5432"},
+		{"gcppostgres", "project:region:instance", "project/region/instance:5432"},
+		{"gcppostgres", "project/region/instance", "project/region/instance:5432"},
+	}
+
+	for _, test := range tests {
+		c := &Config{Scheme: test.scheme, Host: test.host, Port: 5432, Username: "u", Password: "p"}
+		dsn := c.connStr("postgres")
+		prefix := test.scheme + "://u:p@"
+		if !strings.HasPrefix(dsn, prefix) {
+			t.Fatalf("connStr() = %q, want prefix %q", dsn, prefix)
+		}
+		hostPort := strings.TrimPrefix(dsn, prefix)
+		hostPort = hostPort[:strings.LastIndex(strings.SplitN(hostPort, "?", 2)[0], "/postgres")]
+		if hostPort != test.want {
+			t.Errorf("%s host %q: got %q, want %q", test.scheme, test.host, hostPort, test.want)
+		}
+		if test.scheme != "gcppostgres" {
+			u, err := url.Parse(dsn)
+			if err != nil {
+				t.Fatalf("connStr() for host %q returned an unparsable DSN: %v", test.host, err)
+			}
+			if u.Port() != "5432" {
+				t.Errorf("port for host %q: got %q, want 5432", test.host, u.Port())
+			}
+		}
+	}
+}
+
+// TestConnectWithRetryRedactsEscapedPassword pins that a connection error
+// echoing the DSN does not leak the password in any of its escaped forms
+// (#135). The invalid host makes the driver fail to parse the DSN, and the
+// parse error quotes the whole URL.
+func TestConnectWithRetryRedactsEscapedPassword(t *testing.T) {
+	for _, password := range []string{"s3cr3t/pa ss%x", "a:b@c?d#e+f&g=h;i,j", "plain"} {
+		c := &Client{config: Config{
+			Scheme:                        "postgres",
+			Host:                          "bad host",
+			Port:                          5432,
+			Username:                      "u428",
+			Password:                      password,
+			SSLMode:                       "disable",
+			ConnectionRetryTimeoutSeconds: 5,
+		}}
+		_, err := c.connectWithRetry(context.Background(), "postgres", c.config.connStr("postgres"))
+		if err == nil {
+			t.Fatalf("connectWithRetry() with an invalid host expected an error, got nil")
+		}
+		msg := err.Error()
+		for _, form := range []string{
+			password,
+			url.PathEscape(password),
+			url.QueryEscape(password),
+			strings.TrimPrefix(url.UserPassword("", password).String(), ":"),
+		} {
+			if strings.Contains(msg, form) {
+				t.Errorf("connection error leaks password form %q: %s", form, msg)
+			}
+		}
+		if !strings.Contains(msg, "XXXX") {
+			t.Errorf("connection error has no redaction marker, the test does not exercise the DSN echo: %s", msg)
+		}
+	}
+}
+
+// TestParseServerVersionNum pins the conversion of server_version_num to a
+// semver version. The fingerprint no longer parses SELECT VERSION(), whose
+// text carries vendor suffixes such as "13.23-rds.20250508" on RDS Extended
+// Support that semver rejects (#140); server_version_num is a plain integer
+// on PostgreSQL, RDS, Aurora and the other managed services alike.
+func TestParseServerVersionNum(t *testing.T) {
+	tests := []struct {
+		input   string
+		want    string
+		wantErr bool
+	}{
+		// PostgreSQL 10+: major * 10000 + minor.
+		{"170006", "17.6.0", false},
+		{"180000", "18.0.0", false},
+		{"160011", "16.11.0", false},
+		{"100023", "10.23.0", false},
+		// RDS Extended Support "PostgreSQL 13.23-rds.20250508 on aarch64-unknown-linux-gnu, ...".
+		{"130023", "13.23.0", false},
+		// RDS Extended Support "PostgreSQL 12.22-rds.20250220 on x86_64-pc-linux-gnu, ...".
+		{"120022", "12.22.0", false},
+		// Aurora PostgreSQL 17.11: "PostgreSQL 17.11 on aarch64-linux, compiled by gcc-10.5.0, 64-bit".
+		{"170011", "17.11.0", false},
+		// Aurora PostgreSQL 16.6.
+		{"160006", "16.6.0", false},
+		// Before 10: major * 10000 + minor * 100 + patch.
+		{"90621", "9.6.21", false},
+		{"90224", "9.2.24", false},
+		{" 170006\n", "17.6.0", false},
+		{"", "", true},
+		{"17.6", "", true},
+		{"13.23-rds.20250508", "", true},
+		{"-170006", "", true},
+		{"0", "", true},
+	}
+
+	for _, test := range tests {
+		got, err := parseServerVersionNum(test.input)
+		if test.wantErr {
+			if err == nil {
+				t.Errorf("parseServerVersionNum(%q) = %v, want an error", test.input, got)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("parseServerVersionNum(%q) returned unexpected error: %v", test.input, err)
+			continue
+		}
+		if got.String() != test.want {
+			t.Errorf("parseServerVersionNum(%q) = %v, want %v", test.input, got, test.want)
+		}
 	}
 }

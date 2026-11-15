@@ -2,7 +2,9 @@ package postgresql
 
 import (
 	"bytes"
+	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"log"
 	"strings"
@@ -24,7 +26,7 @@ func resourcePostgreSQLUserMapping() *schema.Resource {
 		Update: PGResourceFunc(resourcePostgreSQLUserMappingUpdate),
 		Delete: PGResourceFunc(resourcePostgreSQLUserMappingDelete),
 		Importer: &schema.ResourceImporter{
-			StateContext: schema.ImportStatePassthroughContext,
+			StateContext: resourcePostgreSQLUserMappingImport,
 		},
 
 		Schema: map[string]*schema.Schema{
@@ -32,7 +34,7 @@ func resourcePostgreSQLUserMapping() *schema.Resource {
 				Type:        schema.TypeString,
 				Required:    true,
 				ForceNew:    true,
-				Description: "The name of an existing user that is mapped to foreign server. CURRENT_ROLE, CURRENT_USER, and USER match the name of the current user. When PUBLIC is specified, a so-called public mapping is created that is used when no user-specific mapping is applicable",
+				Description: "The name of an existing user that is mapped to foreign server. CURRENT_ROLE, CURRENT_USER, and USER (in upper case) match the role the provider connects as. When PUBLIC is specified (in any case), a so-called public mapping is created that is used when no user-specific mapping is applicable",
 			},
 			userMappingServerNameAttr: {
 				Type:        schema.TypeString,
@@ -64,7 +66,7 @@ func resourcePostgreSQLUserMappingCreate(db *DBConnection, d *schema.ResourceDat
 	serverName := d.Get(userMappingServerNameAttr).(string)
 
 	b := bytes.NewBufferString("CREATE USER MAPPING ")
-	fmt.Fprint(b, " FOR ", pq.QuoteIdentifier(username))
+	fmt.Fprint(b, " FOR ", userMappingUserSQL(username))
 	fmt.Fprint(b, " SERVER ", pq.QuoteIdentifier(serverName))
 
 	if options, ok := d.GetOk(userMappingOptionsAttr); ok {
@@ -105,17 +107,37 @@ func resourcePostgreSQLUserMappingReadImpl(db *DBConnection, d *schema.ResourceD
 	username := d.Get(userMappingUserNameAttr).(string)
 	serverName := d.Get(userMappingServerNameAttr).(string)
 
+	// A PUBLIC mapping has umuser = 0. The views spell its user differently
+	// ('PUBLIC' in information_schema._pg_user_mappings, 'public' in
+	// pg_user_mappings) and a real role may be named "PUBLIC", so match it on
+	// umuser instead of the name.
+	userFilter := "umuser <> 0 AND authorization_identifier = $2"
+	fallbackFilter := "umuser <> 0 AND usename = $2"
+	args := []any{serverName, username}
+	switch {
+	case isPublicUserMapping(username):
+		userFilter = "umuser = 0"
+		fallbackFilter = userFilter
+		args = args[:1]
+	case isCurrentUserMapping(username):
+		// The keyword is kept in state as written; resolve it to the role
+		// the provider connects as.
+		userFilter = "umuser = (SELECT oid FROM pg_catalog.pg_roles WHERE rolname = current_user)"
+		fallbackFilter = userFilter
+		args = args[:1]
+	}
+
 	var userMappingOptions []string
-	query := "SELECT umoptions FROM information_schema._pg_user_mappings WHERE authorization_identifier = $1 and foreign_server_name = $2"
-	err := db.QueryRow(query, username, serverName).Scan(pq.Array(&userMappingOptions))
+	query := "SELECT umoptions FROM information_schema._pg_user_mappings WHERE foreign_server_name = $1 AND " + userFilter
+	err := db.QueryRow(query, args...).Scan(pq.Array(&userMappingOptions))
 
 	// pg_user_mappings shows umoptions only to the mapped role itself or to a
 	// superuser; anyone else gets NULL, even the owner of the server.
 	optionsMasked := false
 	if err != sql.ErrNoRows && err != nil {
 		// Fallback to pg_user_mappings table if information_schema._pg_user_mappings is not available
-		query := "SELECT umoptions FROM pg_user_mappings WHERE usename = $1 and srvname = $2"
-		err = db.QueryRow(query, username, serverName).Scan(pq.Array(&userMappingOptions))
+		query := "SELECT umoptions FROM pg_user_mappings WHERE srvname = $1 AND " + fallbackFilter
+		err = db.QueryRow(query, args...).Scan(pq.Array(&userMappingOptions))
 		optionsMasked = err == nil && userMappingOptions == nil
 	}
 
@@ -165,7 +187,7 @@ func resourcePostgreSQLUserMappingDelete(db *DBConnection, d *schema.ResourceDat
 	}
 	defer deferredRollback(txn)
 
-	sql := fmt.Sprintf("DROP USER MAPPING FOR %s SERVER %s ", pq.QuoteIdentifier(username), pq.QuoteIdentifier(serverName))
+	sql := fmt.Sprintf("DROP USER MAPPING FOR %s SERVER %s ", userMappingUserSQL(username), pq.QuoteIdentifier(serverName))
 	if _, err := txn.Exec(sql); err != nil {
 		return err
 	}
@@ -203,7 +225,7 @@ func setUserMappingOptionsIfChanged(db *DBConnection, d *schema.ResourceData) er
 	serverName := d.Get(userMappingServerNameAttr).(string)
 
 	b := bytes.NewBufferString("ALTER USER MAPPING ")
-	fmt.Fprintf(b, " FOR %s SERVER %s ", pq.QuoteIdentifier(username), pq.QuoteIdentifier(serverName))
+	fmt.Fprintf(b, " FOR %s SERVER %s ", userMappingUserSQL(username), pq.QuoteIdentifier(serverName))
 
 	oldOptions, newOptions := d.GetChange(userMappingOptionsAttr)
 	fmt.Fprint(b, " OPTIONS ( ")
@@ -245,4 +267,162 @@ func generateUserMappingID(d *schema.ResourceData) string {
 		d.Get(userMappingUserNameAttr).(string),
 		d.Get(userMappingServerNameAttr).(string),
 	}, ".")
+}
+
+// isPublicUserMapping reports whether username means the PUBLIC pseudo-role,
+// like the unquoted keyword PUBLIC in SQL (any case).
+func isPublicUserMapping(username string) bool {
+	return strings.EqualFold(username, "public")
+}
+
+// isCurrentUserMapping reports whether username is one of the keywords that
+// CREATE USER MAPPING accepts for the current user. Only the upper case
+// spelling the documentation uses is a keyword: unlike PUBLIC, a role named
+// "user" is plausible, and it keeps working as a role name.
+func isCurrentUserMapping(username string) bool {
+	switch username {
+	case "CURRENT_USER", "CURRENT_ROLE", "USER":
+		return true
+	}
+	return false
+}
+
+// userMappingUserSQL renders username for CREATE/ALTER/DROP USER MAPPING FOR.
+// PUBLIC and the current user keywords must stay unquoted: "PUBLIC" (quoted)
+// would name a regular role. CURRENT_ROLE and USER are written as
+// CURRENT_USER, which means the same and which PostgreSQL 12 and 13 accept
+// there too (CURRENT_ROLE is only accepted since 14).
+func userMappingUserSQL(username string) string {
+	switch {
+	case isPublicUserMapping(username):
+		return "PUBLIC"
+	case isCurrentUserMapping(username):
+		return "CURRENT_USER"
+	}
+	return pq.QuoteIdentifier(username)
+}
+
+// userMappingImportFormat describes the import ID, which is the resource ID.
+const userMappingImportFormat = "<user_name>.<server_name>"
+
+// userMappingCatalogEntry is a user mapping as pg_user_mappings shows it.
+type userMappingCatalogEntry struct {
+	public       bool // umuser = 0
+	current      bool // umuser is the role the provider connects as
+	user, server string
+}
+
+// userMappingLookup returns the user mappings of the given servers.
+type userMappingLookup func(servers []string) ([]userMappingCatalogEntry, error)
+
+// parseUserMappingImportID splits an import ID "<user_name>.<server_name>"
+// into its parts. Role and server names may contain dots, so the ID is split
+// at every dot and the split that names an existing user mapping wins; an ID
+// that matches no mapping, or more than one, is rejected. user_name keeps the
+// spelling of the ID, so "public" and "PUBLIC" both import the PUBLIC mapping
+// as written in the configuration, and CURRENT_USER, CURRENT_ROLE and USER
+// import the mapping of the role the provider connects as.
+func parseUserMappingImportID(id string, lookup userMappingLookup) (string, string, error) {
+	fail := func(err error) (string, string, error) {
+		return "", "", importParseError("postgresql_user_mapping", id, userMappingImportFormat, err)
+	}
+
+	type split struct{ user, server string }
+	var splits []split
+	var servers []string
+	for i := range len(id) {
+		if id[i] == '.' {
+			splits = append(splits, split{user: id[:i], server: id[i+1:]})
+			servers = append(servers, id[i+1:])
+		}
+	}
+	if len(splits) == 0 {
+		return fail(errors.New("no user mapping matches the ID"))
+	}
+
+	mappings, err := lookup(servers)
+	if err != nil {
+		return fail(fmt.Errorf("could not look up user mappings: %w", err))
+	}
+
+	var candidates []split
+	var descr []string
+	for _, s := range splits {
+		for _, m := range mappings {
+			if m.server != s.server {
+				continue
+			}
+			if userMappingMatches(s.user, m) {
+				candidates = append(candidates, s)
+				descr = append(descr, fmt.Sprintf("user_name=%s server_name=%s", s.user, s.server))
+				break
+			}
+		}
+	}
+
+	switch len(candidates) {
+	case 1:
+		return candidates[0].user, candidates[0].server, nil
+	case 0:
+		return fail(errors.New("no user mapping matches the ID"))
+	default:
+		return fail(ambiguousImportError(descr))
+	}
+}
+
+// userMappingMatches reports whether user_name username refers to mapping m.
+func userMappingMatches(username string, m userMappingCatalogEntry) bool {
+	switch {
+	case isPublicUserMapping(username):
+		return m.public
+	case isCurrentUserMapping(username):
+		return m.current
+	}
+	return !m.public && m.user == username
+}
+
+// lookupUserMappings reads the user mappings of servers from
+// pg_user_mappings, which every role can read (only the options are masked).
+func lookupUserMappings(db QueryAble) userMappingLookup {
+	return func(servers []string) ([]userMappingCatalogEntry, error) {
+		rows, err := db.Query(
+			"SELECT umuser = 0, umuser = (SELECT oid FROM pg_catalog.pg_roles WHERE rolname = current_user), usename, srvname "+
+				"FROM pg_catalog.pg_user_mappings WHERE srvname = ANY($1)",
+			pq.Array(servers),
+		)
+		if err != nil {
+			return nil, err
+		}
+		defer closeRows(rows)
+
+		var out []userMappingCatalogEntry
+		for rows.Next() {
+			var m userMappingCatalogEntry
+			if err := rows.Scan(&m.public, &m.current, &m.user, &m.server); err != nil {
+				return nil, err
+			}
+			out = append(out, m)
+		}
+		return out, rows.Err()
+	}
+}
+
+func resourcePostgreSQLUserMappingImport(ctx context.Context, d *schema.ResourceData, meta any) ([]*schema.ResourceData, error) {
+	db, err := meta.(*Client).Connect()
+	if err != nil {
+		return nil, err
+	}
+
+	username, serverName, err := parseUserMappingImportID(d.Id(), lookupUserMappings(db))
+	if err != nil {
+		return nil, err
+	}
+	if err := d.Set(userMappingUserNameAttr, username); err != nil {
+		return nil, fmt.Errorf("could not set %s: %w", userMappingUserNameAttr, err)
+	}
+	if err := d.Set(userMappingServerNameAttr, serverName); err != nil {
+		return nil, fmt.Errorf("could not set %s: %w", userMappingServerNameAttr, err)
+	}
+
+	return []*schema.ResourceData{d}, nil
 }

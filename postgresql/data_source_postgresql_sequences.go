@@ -9,10 +9,24 @@ import (
 )
 
 const (
+	// sequenceQuery lists sequences from pg_class/pg_sequence with the same
+	// columns as information_schema.sequences, which leaves out identity
+	// column sequences and sequences the current user has no privileges on.
+	// It is a subquery so the filters below can use the column names.
 	sequenceQuery = `
 	SELECT sequence_name, sequence_schema, data_type
-	FROM information_schema.sequences
+	FROM (
+		SELECT c.relname AS sequence_name,
+			n.nspname AS sequence_schema,
+			format_type(s.seqtypid, NULL) AS data_type
+		FROM pg_catalog.pg_class c
+		JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+		JOIN pg_catalog.pg_sequence s ON s.seqrelid = c.oid
+		WHERE c.relkind = 'S'
+			AND NOT pg_is_other_temp_schema(n.oid)
+	) AS sequences
 	`
+	sequenceQueryOrder            = "ORDER BY sequence_schema, sequence_name"
 	sequencePatternMatchingTarget = "sequence_name"
 	sequenceSchemaKeyword         = "sequence_schema"
 )
@@ -97,6 +111,7 @@ func dataSourcePostgreSQLSequencesRead(db *DBConnection, d *schema.ResourceData)
 	queryConcatKeyword := queryConcatKeywordWhere
 
 	query, args := applySequenceDataSourceQueryFilters(query, queryConcatKeyword, d)
+	query += " " + sequenceQueryOrder
 
 	rows, err := dbc.Query(query, args...)
 	if err != nil {

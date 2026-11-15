@@ -321,7 +321,13 @@ func resourcePostgreSQLGrantImport(ctx context.Context, d *schema.ResourceData, 
 // several objects). Read does not refresh with_grant_option, and it forces a
 // replacement, so it has to be right after import.
 func readImportedGrantOption(db *DBConnection, g grantImportID) (bool, error) {
-	conn, err := initConnection(db.client, g.database)
+	// Database grants are read on the maintenance database, like their Read
+	// (see grantConnDatabase).
+	connDatabase := g.database
+	if g.objectType == "database" {
+		connDatabase = ""
+	}
+	conn, err := initConnection(db.client, connDatabase)
 	if err != nil {
 		return false, err
 	}

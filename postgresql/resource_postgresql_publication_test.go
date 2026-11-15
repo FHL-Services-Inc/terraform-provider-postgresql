@@ -92,17 +92,18 @@ func TestAccPostgresqlPublication_Database(t *testing.T) {
 	defer teardown()
 
 	dbName, _ := getTestDBNames(dbSuffix)
+	ownerName := testUniqueName("test")
 
 	testAccPostgresqlPublicationDatabaseConfig := fmt.Sprintf(`
 	resource "postgresql_role" "test" {
-		name = "test"
+		name = "%s"
 	}
 	resource "postgresql_publication" "test" {
 		name     = "publication"
 		database = "%s"
 		owner = postgresql_role.test.name
 	}
-	`, dbName)
+	`, ownerName, dbName)
 
 	resource.Test(t, resource.TestCase{
 		PreCheck: func() {
@@ -120,7 +121,7 @@ func TestAccPostgresqlPublication_Database(t *testing.T) {
 					resource.TestCheckResourceAttr(
 						"postgresql_publication.test", "name", "publication"),
 					resource.TestCheckResourceAttr(
-						"postgresql_publication.test", "owner", "test"),
+						"postgresql_publication.test", "owner", ownerName),
 					resource.TestCheckResourceAttr(
 						"postgresql_publication.test", "database", dbName),
 				),
@@ -356,7 +357,7 @@ func TestAccPostgresqlPublication_UpdateOwner(t *testing.T) {
 	defer teardown()
 
 	dbName, _ := getTestDBNames(dbSuffix)
-	testOwner := "test_owner"
+	testOwner := testUniqueName("test_owner")
 
 	testAccPostgresqlPublicationBaseConfig := fmt.Sprintf(`
 	resource "postgresql_publication" "test" {
@@ -505,9 +506,10 @@ func TestAccPostgresqlPublication_Basic(t *testing.T) {
 	createTestTables(t, dbSuffix, testTables, "")
 
 	dbName, _ := getTestDBNames(dbSuffix)
+	ownerName := testUniqueName("test_owner")
 	testAccPostgresqlPublicationBasicConfig := fmt.Sprintf(`
 resource "postgresql_role" "test_owner" {
-	name = "test_owner"
+	name = "%s"
 	login = true
 }
 
@@ -517,7 +519,7 @@ resource "postgresql_publication" "test" {
 	owner = "${postgresql_role.test_owner.name}"
 	all_tables = true
 }
-`, dbName)
+`, ownerName, dbName)
 
 	resource.Test(t, resource.TestCase{
 		PreCheck: func() {
@@ -540,7 +542,7 @@ resource "postgresql_publication" "test" {
 					resource.TestCheckResourceAttr(
 						"postgresql_publication.test", pubAllTablesAttr, "true"),
 					resource.TestCheckResourceAttr(
-						"postgresql_publication.test", pubOwnerAttr, "test_owner"),
+						"postgresql_publication.test", pubOwnerAttr, ownerName),
 					resource.TestCheckResourceAttr(
 						"postgresql_publication.test", fmt.Sprintf("%s.#", pubTablesAttr), "3"),
 					resource.TestCheckResourceAttr(
@@ -574,9 +576,10 @@ func TestAccPostgresqlPublication_BasicWithoutTruncate(t *testing.T) {
 	createTestTables(t, dbSuffix, testTables, "")
 
 	dbName, _ := getTestDBNames(dbSuffix)
+	ownerName := testUniqueName("test_owner")
 	testAccPostgresqlPublicationBasicConfig := fmt.Sprintf(`
 resource "postgresql_role" "test_owner" {
-	name = "test_owner"
+	name = "%s"
 	login = true
 }
 
@@ -586,7 +589,7 @@ resource "postgresql_publication" "test" {
 	owner = "${postgresql_role.test_owner.name}"
 	all_tables = true
 }
-`, dbName)
+`, ownerName, dbName)
 
 	resource.Test(t, resource.TestCase{
 		PreCheck: func() {
@@ -609,7 +612,7 @@ resource "postgresql_publication" "test" {
 					resource.TestCheckResourceAttr(
 						"postgresql_publication.test", pubAllTablesAttr, "true"),
 					resource.TestCheckResourceAttr(
-						"postgresql_publication.test", pubOwnerAttr, "test_owner"),
+						"postgresql_publication.test", pubOwnerAttr, ownerName),
 					resource.TestCheckResourceAttr(
 						"postgresql_publication.test", fmt.Sprintf("%s.#", pubTablesAttr), "3"),
 					resource.TestCheckResourceAttr(
@@ -821,8 +824,7 @@ resource "postgresql_publication" "test" {
 
 // A publication whose name contains a single quote and a backslash must be
 // found by Read: import works and the next plan shows no drift. The
-// publication is created out of band because CREATE PUBLICATION does not
-// quote the name yet (#122).
+// publication is created out of band to exercise the import path.
 func TestAccPostgresqlPublication_QuotedName(t *testing.T) {
 	skipIfNotAcc(t)
 
@@ -876,6 +878,125 @@ resource "postgresql_publication" "quoted" {
 			{
 				Config:   config,
 				PlanOnly: true,
+			},
+		},
+	})
+}
+
+// A mixed-case publication name and an owner with a dash must be quoted in
+// every statement: CREATE, OWNER TO, ADD/DROP TABLE and SET (#122). An
+// unquoted owner with a dash is a syntax error and an unquoted mixed-case
+// name is folded to lower case, so Read would not find the publication.
+func TestAccPostgresqlPublication_QuotedNameAndOwner(t *testing.T) {
+	skipIfNotAcc(t)
+
+	dbSuffix, teardown := setupTestDatabase(t, true, true)
+	defer teardown()
+	testTables := []string{"test_schema.test_table_1", "test_schema.test_table_2"}
+	createTestTables(t, dbSuffix, testTables, "")
+
+	dbName, _ := getTestDBNames(dbSuffix)
+	pubName := testUniqueName("Pub_MixedCase")
+	owner1 := testUniqueName("pub-owner-1")
+	owner2 := testUniqueName("pub-owner-2")
+
+	config := func(owner, table string, publish string) string {
+		return fmt.Sprintf(`
+resource "postgresql_role" "owner1" {
+	name = %q
+}
+resource "postgresql_role" "owner2" {
+	name = %q
+}
+resource "postgresql_publication" "test" {
+	name          = %q
+	database      = %q
+	owner         = postgresql_role.%s.name
+	tables        = [%q]
+	publish_param = %s
+}
+`, owner1, owner2, pubName, dbName, owner, table, publish)
+	}
+
+	resource.Test(t, resource.TestCase{
+		PreCheck: func() {
+			testAccPreCheck(t)
+			testCheckCompatibleVersion(t, featurePublication)
+			testSuperuserPreCheck(t)
+		},
+		Providers:    testAccProviders,
+		CheckDestroy: testAccCheckPostgresqlPublicationDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config: config("owner1", "test_schema.test_table_1", `["insert"]`),
+				Check: resource.ComposeTestCheckFunc(
+					testAccCheckPostgresqlPublicationExists("postgresql_publication.test"),
+					resource.TestCheckResourceAttr("postgresql_publication.test", "id", dbName+"."+pubName),
+					resource.TestCheckResourceAttr("postgresql_publication.test", pubNameAttr, pubName),
+					resource.TestCheckResourceAttr("postgresql_publication.test", pubOwnerAttr, owner1),
+					resource.TestCheckResourceAttr("postgresql_publication.test", pubTablesAttr+".#", "1"),
+					resource.TestCheckResourceAttr("postgresql_publication.test", pubPublishAttr+".#", "1"),
+				),
+			},
+			{
+				Config: config("owner2", "test_schema.test_table_2", `["insert", "update"]`),
+				Check: resource.ComposeTestCheckFunc(
+					testAccCheckPostgresqlPublicationExists("postgresql_publication.test"),
+					resource.TestCheckResourceAttr("postgresql_publication.test", pubNameAttr, pubName),
+					resource.TestCheckResourceAttr("postgresql_publication.test", pubOwnerAttr, owner2),
+					resource.TestCheckTypeSetElemAttr("postgresql_publication.test", pubTablesAttr+".*", "test_schema.test_table_2"),
+					resource.TestCheckResourceAttr("postgresql_publication.test", pubPublishAttr+".#", "2"),
+				),
+			},
+		},
+	})
+}
+
+// Importing a publication by "<database>.<name>" must keep the name in the
+// resource ID (#123); it used to be stored as "<database>.".
+func TestAccPostgresqlPublication_Import(t *testing.T) {
+	skipIfNotAcc(t)
+
+	dbSuffix, teardown := setupTestDatabase(t, true, true)
+	defer teardown()
+
+	dbName, _ := getTestDBNames(dbSuffix)
+	pubName := testUniqueName("publication")
+
+	config := fmt.Sprintf(`
+resource "postgresql_publication" "test" {
+	name     = %q
+	database = %q
+}
+`, pubName, dbName)
+
+	resource.Test(t, resource.TestCase{
+		PreCheck: func() {
+			testAccPreCheck(t)
+			testCheckCompatibleVersion(t, featurePublication)
+			testSuperuserPreCheck(t)
+		},
+		Providers:    testAccProviders,
+		CheckDestroy: testAccCheckPostgresqlPublicationDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config: config,
+			},
+			{
+				ResourceName:            "postgresql_publication.test",
+				ImportState:             true,
+				ImportStateId:           dbName + "." + pubName,
+				ImportStateVerify:       true,
+				ImportStateVerifyIgnore: []string{pubDropCascadeAttr},
+				ImportStateCheck: func(states []*terraform.InstanceState) error {
+					if len(states) != 1 {
+						return fmt.Errorf("expected 1 imported state, got %d", len(states))
+					}
+					if want := dbName + "." + pubName; states[0].ID != want {
+						return fmt.Errorf("imported ID = %q, want %q", states[0].ID, want)
+					}
+					return nil
+				},
 			},
 		},
 	})

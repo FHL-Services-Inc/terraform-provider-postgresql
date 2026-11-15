@@ -10,9 +10,10 @@ import (
 )
 
 func TestAccPostgresqlFunction_Basic(t *testing.T) {
-	config := `
+	funcName := testUniqueName("basic_function")
+	config := fmt.Sprintf(`
 resource "postgresql_function" "basic_function" {
-    name = "basic_function"
+    name = "%s"
     returns = "integer"
     language = "plpgsql"
     body = <<-EOF
@@ -21,7 +22,7 @@ resource "postgresql_function" "basic_function" {
         END;
     EOF
 }
-`
+`, funcName)
 
 	resource.Test(t, resource.TestCase{
 		PreCheck: func() {
@@ -36,7 +37,7 @@ resource "postgresql_function" "basic_function" {
 				Check: resource.ComposeTestCheckFunc(
 					testAccCheckPostgresqlFunctionExists("postgresql_function.basic_function", ""),
 					resource.TestCheckResourceAttr(
-						"postgresql_function.basic_function", "name", "basic_function"),
+						"postgresql_function.basic_function", "name", funcName),
 					resource.TestCheckResourceAttr(
 						"postgresql_function.basic_function", "schema", "public"),
 					resource.TestCheckResourceAttr(
@@ -96,14 +97,16 @@ resource "postgresql_function" "basic_function" {
 }
 
 func TestAccPostgresqlFunction_MultipleArgs(t *testing.T) {
-	config := `
+	schemaName := testUniqueName("test")
+	funcName := testUniqueName("increment")
+	config := fmt.Sprintf(`
 resource "postgresql_schema" "test" {
-    name = "test"
+    name = "%[1]s"
 }
 
 resource "postgresql_function" "increment" {
     schema = postgresql_schema.test.name
-    name = "increment"
+    name = "%[2]s"
     arg {
         name = "i"
         type = "integer"
@@ -125,7 +128,7 @@ resource "postgresql_function" "increment" {
         END;
     EOF
 }
-`
+`, schemaName, funcName)
 
 	resource.Test(t, resource.TestCase{
 		PreCheck: func() {
@@ -140,9 +143,9 @@ resource "postgresql_function" "increment" {
 				Check: resource.ComposeTestCheckFunc(
 					testAccCheckPostgresqlFunctionExists("postgresql_function.increment", ""),
 					resource.TestCheckResourceAttr(
-						"postgresql_function.increment", "name", "increment"),
+						"postgresql_function.increment", "name", funcName),
 					resource.TestCheckResourceAttr(
-						"postgresql_function.increment", "schema", "test"),
+						"postgresql_function.increment", "schema", schemaName),
 					resource.TestCheckResourceAttr(
 						"postgresql_function.increment", "language", "plpgsql"),
 					resource.TestCheckResourceAttr(
@@ -160,9 +163,10 @@ resource "postgresql_function" "increment" {
 }
 
 func TestAccPostgresqlFunction_Update(t *testing.T) {
-	configCreate := `
+	funcName := testUniqueName("func")
+	configCreate := fmt.Sprintf(`
 resource "postgresql_function" "func" {
-    name = "func"
+    name = "%s"
     returns = "integer"
     language = "plpgsql"
     body = <<-EOF
@@ -171,11 +175,11 @@ resource "postgresql_function" "func" {
         END;
     EOF
 }
-`
+`, funcName)
 
-	configUpdate := `
+	configUpdate := fmt.Sprintf(`
 resource "postgresql_function" "func" {
-    name = "func"
+    name = "%s"
     returns = "integer"
     language = "plpgsql"
     volatility = "IMMUTABLE"
@@ -185,7 +189,7 @@ resource "postgresql_function" "func" {
         END;
     EOF
 }
-`
+`, funcName)
 	resource.Test(t, resource.TestCase{
 		PreCheck: func() {
 			testAccPreCheck(t)
@@ -199,7 +203,7 @@ resource "postgresql_function" "func" {
 				Check: resource.ComposeTestCheckFunc(
 					testAccCheckPostgresqlFunctionExists("postgresql_function.func", ""),
 					resource.TestCheckResourceAttr(
-						"postgresql_function.func", "name", "func"),
+						"postgresql_function.func", "name", funcName),
 					resource.TestCheckResourceAttr(
 						"postgresql_function.func", "schema", "public"),
 					resource.TestCheckResourceAttr(
@@ -211,7 +215,7 @@ resource "postgresql_function" "func" {
 				Check: resource.ComposeTestCheckFunc(
 					testAccCheckPostgresqlFunctionExists("postgresql_function.func", ""),
 					resource.TestCheckResourceAttr(
-						"postgresql_function.func", "name", "func"),
+						"postgresql_function.func", "name", funcName),
 					resource.TestCheckResourceAttr(
 						"postgresql_function.func", "schema", "public"),
 					resource.TestCheckResourceAttr(

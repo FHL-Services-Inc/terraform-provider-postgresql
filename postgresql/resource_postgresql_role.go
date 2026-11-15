@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math"
 	"sort"
 	"strconv"
 	"strings"
@@ -46,10 +47,10 @@ const (
 
 func resourcePostgreSQLRole() *schema.Resource {
 	return &schema.Resource{
-		Create: PGResourceFunc(resourcePostgreSQLRoleCreate),
+		Create: PGResourceClusterWriteFunc(resourcePostgreSQLRoleCreate),
 		Read:   PGResourceFunc(resourcePostgreSQLRoleRead),
-		Update: PGResourceFunc(resourcePostgreSQLRoleUpdate),
-		Delete: PGResourceFunc(resourcePostgreSQLRoleDelete),
+		Update: PGResourceClusterWriteFunc(resourcePostgreSQLRoleUpdate),
+		Delete: PGResourceClusterWriteFunc(resourcePostgreSQLRoleDelete),
 		Importer: &schema.ResourceImporter{
 			StateContext: schema.ImportStatePassthroughContext,
 		},
@@ -380,6 +381,16 @@ func resourcePostgreSQLRoleCreate(db *DBConnection, d *schema.ResourceData) erro
 
 func resourcePostgreSQLRoleDelete(db *DBConnection, d *schema.ResourceData) error {
 	roleName := d.Get(roleNameAttr).(string)
+	skipReassignOwned := d.Get(roleSkipReassignOwnedAttr).(bool)
+
+	// REASSIGN OWNED and DROP OWNED only act on the current database (and on
+	// shared objects), so they first run in every other database where the
+	// role owns objects or holds privileges, one database at a time (#137).
+	if !skipReassignOwned {
+		if err := reassignOwnedInOtherDatabases(db, roleName); err != nil {
+			return err
+		}
+	}
 
 	txn, err := startTransaction(db.client, "")
 	if err != nil {
@@ -391,18 +402,8 @@ func resourcePostgreSQLRoleDelete(db *DBConnection, d *schema.ResourceData) erro
 		return err
 	}
 
-	if !d.Get(roleSkipReassignOwnedAttr).(bool) {
-		if err := withRolesGranted(txn, []string{roleName}, func() error {
-			currentUser := db.client.config.getDatabaseUsername()
-			if _, err := txn.Exec(fmt.Sprintf("REASSIGN OWNED BY %s TO %s", pq.QuoteIdentifier(roleName), pq.QuoteIdentifier(currentUser))); err != nil {
-				return fmt.Errorf("could not reassign owned by role %s to %s: %w", roleName, currentUser, err)
-			}
-
-			if _, err := txn.Exec(fmt.Sprintf("DROP OWNED BY %s", pq.QuoteIdentifier(roleName))); err != nil {
-				return fmt.Errorf("could not drop owned by role %s: %w", roleName, err)
-			}
-			return nil
-		}); err != nil {
+	if !skipReassignOwned {
+		if err := reassignAndDropOwned(db, txn, roleName); err != nil {
 			return err
 		}
 	}
@@ -419,6 +420,116 @@ func resourcePostgreSQLRoleDelete(db *DBConnection, d *schema.ResourceData) erro
 	d.SetId("")
 
 	return nil
+}
+
+// reassignAndDropOwned gives the objects role owns in the database of txn (and
+// the shared objects it owns) to the provider user, then drops the privileges
+// role still holds there. The caller holds pgLockRole on txn.
+func reassignAndDropOwned(db *DBConnection, txn *sql.Tx, role string) error {
+	return withRolesGranted(db, txn, []string{role}, func() error {
+		currentUser := db.client.config.getDatabaseUsername()
+		if _, err := txn.Exec(fmt.Sprintf("REASSIGN OWNED BY %s TO %s", pq.QuoteIdentifier(role), pq.QuoteIdentifier(currentUser))); err != nil {
+			return fmt.Errorf("could not reassign owned by role %s to %s: %w", role, currentUser, err)
+		}
+
+		if _, err := txn.Exec(fmt.Sprintf("DROP OWNED BY %s", pq.QuoteIdentifier(role))); err != nil {
+			return fmt.Errorf("could not drop owned by role %s: %w", role, err)
+		}
+		return nil
+	})
+}
+
+// roleDependentDatabasesQuery lists the databases, other than the current one,
+// that hold objects owned by role or privileges granted to it. pg_shdepend is
+// a shared catalog readable by any user, so this needs no connection to these
+// databases. Dependencies on shared objects (dbid = 0) are handled by
+// REASSIGN/DROP OWNED in the provider's database. Databases that do not allow
+// connections (template0) are left out: DROP ROLE then reports what is left.
+const roleDependentDatabasesQuery = `SELECT DISTINCT d.datname
+FROM pg_shdepend s
+JOIN pg_roles r ON r.oid = s.refobjid
+JOIN pg_database d ON d.oid = s.dbid
+WHERE s.refclassid = 'pg_authid'::regclass
+  AND r.rolname = $1
+  AND d.datname <> current_database()
+  AND d.datallowconn
+ORDER BY d.datname`
+
+func roleDependentDatabases(db QueryAble, role string) ([]string, error) {
+	rows, err := db.Query(roleDependentDatabasesQuery, role)
+	if err != nil {
+		return nil, fmt.Errorf("could not list the databases where role %s owns objects: %w", role, err)
+	}
+	defer func() {
+		if err := rows.Close(); err != nil {
+			log.Printf("[ERR] could not close rows: %v", err)
+		}
+	}()
+
+	var names []string
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, fmt.Errorf("could not scan database name: %w", err)
+		}
+		names = append(names, name)
+	}
+	return names, rows.Err()
+}
+
+// reassignOwnedInOtherDatabases runs REASSIGN OWNED / DROP OWNED for role in
+// every database other than the provider's one where role owns objects or
+// holds privileges.
+//
+// Each database gets its own transaction on that database's pool (shared with
+// the other resources, so max_idle_connections and the eviction before DROP
+// DATABASE apply), committed before the next one starts: at most one
+// connection is held at any time, so no pool is ever asked for a second
+// connection while one of its connections is pinned by this operation. This
+// also keeps the lock order of withRolesGranted (advisory locks first, then
+// the membership locks until the transaction ends).
+//
+// A database dropped since the catalog was read is skipped.
+func reassignOwnedInOtherDatabases(db *DBConnection, role string) error {
+	dbNames, err := roleDependentDatabases(db, role)
+	if err != nil {
+		return err
+	}
+
+	for _, dbName := range dbNames {
+		if dbName == db.client.databaseName {
+			continue
+		}
+		if err := reassignOwnedInDatabase(db.client, dbName, role); err != nil {
+			if isDatabaseDoesNotExistError(err) {
+				log.Printf("[DEBUG] database %s no longer exists, skipping REASSIGN OWNED BY %s there", dbName, role)
+				continue
+			}
+			return fmt.Errorf("in database %s: %w", dbName, err)
+		}
+	}
+	return nil
+}
+
+func reassignOwnedInDatabase(client *Client, dbName, role string) error {
+	dbConn, err := initConnection(client, dbName)
+	if err != nil {
+		return err
+	}
+
+	txn, err := dbConn.Begin()
+	if err != nil {
+		return fmt.Errorf("could not start transaction: %w", err)
+	}
+	defer deferredRollback(txn)
+
+	if err := pgLockRole(txn, role); err != nil {
+		return err
+	}
+	if err := reassignAndDropOwned(dbConn, txn, role); err != nil {
+		return err
+	}
+	return commitTxn(txn)
 }
 
 func resourcePostgreSQLRoleRead(db *DBConnection, d *schema.ResourceData) error {
@@ -545,16 +656,56 @@ func readSearchPath(roleConfig pq.ByteaArray) []string {
 	return nil
 }
 
-// readIdleInTransactionSessionTimeout searches for an idle_in_transaction_session_timeout entry in the rolconfig array.
-// In case no such value is present, it returns nil.
-func readIdleInTransactionSessionTimeout(roleConfig pq.ByteaArray) (int, error) {
+// millisecondUnits maps the time units PostgreSQL accepts for
+// millisecond-based settings to their value in milliseconds.
+// https://www.postgresql.org/docs/current/config-setting.html#CONFIG-SETTING-NAMES-VALUES
+var millisecondUnits = []struct {
+	suffix string
+	factor float64
+}{
+	// Longer suffixes first so e.g. "ms" is not matched as "s".
+	{"ms", 1},
+	{"us", 0.001},
+	{"min", 60 * 1000},
+	{"s", 1000},
+	{"h", 60 * 60 * 1000},
+	{"d", 24 * 60 * 60 * 1000},
+}
+
+// parseMillisecondsSetting converts a millisecond-based setting value to an
+// integer number of milliseconds. PostgreSQL stores the value exactly as it
+// was set, so alongside a bare integer ("120000") it can carry any of the
+// documented time units ("2min", "5s", "150ms"), optionally with whitespace
+// before the unit.
+func parseMillisecondsSetting(value string) (int, error) {
+	if res, err := strconv.Atoi(value); err == nil {
+		return res, nil
+	}
+	for _, unit := range millisecondUnits {
+		if !strings.HasSuffix(value, unit.suffix) {
+			continue
+		}
+		number := strings.TrimSpace(strings.TrimSuffix(value, unit.suffix))
+		res, err := strconv.ParseFloat(number, 64)
+		if err != nil {
+			break
+		}
+		return int(math.Round(res * unit.factor)), nil
+	}
+	return -1, fmt.Errorf("invalid millisecond setting value %q", value)
+}
+
+// readMillisecondsRoleSetting searches for the given millisecond-based setting
+// in the rolconfig array and returns its value in milliseconds.
+// In case no such value is present, it returns 0.
+func readMillisecondsRoleSetting(roleConfig pq.ByteaArray, attr string) (int, error) {
 	for _, v := range roleConfig {
 		config := string(v)
-		if strings.HasPrefix(config, roleIdleInTransactionSessionTimeoutAttr) {
-			var result = strings.Split(strings.TrimPrefix(config, roleIdleInTransactionSessionTimeoutAttr+"="), ", ")
-			res, err := strconv.Atoi(result[0])
+		if strings.HasPrefix(config, attr+"=") {
+			var result = strings.Split(strings.TrimPrefix(config, attr+"="), ", ")
+			res, err := parseMillisecondsSetting(result[0])
 			if err != nil {
-				return -1, fmt.Errorf("error reading statement_timeout: %w", err)
+				return -1, fmt.Errorf("error reading %s: %w", attr, err)
 			}
 			return res, nil
 		}
@@ -562,21 +713,16 @@ func readIdleInTransactionSessionTimeout(roleConfig pq.ByteaArray) (int, error) 
 	return 0, nil
 }
 
+// readIdleInTransactionSessionTimeout searches for an idle_in_transaction_session_timeout entry in the rolconfig array.
+// In case no such value is present, it returns 0.
+func readIdleInTransactionSessionTimeout(roleConfig pq.ByteaArray) (int, error) {
+	return readMillisecondsRoleSetting(roleConfig, roleIdleInTransactionSessionTimeoutAttr)
+}
+
 // readStatementTimeout searches for a statement_timeout entry in the rolconfig array.
-// In case no such value is present, it returns nil.
+// In case no such value is present, it returns 0.
 func readStatementTimeout(roleConfig pq.ByteaArray) (int, error) {
-	for _, v := range roleConfig {
-		config := string(v)
-		if strings.HasPrefix(config, roleStatementTimeoutAttr) {
-			var result = strings.Split(strings.TrimPrefix(config, roleStatementTimeoutAttr+"="), ", ")
-			res, err := strconv.Atoi(result[0])
-			if err != nil {
-				return -1, fmt.Errorf("error reading statement_timeout: %w", err)
-			}
-			return res, nil
-		}
-	}
-	return 0, nil
+	return readMillisecondsRoleSetting(roleConfig, roleStatementTimeoutAttr)
 }
 
 // readAssumeRole searches for a role entry in the rolconfig array.
@@ -655,6 +801,11 @@ func readRolePassword(db *DBConnection, d *schema.ResourceData, roleCanLogin boo
 }
 
 func resourcePostgreSQLRoleUpdate(db *DBConnection, d *schema.ResourceData) error {
+	// If the update fails, keep the previous state. Otherwise the SDK saves
+	// the new config, and attributes Read can't refresh (password) would look
+	// applied when the transaction was rolled back.
+	d.Partial(true)
+
 	txn, err := startTransaction(db.client, "")
 	if err != nil {
 		return err
@@ -739,6 +890,7 @@ func resourcePostgreSQLRoleUpdate(db *DBConnection, d *schema.ResourceData) erro
 	if err = txn.Commit(); err != nil {
 		return fmt.Errorf("could not commit transaction: %w", err)
 	}
+	d.Partial(false)
 
 	return resourcePostgreSQLRoleReadImpl(db, d)
 }

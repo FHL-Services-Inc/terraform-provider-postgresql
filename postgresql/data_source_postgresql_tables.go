@@ -9,10 +9,30 @@ import (
 )
 
 const (
+	// tableQuery lists relations from pg_class with the same columns and
+	// table_type values as information_schema.tables, but without its
+	// privilege filter: information_schema only shows tables the current
+	// user owns (or is a member of the owner) or has a privilege on, so a
+	// non-superuser provider silently missed tables owned by other roles.
+	// It is a subquery so the filters below can use the column names.
 	tableQuery = `
 	SELECT table_name, table_schema, table_type
-	FROM information_schema.tables
+	FROM (
+		SELECT c.relname AS table_name,
+			n.nspname AS table_schema,
+			CASE
+				WHEN n.oid = pg_my_temp_schema() THEN 'LOCAL TEMPORARY'
+				WHEN c.relkind IN ('r', 'p') THEN 'BASE TABLE'
+				WHEN c.relkind = 'v' THEN 'VIEW'
+				WHEN c.relkind = 'f' THEN 'FOREIGN'
+			END AS table_type
+		FROM pg_catalog.pg_class c
+		JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+		WHERE c.relkind IN ('r', 'v', 'f', 'p')
+			AND NOT pg_is_other_temp_schema(n.oid)
+	) AS tables
 	`
+	tableQueryOrder            = "ORDER BY table_schema, table_name"
 	tablePatternMatchingTarget = "table_name"
 	tableSchemaKeyword         = "table_schema"
 	tableTypeKeyword           = "table_type"
@@ -105,6 +125,7 @@ func dataSourcePostgreSQLTablesRead(db *DBConnection, d *schema.ResourceData) er
 	queryConcatKeyword := queryConcatKeywordWhere
 
 	query, args := applyTableDataSourceQueryFilters(query, queryConcatKeyword, d)
+	query += " " + tableQueryOrder
 
 	rows, err := dbc.Query(query, args...)
 	if err != nil {

@@ -29,10 +29,10 @@ const (
 
 func resourcePostgreSQLDatabase() *schema.Resource {
 	return &schema.Resource{
-		Create: PGResourceFunc(resourcePostgreSQLDatabaseCreate),
+		Create: PGResourceClusterWriteFunc(resourcePostgreSQLDatabaseCreate),
 		Read:   PGResourceFunc(resourcePostgreSQLDatabaseRead),
-		Update: PGResourceFunc(resourcePostgreSQLDatabaseUpdate),
-		Delete: PGResourceFunc(resourcePostgreSQLDatabaseDelete),
+		Update: PGResourceClusterWriteFunc(resourcePostgreSQLDatabaseUpdate),
+		Delete: PGResourceClusterWriteFunc(resourcePostgreSQLDatabaseDelete),
 		Importer: &schema.ResourceImporter{
 			StateContext: schema.ImportStatePassthroughContext,
 		},
@@ -57,31 +57,35 @@ func resourcePostgreSQLDatabase() *schema.Resource {
 				Description: "The name of the template from which to create the new database",
 			},
 			dbEncodingAttr: {
-				Type:        schema.TypeString,
-				Optional:    true,
-				Computed:    true,
-				ForceNew:    true,
-				Description: "Character set encoding to use in the new database",
+				Type:             schema.TypeString,
+				Optional:         true,
+				Computed:         true,
+				ForceNew:         true,
+				DiffSuppressFunc: suppressDatabaseDefault,
+				Description:      "Character set encoding to use in the new database",
 			},
 			dbCollationAttr: {
-				Type:        schema.TypeString,
-				Optional:    true,
-				Computed:    true,
-				ForceNew:    true,
-				Description: "Collation order (LC_COLLATE) to use in the new database",
+				Type:             schema.TypeString,
+				Optional:         true,
+				Computed:         true,
+				ForceNew:         true,
+				DiffSuppressFunc: suppressDatabaseDefault,
+				Description:      "Collation order (LC_COLLATE) to use in the new database",
 			},
 			dbCTypeAttr: {
-				Type:        schema.TypeString,
-				Optional:    true,
-				Computed:    true,
-				ForceNew:    true,
-				Description: "Character classification (LC_CTYPE) to use in the new database",
+				Type:             schema.TypeString,
+				Optional:         true,
+				Computed:         true,
+				ForceNew:         true,
+				DiffSuppressFunc: suppressDatabaseDefault,
+				Description:      "Character classification (LC_CTYPE) to use in the new database",
 			},
 			dbTablespaceAttr: {
-				Type:        schema.TypeString,
-				Optional:    true,
-				Computed:    true,
-				Description: "The name of the tablespace that will be associated with the new database",
+				Type:             schema.TypeString,
+				Optional:         true,
+				Computed:         true,
+				DiffSuppressFunc: suppressDatabaseDefaultTablespace,
+				Description:      "The name of the tablespace that will be associated with the new database",
 			},
 			dbConnLimitAttr: {
 				Type:         schema.TypeInt,
@@ -132,6 +136,7 @@ func createDatabase(db *DBConnection, d *schema.ResourceData) error {
 	if owner != "" {
 		// Take a lock on db currentUser to avoid multiple database creation at the same time
 		// It can fail if they grant the same owner to current at the same time as it's not done in transaction.
+		setOption := db.featureSupported(featureAuthMembersSetOption)
 		lockConn, release, err := lockRoleConn(db, currentUser)
 		if err != nil {
 			return err
@@ -139,14 +144,19 @@ func createDatabase(db *DBConnection, d *schema.ResourceData) error {
 		defer release()
 		conn = lockConn
 
+		// The membership granted below is visible to withRolesGranted in
+		// other transactions until it is revoked (#152).
+		unlock := lockDatabaseMemberships(owner)
+		defer unlock()
+
 		// Needed in order to set the owner of the db if the connection user is not a
 		// superuser
-		ownerGranted, err := grantRoleMembership(conn, owner, currentUser)
+		ownerGranted, err := grantRoleMembership(conn, setOption, owner, currentUser)
 		if err != nil {
 			return err
 		}
 		if ownerGranted {
-			defer revokeRoleMembershipDeferred(conn, owner, currentUser)
+			defer revokeRoleMembershipDeferred(conn, setOption, owner, currentUser)
 		}
 	}
 
@@ -237,6 +247,15 @@ func createDatabase(db *DBConnection, d *schema.ResourceData) error {
 }
 
 func resourcePostgreSQLDatabaseDelete(db *DBConnection, d *schema.ResourceData) error {
+	dbName := d.Get(dbNameAttr).(string)
+	// db is connected to the provider's own database, which PostgreSQL never
+	// lets us drop ("cannot drop the currently open database"). Fail before
+	// blocking connections to it and terminating every other session on it,
+	// including the other resources sharing our pool.
+	if dbName == db.client.databaseName {
+		return fmt.Errorf("cannot drop database %q: it is the database the provider connects to (provider \"database\" setting); configure the provider with another database to drop it", dbName)
+	}
+
 	currentUser := db.client.config.getDatabaseUsername()
 	owner := d.Get(dbOwnerAttr).(string)
 
@@ -245,6 +264,7 @@ func resourcePostgreSQLDatabaseDelete(db *DBConnection, d *schema.ResourceData) 
 	// lock when an owner is set.
 	var conn QueryAble = db
 	if owner != "" {
+		setOption := db.featureSupported(featureAuthMembersSetOption)
 		lockConn, release, err := lockRoleConn(db, currentUser)
 		if err != nil {
 			return err
@@ -252,18 +272,21 @@ func resourcePostgreSQLDatabaseDelete(db *DBConnection, d *schema.ResourceData) 
 		defer release()
 		conn = lockConn
 
+		// See createDatabase (#152).
+		unlock := lockDatabaseMemberships(owner)
+		defer unlock()
+
 		// Needed in order to set the owner of the db if the connection user is not a
 		// superuser
-		ownerGranted, err := grantRoleMembership(conn, owner, currentUser)
+		ownerGranted, err := grantRoleMembership(conn, setOption, owner, currentUser)
 		if err != nil {
 			return err
 		}
 		if ownerGranted {
-			defer revokeRoleMembershipDeferred(conn, owner, currentUser)
+			defer revokeRoleMembershipDeferred(conn, setOption, owner, currentUser)
 		}
 	}
 
-	dbName := d.Get(dbNameAttr).(string)
 	if db.featureSupported(featureDBIsTemplate) {
 		if isTemplate := d.Get(dbIsTemplateAttr).(bool); isTemplate {
 			// Template databases must have this attribute cleared before
@@ -280,9 +303,7 @@ func resourcePostgreSQLDatabaseDelete(db *DBConnection, d *schema.ResourceData) 
 
 	// Close our own pooled connections to the database (only kept with
 	// max_idle_connections > 0) before terminating the remaining ones.
-	if db.client.config.evictDBConnection(dbName) {
-		log.Printf("[DEBUG] evicted pooled connections to database %q before dropping it", dbName)
-	}
+	evictOtherDBPool(db, dbName)
 
 	// Terminate all active connections and block new one
 	if err := terminateBConnections(db, conn, dbName); err != nil {
@@ -443,7 +464,7 @@ func setDBName(db *DBConnection, d *schema.ResourceData) error {
 // evictOtherDBPool closes this provider's pooled connections to database
 // (see evictDBConnection), unless database is the one db itself is connected
 // to: the statement that follows still needs that pool, and PostgreSQL refuses
-// to rename or copy the database of the current session anyway.
+// to rename, copy or drop the database of the current session anyway.
 func evictOtherDBPool(db *DBConnection, database string) {
 	if database == db.client.databaseName {
 		return
@@ -464,20 +485,12 @@ func setDBOwner(db *DBConnection, d *schema.ResourceData) error {
 	}
 	currentUser := db.client.config.getDatabaseUsername()
 
+	setOption := db.featureSupported(featureAuthMembersSetOption)
 	conn, release, err := lockRoleConn(db, currentUser)
 	if err != nil {
 		return err
 	}
 	defer release()
-
-	//needed in order to set the owner of the db if the connection user is not a superuser
-	ownerGranted, err := grantRoleMembership(conn, owner, currentUser)
-	if err != nil {
-		return err
-	}
-	if ownerGranted {
-		defer revokeRoleMembershipDeferred(conn, owner, currentUser)
-	}
 
 	dbName := d.Get(dbNameAttr).(string)
 
@@ -488,12 +501,26 @@ func setDBOwner(db *DBConnection, d *schema.ResourceData) error {
 	if err != nil {
 		return fmt.Errorf("error getting current database OWNER: %w", err)
 	}
-	currentOwnerGranted, err := grantRoleMembership(conn, currentOwner, currentUser)
+
+	// See createDatabase (#152).
+	unlock := lockDatabaseMemberships(owner, currentOwner)
+	defer unlock()
+
+	//needed in order to set the owner of the db if the connection user is not a superuser
+	ownerGranted, err := grantRoleMembership(conn, setOption, owner, currentUser)
+	if err != nil {
+		return err
+	}
+	if ownerGranted {
+		defer revokeRoleMembershipDeferred(conn, setOption, owner, currentUser)
+	}
+
+	currentOwnerGranted, err := grantRoleMembership(conn, setOption, currentOwner, currentUser)
 	if err != nil {
 		return err
 	}
 	if currentOwnerGranted {
-		defer revokeRoleMembershipDeferred(conn, currentOwner, currentUser)
+		defer revokeRoleMembershipDeferred(conn, setOption, currentOwner, currentUser)
 	}
 
 	sql := fmt.Sprintf("ALTER DATABASE %s OWNER TO %s", pq.QuoteIdentifier(dbName), pq.QuoteIdentifier(owner))
@@ -527,6 +554,7 @@ func setAlterOwnership(db *DBConnection, d *schema.ResourceData) error {
 	// locks taken in the same database, and taking it in dbName let owner
 	// changes of several databases grant and revoke the same membership at
 	// the same time (#25).
+	setOption := db.featureSupported(featureAuthMembersSetOption)
 	conn, release, err := lockRoleConn(db, currentUser)
 	if err != nil {
 		return err
@@ -557,12 +585,40 @@ func setAlterOwnership(db *DBConnection, d *schema.ResourceData) error {
 		return nil
 	}
 
-	currentOwnerGranted, err := grantRoleMembership(conn, currentOwner, currentUser)
+	// REASSIGN OWNED only affects the database it runs in, so it runs on a
+	// connection to dbName, while the lock (and the memberships) stay on the
+	// maintenance connection. That second connection comes from the pool of
+	// dbName, never from the pool the lock connection is pinned from, so an
+	// exhausted pool (max_connections) cannot make it wait forever. When
+	// dbName is the maintenance database itself, both would come from the
+	// same pool, so the lock connection is used, once the memberships are
+	// granted on it.
+	//
+	// The connection to dbName is taken before the membership locks below:
+	// a withRolesGranted transaction in dbName may hold the last connection
+	// of that pool while it waits for them (see membershipLocks).
+	var reassignTxn *sql.Tx
+	if dbName != db.client.databaseName {
+		targetDB, err := initConnection(db.client, dbName)
+		if err != nil {
+			return err
+		}
+		if reassignTxn, err = beginReassignTxn(targetDB); err != nil {
+			return err
+		}
+		defer deferredRollback(reassignTxn)
+	}
+
+	// See createDatabase (#152).
+	unlock := lockDatabaseMemberships(currentOwner, newOwner)
+	defer unlock()
+
+	currentOwnerGranted, err := grantRoleMembership(conn, setOption, currentOwner, currentUser)
 	if err != nil {
 		return err
 	}
 	if currentOwnerGranted {
-		defer revokeRoleMembershipDeferred(conn, currentOwner, currentUser)
+		defer revokeRoleMembershipDeferred(conn, setOption, currentOwner, currentUser)
 	}
 
 	// REASSIGN OWNED also needs the privileges of the new owner, and since
@@ -570,40 +626,19 @@ func setAlterOwnership(db *DBConnection, d *schema.ResourceData) error {
 	// role gets in the roles it creates has neither by default
 	// (createrole_self_grant), isMemberOfRole does not count it, and the
 	// explicit GRANT gets SET (and INHERIT) by default.
-	newOwnerGranted, err := grantRoleMembership(conn, newOwner, currentUser)
+	newOwnerGranted, err := grantRoleMembership(conn, setOption, newOwner, currentUser)
 	if err != nil {
 		return err
 	}
 	if newOwnerGranted {
-		defer revokeRoleMembershipDeferred(conn, newOwner, currentUser)
+		defer revokeRoleMembershipDeferred(conn, setOption, newOwner, currentUser)
 	}
 
-	// REASSIGN OWNED only affects the database it runs in, so it runs on a
-	// connection to dbName, while the lock (and the memberships) stay on the
-	// maintenance connection. That second connection comes from the pool of
-	// dbName, never from the pool the lock connection is pinned from, so an
-	// exhausted pool (max_connections) cannot make it wait forever. When
-	// dbName is the maintenance database itself, both would come from the
-	// same pool, so the lock connection is used.
-	var reassignTxn *sql.Tx
-	if dbName == db.client.databaseName {
-		reassignTxn, err = conn.Begin()
-	} else {
-		var targetDB *DBConnection
-		targetDB, err = initConnection(db.client, dbName)
-		if err != nil {
+	if reassignTxn == nil {
+		if reassignTxn, err = beginReassignTxn(conn); err != nil {
 			return err
 		}
-		reassignTxn, err = targetDB.Begin()
-	}
-	if err != nil {
-		return fmt.Errorf("could not start transaction: %w", err)
-	}
-	defer deferredRollback(reassignTxn)
-	// REASSIGN used to run in the pgLockRole transaction, which had
-	// statement_timeout disabled.
-	if _, err := reassignTxn.Exec("SET LOCAL statement_timeout = 0"); err != nil {
-		return fmt.Errorf("could not disable statement_timeout: %w", err)
+		defer deferredRollback(reassignTxn)
 	}
 
 	query := fmt.Sprintf("REASSIGN OWNED BY %s TO %s", pq.QuoteIdentifier(currentOwner), pq.QuoteIdentifier(newOwner))
@@ -617,6 +652,37 @@ func setAlterOwnership(db *DBConnection, d *schema.ResourceData) error {
 	return nil
 }
 
+// suppressDatabaseDefault suppresses the diff between "DEFAULT" in the config
+// and the value the server actually picked for encoding, lc_collate and
+// lc_ctype. CREATE DATABASE resolves DEFAULT from the template and Read stores
+// the real value, so without this the database would be replaced on every
+// plan. An empty old value means the database does not exist yet.
+func suppressDatabaseDefault(_, old, new string, _ *schema.ResourceData) bool {
+	return strings.EqualFold(new, "DEFAULT") && old != ""
+}
+
+// suppressDatabaseDefaultTablespace suppresses the diff between
+// tablespace_name = "DEFAULT" and the pg_default tablespace Read stores for it.
+// Any other tablespace in state is a real change back to the default.
+func suppressDatabaseDefaultTablespace(_, old, new string, _ *schema.ResourceData) bool {
+	return strings.EqualFold(new, "DEFAULT") && old == "pg_default"
+}
+
+// beginReassignTxn starts the transaction REASSIGN OWNED runs in.
+func beginReassignTxn(db interface{ Begin() (*sql.Tx, error) }) (*sql.Tx, error) {
+	txn, err := db.Begin()
+	if err != nil {
+		return nil, fmt.Errorf("could not start transaction: %w", err)
+	}
+	// REASSIGN used to run in the pgLockRole transaction, which had
+	// statement_timeout disabled.
+	if _, err := txn.Exec("SET LOCAL statement_timeout = 0"); err != nil {
+		deferredRollback(txn)
+		return nil, fmt.Errorf("could not disable statement_timeout: %w", err)
+	}
+	return txn, nil
+}
+
 func setDBTablespace(db QueryAble, d *schema.ResourceData) error {
 	if !d.HasChange(dbTablespaceAttr) {
 		return nil
@@ -624,12 +690,12 @@ func setDBTablespace(db QueryAble, d *schema.ResourceData) error {
 
 	tbspName := d.Get(dbTablespaceAttr).(string)
 	dbName := d.Get(dbNameAttr).(string)
-	var sql string
-	if tbspName == "" || strings.ToUpper(tbspName) == "DEFAULT" {
-		sql = fmt.Sprintf("ALTER DATABASE %s RESET TABLESPACE", pq.QuoteIdentifier(dbName))
-	} else {
-		sql = fmt.Sprintf("ALTER DATABASE %s SET TABLESPACE %s", pq.QuoteIdentifier(dbName), pq.QuoteIdentifier(tbspName))
+	// ALTER DATABASE has no RESET TABLESPACE (RESET only takes configuration
+	// parameters), so moving back to the default means pg_default.
+	if tbspName == "" || strings.EqualFold(tbspName, "DEFAULT") {
+		tbspName = "pg_default"
 	}
+	sql := fmt.Sprintf("ALTER DATABASE %s SET TABLESPACE %s", pq.QuoteIdentifier(dbName), pq.QuoteIdentifier(tbspName))
 
 	if _, err := db.Exec(sql); err != nil {
 		return fmt.Errorf("error updating database TABLESPACE: %w", err)

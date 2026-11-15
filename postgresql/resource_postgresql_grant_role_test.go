@@ -60,7 +60,9 @@ func TestCreateGrantRoleQuery(t *testing.T) {
 // (which forces a sequential function scan on large installations). This guards
 // against an accidental regression to the function-scan form. On PG 16+ the
 // pair can have one row per grantor, so the query must prefer the row granted
-// by current_user (#138).
+// by current_user (#138). A superuser's grants are recorded with the bootstrap
+// superuser (OID 10) as grantor, so for a superuser that row is preferred
+// instead (#151).
 func TestGetGrantRoleQuery(t *testing.T) {
 	expected := `
 SELECT
@@ -75,7 +77,10 @@ WHERE
   ur.rolname = $1 AND
   gr.rolname = $2
 ORDER BY
-  (m.grantor = (SELECT oid FROM pg_roles WHERE rolname = current_user)) DESC,
+  (m.grantor = (
+    SELECT CASE WHEN rolsuper THEN 10::oid ELSE oid END
+    FROM pg_roles WHERE rolname = current_user
+  )) DESC,
   m.grantor
 LIMIT 1;
 `
@@ -139,7 +144,7 @@ func TestAccPostgresqlGrantRole(t *testing.T) {
 
 	_, roleName := getTestDBNames(dbSuffix)
 
-	grantedRoleName := "foo"
+	grantedRoleName := testUniqueName("foo")
 
 	testAccPostgresqlGrantRoleResources := fmt.Sprintf(`
 	resource postgresql_role "grant" {
@@ -186,7 +191,7 @@ func TestAccPostgresqlGrantRoleToProviderUser(t *testing.T) {
 
 	config := getTestConfig(t)
 	providerUser := config.getDatabaseUsername()
-	grantedRoleName := "test_grant_role_self"
+	grantedRoleName := testUniqueName("test_grant_role_self")
 
 	resourceConfig := fmt.Sprintf(`
 	resource postgresql_role "grp" {
@@ -214,6 +219,94 @@ func TestAccPostgresqlGrantRoleToProviderUser(t *testing.T) {
 						"postgresql_grant_role.self", "grant_role", grantedRoleName),
 					resource.TestCheckResourceAttr(
 						"postgresql_grant_role.self", "with_admin_option", strconv.FormatBool(false)),
+				),
+			},
+			{
+				// The plan right after apply must be empty.
+				Config:   resourceConfig,
+				PlanOnly: true,
+			},
+		},
+	})
+}
+
+// On PostgreSQL 16+ a grant made by any superuser is recorded with the
+// bootstrap superuser (OID 10) as grantor, not with current_user. With a
+// superuser provider that is not the bootstrap superuser, the read must still
+// pick the row the provider created when the pair also has a row from another
+// grantor, here one WITH ADMIN OPTION granted by a CREATEROLE role (#151).
+func TestAccPostgresqlGrantRoleNonBootstrapSuperuser(t *testing.T) {
+	skipIfNotAcc(t)
+	skipIfNotSuperuser(t)
+
+	config := getTestConfig(t)
+	dsn := config.connStr("postgres")
+
+	var versionNum int
+	func() {
+		db, err := sql.Open("postgres", dsn)
+		if err != nil {
+			t.Fatalf("could not create connection pool: %v", err)
+		}
+		defer closeDB(t, db)
+		if err := db.QueryRow("SELECT current_setting('server_version_num')::int").Scan(&versionNum); err != nil {
+			t.Fatalf("could not read server version: %v", err)
+		}
+	}()
+	if versionNum < 160000 {
+		t.Skip("one membership row per grantor exists only on PostgreSQL 16+")
+	}
+
+	admin := testUniqueName("tf_tests_superuser")
+	other := testUniqueName("tf_tests_grantor")
+	grp := testUniqueName("tf_tests_grp")
+	member := testUniqueName("tf_tests_member")
+	const adminPassword = "admin"
+
+	dbExecute(t, dsn, fmt.Sprintf("CREATE ROLE %s LOGIN SUPERUSER PASSWORD %s",
+		pq.QuoteIdentifier(admin), pq.QuoteLiteral(adminPassword)))
+	dbExecute(t, dsn, fmt.Sprintf("CREATE ROLE %s CREATEROLE", pq.QuoteIdentifier(other)))
+	dbExecute(t, dsn, fmt.Sprintf("CREATE ROLE %s", pq.QuoteIdentifier(grp)))
+	dbExecute(t, dsn, fmt.Sprintf("CREATE ROLE %s", pq.QuoteIdentifier(member)))
+	defer func() {
+		for _, role := range []string{member, grp, other, admin} {
+			dbExecute(t, dsn, fmt.Sprintf("DROP ROLE IF EXISTS %s", pq.QuoteIdentifier(role)))
+		}
+	}()
+	dbExecute(t, dsn, fmt.Sprintf("GRANT %s TO %s WITH ADMIN OPTION",
+		pq.QuoteIdentifier(grp), pq.QuoteIdentifier(other)))
+	// A second row for (member, grp), granted by other WITH ADMIN OPTION.
+	dbExecute(t, dsn, fmt.Sprintf("GRANT %s TO %s WITH ADMIN OPTION GRANTED BY %s",
+		pq.QuoteIdentifier(grp), pq.QuoteIdentifier(member), pq.QuoteIdentifier(other)))
+
+	resourceConfig := fmt.Sprintf(`
+provider "postgresql" {
+  username  = %q
+  password  = %q
+  superuser = true
+}
+
+resource "postgresql_grant_role" "grant" {
+  role       = %q
+  grant_role = %q
+}
+`, admin, adminPassword, member, grp)
+
+	resource.Test(t, resource.TestCase{
+		PreCheck: func() {
+			testAccPreCheck(t)
+			testCheckCompatibleVersion(t, featurePrivileges)
+		},
+		ProviderFactories: map[string]func() (*schema.Provider, error){
+			"postgresql": func() (*schema.Provider, error) { return Provider(), nil },
+		},
+		Steps: []resource.TestStep{
+			{
+				Config: resourceConfig,
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr(
+						"postgresql_grant_role.grant", "with_admin_option", strconv.FormatBool(false)),
+					checkGrantRole(t, dsn, member, grp, false),
 				),
 			},
 			{

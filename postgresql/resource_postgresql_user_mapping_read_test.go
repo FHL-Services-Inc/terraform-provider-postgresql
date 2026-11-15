@@ -111,3 +111,44 @@ func TestUserMappingReadOptions(t *testing.T) {
 		})
 	}
 }
+
+// TestUserMappingReadCurrentUser checks that Read resolves the current user
+// keywords to the provider role instead of looking for a role of that name,
+// and keeps the keyword in state.
+func TestUserMappingReadCurrentUser(t *testing.T) {
+	for _, keyword := range []string{"CURRENT_USER", "CURRENT_ROLE", "USER"} {
+		t.Run(keyword, func(t *testing.T) {
+			var queries []string
+			conn := newStmtCountingConnection(t, nil)
+			stmtCounter.mu.Lock()
+			stmtCounter.respond = func(query string) (driver.Rows, error) {
+				queries = append(queries, query)
+				return &singleValueRows{value: "{user=remote}"}, nil
+			}
+			stmtCounter.mu.Unlock()
+
+			d := schema.TestResourceDataRaw(t, resourcePostgreSQLUserMapping().Schema, map[string]any{
+				userMappingUserNameAttr:   keyword,
+				userMappingServerNameAttr: "srv",
+			})
+			d.SetId(keyword + ".srv")
+
+			if err := resourcePostgreSQLUserMappingRead(conn, d); err != nil {
+				t.Fatalf("Read returned error: %v", err)
+			}
+			if len(queries) != 1 {
+				t.Fatalf("Read ran %d queries, want 1: %v", len(queries), queries)
+			}
+			if !strings.Contains(queries[0], "umuser = (SELECT oid FROM pg_catalog.pg_roles WHERE rolname = current_user)") ||
+				strings.Contains(queries[0], "$2") {
+				t.Errorf("Read query does not resolve the current user: %s", queries[0])
+			}
+			if got := d.Get(userMappingUserNameAttr); got != keyword {
+				t.Errorf("user_name = %v, want %s", got, keyword)
+			}
+			if d.Id() != keyword+".srv" {
+				t.Errorf("ID = %q, want %q", d.Id(), keyword+".srv")
+			}
+		})
+	}
+}

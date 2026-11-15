@@ -6,13 +6,13 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net"
 	"net/url"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
-	"unicode"
 
 	"github.com/blang/semver"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/retry"
@@ -52,6 +52,7 @@ const (
 	featureCreateRoleSelfGrant
 	featureSecurityLabel
 	featureMaintainPrivilege
+	featureAuthMembersSetOption
 )
 
 // defaultConnMaxIdleTime closes connections that stayed idle in the pool for
@@ -143,6 +144,9 @@ var (
 
 		// MAINTAIN privilege on tables (PG 17+)
 		featureMaintainPrivilege: semver.MustParseRange(">=17.0.0"),
+
+		// pg_auth_members has a set_option column (PG 16+)
+		featureAuthMembersSetOption: semver.MustParseRange(">=16.0.0"),
 	}
 )
 
@@ -154,6 +158,59 @@ type DBConnection struct {
 	// version is the version number of the database as determined by parsing the
 	// output of `SELECT VERSION()`.x
 	version semver.Version
+
+	// sessionRole memoizes the login role of this pool and its rolsuper
+	// attribute; see sessionRoleMemo.
+	sessionRole sessionRoleMemo
+}
+
+// sessionRoleMemo caches CURRENT_USER and its rolsuper attribute for one
+// DBConnection. A DBConnection is keyed by DSN, so its login role is fixed
+// for its whole lifetime; only successful lookups are stored, and a lookup
+// racing with another one just stores the same value twice. The memo lives
+// and dies with its pool: a pool evicted from dbRegistry (evictDBConnection)
+// is replaced by a new DBConnection, which starts with an empty memo.
+type sessionRoleMemo struct {
+	mu             sync.Mutex
+	user           string
+	userKnown      bool
+	superuser      bool
+	superuserKnown bool
+}
+
+// currentUser returns the session user, querying it on q the first time.
+// q should be the transaction the caller already holds, so the first lookup
+// does not need a second connection from the pool.
+func (db *DBConnection) currentUser(q QueryAble) (string, error) {
+	db.sessionRole.mu.Lock()
+	user, known := db.sessionRole.user, db.sessionRole.userKnown
+	db.sessionRole.mu.Unlock()
+	if known {
+		return user, nil
+	}
+
+	user, err := getCurrentUser(q)
+	if err != nil {
+		return "", err
+	}
+
+	db.sessionRole.mu.Lock()
+	db.sessionRole.user, db.sessionRole.userKnown = user, true
+	db.sessionRole.mu.Unlock()
+	return user, nil
+}
+
+// cachedSuperuser returns the memoized rolsuper of the session user, if known.
+func (db *DBConnection) cachedSuperuser() (superuser, known bool) {
+	db.sessionRole.mu.Lock()
+	defer db.sessionRole.mu.Unlock()
+	return db.sessionRole.superuser, db.sessionRole.superuserKnown
+}
+
+func (db *DBConnection) storeSuperuser(superuser bool) {
+	db.sessionRole.mu.Lock()
+	defer db.sessionRole.mu.Unlock()
+	db.sessionRole.superuser, db.sessionRole.superuserKnown = superuser, true
 }
 
 // featureSupported returns true if a given feature is supported or not. This is
@@ -171,12 +228,17 @@ func (db *DBConnection) featureSupported(name featureName) bool {
 
 // isSuperuser returns true if connected user is a Postgres SUPERUSER
 func (db *DBConnection) isSuperuser() (bool, error) {
+	if superuser, known := db.cachedSuperuser(); known {
+		return superuser, nil
+	}
+
 	var superuser bool
 
 	if err := db.QueryRow("SELECT rolsuper FROM pg_roles WHERE rolname = CURRENT_USER").Scan(&superuser); err != nil {
 		return false, fmt.Errorf("could not check if current user is superuser: %w", err)
 	}
 
+	db.storeSuperuser(superuser)
 	return superuser, nil
 }
 
@@ -204,11 +266,24 @@ type Config struct {
 	ConnMaxLifetimeSeconds          int
 	MaxConns                        int
 	MaxIdleConns                    int
+	MaxTotalConns                   int
 	ExpectedVersion                 semver.Version
 	SSLClientCert                   *ClientCertificateConfig
 	SSLRootCertPath                 string
 	GCPIAMImpersonateServiceAccount string
 	BinaryParameters                bool
+
+	// AuthTokens, when set, supplies the password of every new connection
+	// for the "postgres" scheme (AWS RDS IAM and Azure AD tokens), and
+	// Password is left empty, so the DSN and the dbRegistry key carry no
+	// token. It is a pointer: all Clients of a provider share the cache.
+	AuthTokens *authTokenSource
+
+	// CatalogSnapshot lets grant and default privileges Reads share one
+	// per-database catalog snapshot (see catalog_snapshot.go) instead of each
+	// querying the catalogs; CatalogSnapshotTTLSeconds bounds its age.
+	CatalogSnapshot           bool
+	CatalogSnapshotTTLSeconds int
 }
 
 // Client struct holding connection string
@@ -275,28 +350,34 @@ func (c *Config) connParams() []string {
 	for key, value := range params {
 		paramsArray = append(paramsArray, fmt.Sprintf("%s=%s", key, url.QueryEscape(value)))
 	}
-	// Map iteration order is random; sort so the DSN (the dbRegistry key) is
-	// stable and a database always maps to a single registry entry.
+	// Map iteration order is random; sort so the DSN (the key of dbRegistry
+	// and of the catalog snapshots) is stable and a database always maps to a
+	// single registry entry and a single snapshot.
 	sort.Strings(paramsArray)
 
 	return paramsArray
 }
 
 func (c *Config) connStr(database string) string {
-	host := c.Host
-	// For GCP, support both project/region/instance and project:region:instance
-	// (The second one allows to use the output of google_sql_database_instance as host
+	var hostPort string
 	if c.Scheme == "gcppostgres" {
-		host = strings.ReplaceAll(host, ":", "/")
+		// For GCP, support both project/region/instance and project:region:instance
+		// (The second one allows to use the output of google_sql_database_instance as host
+		hostPort = fmt.Sprintf("%s:%d", strings.ReplaceAll(c.Host, ":", "/"), c.Port)
+	} else {
+		// JoinHostPort brackets IPv6 literals; strip brackets the user may
+		// already have put around one so they are not doubled.
+		host := strings.TrimSuffix(strings.TrimPrefix(c.Host, "["), "]")
+		hostPort = net.JoinHostPort(host, strconv.Itoa(c.Port))
 	}
 
+	// url.UserPassword escapes ':' in the username too, which PathEscape
+	// leaves as is, so a username such as "AROA123:session" is not split.
 	connStr := fmt.Sprintf(
-		"%s://%s:%s@%s:%d/%s?%s",
+		"%s://%s@%s/%s?%s",
 		c.Scheme,
-		url.PathEscape(c.Username),
-		url.PathEscape(c.Password),
-		host,
-		c.Port,
+		url.UserPassword(c.Username, c.Password).String(),
+		hostPort,
 		database,
 		strings.Join(c.connParams(), "&"),
 	)
@@ -346,9 +427,9 @@ func (c *Client) Connect() (*DBConnection, error) {
 	}
 
 	conn = &DBConnection{
-		db,
-		c,
-		*version,
+		DB:      db,
+		client:  c,
+		version: *version,
 	}
 
 	dbRegistryLock.Lock()
@@ -419,7 +500,11 @@ func (c *Client) connectWithRetry(ctx context.Context, postgresDriverName, dsn s
 
 	connectRetryTimeout := time.Duration(c.config.ConnectionRetryTimeoutSeconds) * time.Second
 	retryError := retry.RetryContext(ctx, connectRetryTimeout, func() *retry.RetryError {
-		if c.config.Scheme == "postgres" {
+		if budget := c.config.connBudget(); budget != nil {
+			db, err = c.config.openBudgetedPostgresDB(dsn, budget)
+		} else if c.config.Scheme == "postgres" && c.config.AuthTokens != nil {
+			db, err = c.config.openTokenAuthDB(dsn)
+		} else if c.config.Scheme == "postgres" {
 			db, err = sql.Open(postgresDriverName, dsn)
 		} else if c.config.Scheme == "gcppostgres" && c.config.GCPIAMImpersonateServiceAccount != "" {
 			db, err = openImpersonatedGCPDBConnection(ctx, dsn, c.config.GCPIAMImpersonateServiceAccount)
@@ -452,8 +537,12 @@ func (c *Client) connectWithRetry(ctx context.Context, postgresDriverName, dsn s
 		if _, ok := errors.AsType[*pq.Error](retryError); ok {
 			return nil, fmt.Errorf("error connecting to PostgreSQL server %s (scheme: %s): %w", c.config.Host, c.config.Scheme, retryError)
 		}
-		errString := strings.Replace(retryError.Error(), c.config.Password, "XXXX", 2)
-		return nil, fmt.Errorf("error connecting to PostgreSQL server %s (scheme: %s): %s", c.config.Host, c.config.Scheme, errString)
+		// The DSN holds the password URL-escaped, and errors such as a URL
+		// parse failure echo the DSN, so redact the escaped forms as well.
+		// On the auth token path Password is empty and the connector has
+		// already redacted the token.
+		redacted := redactTokenError(retryError, c.config.Password)
+		return nil, fmt.Errorf("error connecting to PostgreSQL server %s (scheme: %s): %s", c.config.Host, c.config.Scheme, redacted)
 	}
 
 	return db, nil
@@ -476,28 +565,36 @@ func isRetryableConnectionError(err error) bool {
 
 // fingerprintCapabilities queries PostgreSQL to populate a local catalog of
 // capabilities.  This is only run once per Client.
+//
+// It reads server_version_num rather than parsing SELECT VERSION(): the
+// version text carries vendor suffixes (e.g. "13.23-rds.20250508" on RDS
+// Extended Support) that are not valid semver, while server_version_num is a
+// plain integer everywhere, RDS and Aurora included.
 func fingerprintCapabilities(db *sql.DB) (*semver.Version, error) {
-	var pgVersion string
-	err := db.QueryRow(`SELECT VERSION()`).Scan(&pgVersion)
-	if err != nil {
+	var versionNum string
+	if err := db.QueryRow(`SHOW server_version_num`).Scan(&versionNum); err != nil {
 		return nil, fmt.Errorf("error PostgreSQL version: %w", err)
 	}
 
-	// PostgreSQL 9.2.21 on x86_64-apple-darwin16.5.0, compiled by Apple LLVM version 8.1.0 (clang-802.0.42), 64-bit
-	// PostgreSQL 9.6.7, compiled by Visual C++ build 1800, 64-bit
-	fields := strings.FieldsFunc(pgVersion, func(c rune) bool {
-		return unicode.IsSpace(c) || c == ','
-	})
-	if len(fields) < 2 {
-		return nil, fmt.Errorf("error determining the server version: %q", pgVersion)
-	}
-
-	version, err := semver.ParseTolerant(fields[1])
+	version, err := parseServerVersionNum(versionNum)
 	if err != nil {
-		return nil, fmt.Errorf("error parsing version: %w", err)
+		return nil, err
 	}
-
 	return &version, nil
+}
+
+// parseServerVersionNum converts a server_version_num value to a version:
+// major * 10000 + minor from PostgreSQL 10 on (170006 is 17.6.0), and
+// major * 10000 + minor * 100 + patch before (90621 is 9.6.21).
+func parseServerVersionNum(s string) (semver.Version, error) {
+	n, err := strconv.ParseUint(strings.TrimSpace(s), 10, 32)
+	if err != nil || n == 0 {
+		return semver.Version{}, fmt.Errorf("error parsing server_version_num %q", s)
+	}
+	if n >= 100000 {
+		return semver.Version{Major: n / 10000, Minor: n % 10000}, nil
+	}
+	return semver.Version{Major: n / 10000, Minor: (n / 100) % 100, Patch: n % 100}, nil
 }
 
 func openImpersonatedGCPDBConnection(ctx context.Context, dsn string, targetServiceAccountEmail string) (*sql.DB, error) {

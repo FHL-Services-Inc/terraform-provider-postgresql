@@ -15,10 +15,10 @@ import (
 
 func resourcePostgreSQLDefaultPrivileges() *schema.Resource {
 	return &schema.Resource{
-		Create: PGResourceFunc(resourcePostgreSQLDefaultPrivilegesCreate),
-		Update: PGResourceFunc(resourcePostgreSQLDefaultPrivilegesCreate),
+		Create: PGResourceWriteFunc(retryOnConcurrentCatalogUpdate(resourcePostgreSQLDefaultPrivilegesCreate)),
+		Update: PGResourceWriteFunc(retryOnConcurrentCatalogUpdate(resourcePostgreSQLDefaultPrivilegesCreate)),
 		Read:   PGResourceFunc(resourcePostgreSQLDefaultPrivilegesRead),
-		Delete: PGResourceFunc(resourcePostgreSQLDefaultPrivilegesDelete),
+		Delete: PGResourceWriteFunc(retryOnConcurrentCatalogUpdate(resourcePostgreSQLDefaultPrivilegesDelete)),
 		Importer: &schema.ResourceImporter{
 			StateContext: resourcePostgreSQLDefaultPrivilegesImport,
 		},
@@ -31,10 +31,11 @@ func resourcePostgreSQLDefaultPrivileges() *schema.Resource {
 				Description: "The name of the role to which grant default privileges on",
 			},
 			"database": {
-				Type:        schema.TypeString,
-				Required:    true,
-				ForceNew:    true,
-				Description: "The database to grant default privileges for this role",
+				Type:         schema.TypeString,
+				Required:     true,
+				ForceNew:     true,
+				ValidateFunc: validation.StringIsNotEmpty,
+				Description:  "The database to grant default privileges for this role",
 			},
 			"owner": {
 				Type:        schema.TypeString,
@@ -98,6 +99,20 @@ func resourcePostgreSQLDefaultPrivilegesRead(db *DBConnection, d *schema.Resourc
 		)
 	}
 
+	// With catalog_snapshot the Read is served from the snapshot of the
+	// database; Create and Update read directly after their write.
+	snap, gone := grantReadSnapshot(db, d)
+	if gone {
+		return nil
+	}
+	if snap != nil {
+		err := readRoleDefaultPrivilegesFromSnapshot(snap, db, d)
+		if err == nil {
+			return nil
+		}
+		log.Printf("[WARN] could not read %s from the catalog snapshot, reading directly: %v", d.Id(), err)
+	}
+
 	return readRoleDefaultPrivileges(db, d)
 }
 
@@ -139,12 +154,12 @@ func resourcePostgreSQLDefaultPrivilegesCreate(db *DBConnection, d *schema.Resou
 	}
 	defer deferredRollback(txn)
 
-	if err := pgLockRole(txn, owner); err != nil {
+	if err := lockDefaultPrivileges(txn, d); err != nil {
 		return err
 	}
 
 	// Needed in order to set the owner of the db if the connection user is not a superuser
-	if err := withRolesGranted(txn, []string{owner}, func() error {
+	if err := withRolesGranted(db, txn, []string{owner}, func() error {
 
 		// Revoke all privileges before granting otherwise reducing privileges will not work.
 		// We just have to revoke them in the same transaction so role will not lose its privileges
@@ -188,13 +203,16 @@ func resourcePostgreSQLDefaultPrivilegesDelete(db *DBConnection, d *schema.Resou
 	}
 	defer deferredRollback(txn)
 
-	if err := pgLockRole(txn, owner); err != nil {
+	if err := lockDefaultPrivileges(txn, d); err != nil {
 		return err
 	}
 
 	// Needed in order to set the owner of the db if the connection user is not a superuser
-	if err := withRolesGranted(txn, []string{owner}, func() error {
-		return revokeRoleDefaultPrivileges(txn, d)
+	if err := withRolesGranted(db, txn, []string{owner}, func() error {
+		if err := revokeRoleDefaultPrivileges(txn, d); err != nil {
+			return err
+		}
+		return restoreBuiltinDefaultPrivileges(db, txn, d)
 	}); err != nil {
 		return err
 	}
@@ -204,6 +222,14 @@ func resourcePostgreSQLDefaultPrivilegesDelete(db *DBConnection, d *schema.Resou
 	}
 
 	return nil
+}
+
+// lockDefaultPrivileges locks the owner role (not its members: default
+// privileges change no membership), then the pg_default_acl row of the
+// resource (see grant_locks.go).
+func lockDefaultPrivileges(txn *sql.Tx, d *schema.ResourceData) error {
+	return pgLockGranteeAndObjects(txn, d.Get("owner").(string), "",
+		[]advisoryLockKey{defaultPrivilegesLockKey(d)})
 }
 
 // buildReadRoleDefaultPrivilegesQuery builds the default privileges Read query.
@@ -216,6 +242,13 @@ func resourcePostgreSQLDefaultPrivilegesDelete(db *DBConnection, d *schema.Resou
 // same entry the previous filter on pg_get_userbyid(grantor) = owner selected,
 // without calling that function for every default ACL item. A missing owner
 // matches no entry, exactly as before.
+//
+// Without a schema, a missing entry reads as acldefault(type, owner): this is
+// what the owner's new objects get, and PostgreSQL deletes a global entry that
+// becomes equal to it (e.g. ALL on tables for the owner itself, or EXECUTE on
+// functions for PUBLIC), so such an entry is present, not gone (#117). A
+// per-schema entry is only added to the global one, so a missing one grants
+// nothing.
 func buildReadRoleDefaultPrivilegesQuery(d *schema.ResourceData) (string, []any) {
 	pgSchema := d.Get("schema").(string)
 	args := []any{
@@ -224,24 +257,29 @@ func buildReadRoleDefaultPrivilegesQuery(d *schema.ResourceData) (string, []any)
 		objectTypes[d.Get("object_type").(string)],
 	}
 
-	namespace, schemaExists, withSchema := "0", "true", ""
+	const entry = `SELECT da.defaclacl FROM pg_default_acl da
+        WHERE da.defaclrole = (SELECT oid FROM o)
+          AND da.defaclnamespace = %s
+          AND da.defaclobjtype = $3`
+
+	acl, schemaExists, withSchema := "", "true", ""
 	if pgSchema != "" {
 		withSchema = `,
 n AS (SELECT oid FROM pg_namespace WHERE nspname = $4)`
-		namespace, schemaExists = "(SELECT oid FROM n)", "EXISTS (SELECT 1 FROM n)"
+		schemaExists = "EXISTS (SELECT 1 FROM n)"
+		acl = "(" + fmt.Sprintf(entry, "(SELECT oid FROM n)") + ")"
 		args = append(args, pgSchema)
+	} else {
+		acl = "COALESCE((" + fmt.Sprintf(entry, "0") + "),\n        acldefault(" +
+			pq.QuoteLiteral(defaultACLBuiltinType(d.Get("object_type").(string))) + ", (SELECT oid FROM o)))"
 	}
 
 	query := grantReadRoleCTE + `,
 o AS (SELECT oid FROM pg_roles WHERE rolname = $2)` + withSchema + `
 SELECT r.oid IS NOT NULL, ` + schemaExists + `, (
     SELECT array_agg(a.privilege_type)
-    FROM pg_default_acl da
-    CROSS JOIN LATERAL aclexplode(da.defaclacl) a
-    WHERE da.defaclrole = (SELECT oid FROM o)
-      AND da.defaclnamespace = ` + namespace + `
-      AND da.defaclobjtype = $3
-      AND a.grantee = r.oid
+    FROM aclexplode(` + acl + `) a
+    WHERE a.grantee = r.oid
 )
 FROM r
 `
@@ -307,6 +345,94 @@ func readRoleDefaultPrivileges(db *DBConnection, d *schema.ResourceData) error {
 	return nil
 }
 
+// readRoleDefaultPrivilegesFromSnapshot is readRoleDefaultPrivileges served
+// from the catalog snapshot, with the same outcome: the pg_default_acl entry
+// is the one keyed by the owner's OID, the schema's OID (0 without a schema)
+// and the object type; a missing role or schema removes the resource from
+// state; a missing owner reads as no privileges, and so does a missing entry
+// in a schema, while a missing global entry reads as the built-in defaults
+// (builtinDefaultPrivileges).
+func readRoleDefaultPrivilegesFromSnapshot(snap *catalogSnapshot, db *DBConnection, d *schema.ResourceData) error {
+	role := d.Get("role").(string)
+	pgSchema := d.Get("schema").(string)
+	privilegesInput := d.Get("privileges").(*schema.Set).List()
+
+	grantee, roleExists := snap.granteeOf(role)
+	schemaExists := true
+	var namespace uint32
+	if pgSchema != "" {
+		ns, ok := snap.namespaces[pgSchema]
+		schemaExists = ok
+		namespace = ns.oid
+	}
+
+	var privileges []string
+	if owner, ok := snap.roles[d.Get("owner").(string)]; ok {
+		key := defaultACLKey{owner: owner, namespace: namespace, objType: objectTypes[d.Get("object_type").(string)]}
+		if acl, ok := snap.defaultACL[key]; ok {
+			var err error
+			if privileges, err = aclPrivilegesGrantedTo(acl, grantee); err != nil {
+				return err
+			}
+		} else if pgSchema == "" {
+			privileges = builtinDefaultPrivileges(db, d.Get("object_type").(string), role == d.Get("owner").(string), role == publicRole)
+		}
+	}
+
+	if grantTargetGone(d, roleExists, schemaExists) {
+		return nil
+	}
+
+	// We consider no privileges as "not exists" unless no privileges were provided as input
+	if len(privileges) == 0 {
+		log.Printf("[DEBUG] no default privileges for role %s in schema %s", role, pgSchema)
+		if len(privilegesInput) != 0 {
+			d.SetId("")
+			return nil
+		}
+	}
+
+	privilegesSet := stringSliceToSet(privileges)
+	if !resourcePrivilegesEqual(privilegesSet, db, d) {
+		d.Set("privileges", privilegesSet)
+	}
+	d.SetId(generateDefaultPrivilegesID(d))
+
+	return nil
+}
+
+// defaultACLBuiltinType returns the acldefault object type of a default
+// privileges object type. It is the pg_default_acl.defaclobjtype of the object
+// type except for sequences: 'S' there, 's' for acldefault ('S' is a foreign
+// server).
+func defaultACLBuiltinType(objectType string) string {
+	if t := objectTypes[objectType]; t != "S" {
+		return t
+	}
+	return "s"
+}
+
+// builtinDefaultPrivileges returns the privileges acldefault(type, owner)
+// grants to the grantee of a default privileges resource, as the direct Read
+// gets them from the server: every privilege of the object type for the owner,
+// EXECUTE on functions and USAGE on types for PUBLIC, nothing for other roles.
+func builtinDefaultPrivileges(db *DBConnection, objectType string, isOwner, isPublic bool) []string {
+	var privileges []string
+	switch {
+	case isOwner:
+		for _, p := range allowedPrivilegesForObjectType(objectType, db) {
+			if p != "ALL" {
+				privileges = append(privileges, p)
+			}
+		}
+	case isPublic && (objectType == "function" || objectType == "routine"):
+		privileges = []string{"EXECUTE"}
+	case isPublic && objectType == "type":
+		privileges = []string{"USAGE"}
+	}
+	return privileges
+}
+
 func grantRoleDefaultPrivileges(txn *sql.Tx, d *schema.ResourceData) error {
 	role := d.Get("role").(string)
 	pgSchema := d.Get("schema").(string)
@@ -347,6 +473,38 @@ func grantRoleDefaultPrivileges(txn *sql.Tx, d *schema.ResourceData) error {
 		return fmt.Errorf("could not alter default privileges: %w", err)
 	}
 
+	return nil
+}
+
+// restoreBuiltinDefaultPrivileges grants back, after the REVOKE ALL of a
+// destroy, the built-in defaults (acldefault) a global entry gives the role:
+// everything for the owner itself, EXECUTE on functions and USAGE on types for
+// PUBLIC. Without it the destroy leaves the owner or PUBLIC with fewer
+// privileges on new objects than before the resource existed, and the
+// pg_default_acl row it leaves behind blocks DROP ROLE of the owner.
+// PostgreSQL deletes a global entry once it equals acldefault again. Per-schema
+// entries only add to the global one, so they have nothing to restore.
+func restoreBuiltinDefaultPrivileges(db *DBConnection, txn *sql.Tx, d *schema.ResourceData) error {
+	if d.Get("schema").(string) != "" {
+		return nil
+	}
+	role := d.Get("role").(string)
+	owner := d.Get("owner").(string)
+	objectType := d.Get("object_type").(string)
+	privileges := builtinDefaultPrivileges(db, objectType, role == owner, role == publicRole)
+	if len(privileges) == 0 {
+		return nil
+	}
+
+	query := fmt.Sprintf("ALTER DEFAULT PRIVILEGES FOR ROLE %s GRANT %s ON %sS TO %s",
+		pq.QuoteIdentifier(owner),
+		strings.Join(privileges, ","),
+		strings.ToUpper(objectType),
+		pq.QuoteIdentifier(role),
+	)
+	if _, err := txn.Exec(query); err != nil {
+		return fmt.Errorf("could not restore the built-in default privileges: %w", err)
+	}
 	return nil
 }
 

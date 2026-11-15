@@ -31,10 +31,10 @@ const (
 
 func resourcePostgreSQLSchema() *schema.Resource {
 	return &schema.Resource{
-		Create: PGResourceFunc(resourcePostgreSQLSchemaCreate),
+		Create: PGResourceWriteFunc(resourcePostgreSQLSchemaCreate),
 		Read:   PGResourceFunc(resourcePostgreSQLSchemaRead),
-		Update: PGResourceFunc(resourcePostgreSQLSchemaUpdate),
-		Delete: PGResourceFunc(resourcePostgreSQLSchemaDelete),
+		Update: PGResourceWriteFunc(resourcePostgreSQLSchemaUpdate),
+		Delete: PGResourceWriteFunc(resourcePostgreSQLSchemaDelete),
 		Importer: &schema.ResourceImporter{
 			StateContext: schema.ImportStatePassthroughContext,
 		},
@@ -141,7 +141,7 @@ func resourcePostgreSQLSchemaCreate(db *DBConnection, d *schema.ResourceData) er
 
 	}
 
-	if err := withRolesGranted(txn, rolesToGrant, func() error {
+	if err := withRolesGranted(db, txn, rolesToGrant, func() error {
 		return createSchema(db, txn, d)
 	}); err != nil {
 		return err
@@ -249,7 +249,7 @@ func resourcePostgreSQLSchemaDelete(db *DBConnection, d *schema.ResourceData) er
 
 	owner := d.Get("owner").(string)
 
-	if err = withRolesGranted(txn, []string{owner}, func() error {
+	if err = withRolesGranted(db, txn, []string{owner}, func() error {
 		dropMode := "RESTRICT"
 		if d.Get(schemaDropCascade).(bool) {
 			dropMode = "CASCADE"
@@ -350,6 +350,16 @@ func resourcePostgreSQLSchemaUpdate(db *DBConnection, d *schema.ResourceData) er
 	}
 	defer deferredRollback(txn)
 
+	// setSchemaPolicy takes the membership locks of the owner
+	// (withRolesGranted). Take them before the DDL below: waiting for them
+	// while holding locks on the schema could block, forever, an owner change
+	// of the database that holds them and runs REASSIGN OWNED on that schema
+	// (setAlterOwnership, see membershipLocks).
+	if owner := d.Get(schemaOwnerAttr).(string); owner != "" && d.HasChange(schemaPolicyAttr) &&
+		(d.HasChange(schemaNameAttr) || d.HasChange(schemaOwnerAttr)) {
+		lockMembershipsForTxn(txn, []string{owner})
+	}
+
 	if err := setSchemaName(txn, d, databaseName); err != nil {
 		return err
 	}
@@ -358,7 +368,7 @@ func resourcePostgreSQLSchemaUpdate(db *DBConnection, d *schema.ResourceData) er
 		return err
 	}
 
-	if err := setSchemaPolicy(txn, d); err != nil {
+	if err := setSchemaPolicy(db, txn, d); err != nil {
 		return err
 	}
 
@@ -410,7 +420,7 @@ func setSchemaOwner(txn *sql.Tx, d *schema.ResourceData) error {
 	return nil
 }
 
-func setSchemaPolicy(txn *sql.Tx, d *schema.ResourceData) error {
+func setSchemaPolicy(db *DBConnection, txn *sql.Tx, d *schema.ResourceData) error {
 	if !d.HasChange(schemaPolicyAttr) {
 		return nil
 	}
@@ -475,7 +485,7 @@ func setSchemaPolicy(txn *sql.Tx, d *schema.ResourceData) error {
 		rolesToGrant = append(rolesToGrant, owner)
 	}
 
-	return withRolesGranted(txn, rolesToGrant, func() error {
+	return withRolesGranted(db, txn, rolesToGrant, func() error {
 		for _, query := range queries {
 			if _, err := txn.Exec(query); err != nil {
 				return fmt.Errorf("error updating schema DCL: %w", err)

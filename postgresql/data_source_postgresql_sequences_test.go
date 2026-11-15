@@ -108,3 +108,54 @@ func generateDataSourceSequencesConfig(dbName string) string {
 
 	`, dbName)
 }
+
+// Identity column sequences and sequences owned by a role the provider user
+// has no privileges on must be listed too.
+func TestAccPostgresqlDataSourceSequences_identityAndOtherOwner(t *testing.T) {
+	skipIfNotAcc(t)
+
+	dbSuffix, teardown := setupTestDatabase(t, true, true)
+	defer teardown()
+
+	dbName, roleName := getTestDBNames(dbSuffix)
+	config := getTestConfig(t)
+
+	// The other owner creates its object itself; setupTestDatabase only grants USAGE.
+	dbExecute(t, config.connStr(dbName), fmt.Sprintf("GRANT CREATE ON SCHEMA dev_schema TO %s", roleName))
+	dbExecute(t, config.connStr(dbName), "CREATE TABLE dev_schema.t (id int GENERATED ALWAYS AS IDENTITY, x serial)")
+	createTestSequences(t, dbSuffix, []string{"dev_schema.plain_seq"}, "")
+	createTestSequences(t, dbSuffix, []string{"dev_schema.other_seq"}, roleName)
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:  func() { testAccPreCheck(t) },
+		Providers: testAccProviders,
+		Steps: []resource.TestStep{
+			{
+				Config: fmt.Sprintf(`
+				data "postgresql_sequences" "all" {
+					database = "%[1]s"
+					schemas  = ["dev_schema"]
+				}
+
+				data "postgresql_sequences" "identity" {
+					database          = "%[1]s"
+					schemas           = ["dev_schema"]
+					like_any_patterns = ["t_id%%"]
+				}
+				`, dbName),
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr("data.postgresql_sequences.all", "sequences.#", "4"),
+					resource.TestCheckResourceAttr("data.postgresql_sequences.all", "sequences.0.object_name", "other_seq"),
+					resource.TestCheckResourceAttr("data.postgresql_sequences.all", "sequences.0.data_type", "bigint"),
+					resource.TestCheckResourceAttr("data.postgresql_sequences.all", "sequences.1.object_name", "plain_seq"),
+					resource.TestCheckResourceAttr("data.postgresql_sequences.all", "sequences.2.object_name", "t_id_seq"),
+					resource.TestCheckResourceAttr("data.postgresql_sequences.all", "sequences.2.schema_name", "dev_schema"),
+					resource.TestCheckResourceAttr("data.postgresql_sequences.all", "sequences.2.data_type", "integer"),
+					resource.TestCheckResourceAttr("data.postgresql_sequences.all", "sequences.3.object_name", "t_x_seq"),
+					resource.TestCheckResourceAttr("data.postgresql_sequences.identity", "sequences.#", "1"),
+					resource.TestCheckResourceAttr("data.postgresql_sequences.identity", "sequences.0.object_name", "t_id_seq"),
+				),
+			},
+		},
+	})
+}
