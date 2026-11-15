@@ -18,7 +18,9 @@ services:
         ports:
             - 25432:5432
         healthcheck:
-          test: [ "CMD-SHELL", "pg_isready" ]
-          interval: 10s
+          # TCP, not the socket: the image's init-time server only listens on
+          # the socket, so this turns healthy once the real server is up.
+          test: [ "CMD-SHELL", "pg_isready -h 127.0.0.1" ]
+          interval: 2s
           timeout: 5s
-          retries: 5
+          retries: 30
