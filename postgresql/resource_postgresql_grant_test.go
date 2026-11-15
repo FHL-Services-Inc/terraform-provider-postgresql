@@ -1481,7 +1481,7 @@ func TestAccPostgresqlGrantDatabaseNotOwned(t *testing.T) {
 	dbExecute(t, dsn, fmt.Sprintf("REVOKE %s FROM %s", ownerRole, adminUser))
 	defer func() {
 		dbExecute(t, dsn, fmt.Sprintf("GRANT %s TO %s", ownerRole, adminUser))
-		dbExecute(t, dsn, fmt.Sprintf("DROP DATABASE IF EXISTS %s", dbName))
+		dropTestDatabase(t, config, dbName)
 		dbExecute(t, dsn, fmt.Sprintf("DROP ROLE IF EXISTS %s", roRole))
 		dbExecute(t, dsn, fmt.Sprintf("REVOKE %s FROM %s", ownerRole, adminUser))
 		dbExecute(t, dsn, fmt.Sprintf("DROP ROLE IF EXISTS %s", ownerRole))

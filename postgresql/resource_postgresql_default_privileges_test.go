@@ -447,7 +447,7 @@ func TestAccPostgresqlDefaultPrivileges_ReverseMembershipManyDatabases(t *testin
 	for i := range databases {
 		dbNames[i], _ = getTestDBNames(fmt.Sprintf("dp_reverse_%d", i))
 		dbExecute(t, dsn, fmt.Sprintf("CREATE DATABASE %s", dbNames[i]))
-		defer dbExecute(t, dsn, fmt.Sprintf("DROP DATABASE %s", dbNames[i]))
+		defer dropTestDatabase(t, config, dbNames[i])
 	}
 
 	tfConfig := func(tablePrivileges, sequencePrivileges string) string {
