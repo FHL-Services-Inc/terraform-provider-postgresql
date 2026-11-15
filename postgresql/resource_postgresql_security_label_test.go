@@ -4,7 +4,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"strings"
+	"regexp"
 	"testing"
 
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/resource"
@@ -92,6 +92,47 @@ func TestAccPostgresqlSecurityLabel_Update(t *testing.T) {
 	})
 }
 
+// TestAccPostgresqlSecurityLabel_Import imports a label by its ID, including
+// a role name with a dot and an upper case object type (issue #189).
+func TestAccPostgresqlSecurityLabel_Import(t *testing.T) {
+	roleName := testUniqueName("security_label.test_role")
+
+	resource.Test(t, resource.TestCase{
+		PreCheck: func() {
+			testAccPreCheck(t)
+			testCheckCompatibleVersion(t, featureSecurityLabel)
+			testSuperuserPreCheck(t)
+			testSecurityLabelProviderPreCheck(t, "dummy")
+		},
+		Providers:    testAccProviders,
+		CheckDestroy: testAccCheckPostgresqlSecurityLabelDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config: testAccPostgresqlSecurityLabelConfig(roleName),
+				Check: resource.TestCheckResourceAttr(
+					"postgresql_security_label.test_label", "id", "dummy.role."+roleName),
+			},
+			{
+				ResourceName:      "postgresql_security_label.test_label",
+				ImportState:       true,
+				ImportStateVerify: true,
+			},
+			{
+				ResourceName:      "postgresql_security_label.test_label",
+				ImportState:       true,
+				ImportStateId:     "dummy.ROLE." + roleName,
+				ImportStateVerify: true,
+			},
+			{
+				ResourceName:  "postgresql_security_label.test_label",
+				ImportState:   true,
+				ImportStateId: "dummy.role.no_such_role_" + roleName,
+				ExpectError:   regexp.MustCompile("no security label matches the ID"),
+			},
+		},
+	})
+}
+
 // testSecurityLabelProviderPreCheck skips the test unless the label provider
 // is loaded on the server. The tests use the dummy_seclabel module, which the
 // image built from tests/build preloads but a stock postgres image doesn't
@@ -156,8 +197,9 @@ func testAccCheckPostgresqlSecurityLabelDestroy(s *terraform.State) error {
 		}
 		defer deferredRollback(txn)
 
-		splitted := strings.Split(rs.Primary.ID, ".")
-		exists, err := checkSecurityLabelExists(txn, splitted[1], splitted[2], splitted[0])
+		// Names may contain dots, so use the attributes rather than the ID.
+		attrs := rs.Primary.Attributes
+		exists, err := checkSecurityLabelExists(txn, attrs[securityLabelObjectTypeAttr], attrs[securityLabelObjectNameAttr], attrs[securityLabelProviderAttr])
 
 		if err != nil {
 			return fmt.Errorf("error checking security label%s", err)
