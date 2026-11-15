@@ -25,7 +25,11 @@ const (
 	// (WITH ADMIN, grantor = bootstrap superuser). The row granted by
 	// current_user is the one this resource creates and revokes, so it is
 	// preferred; any other row is a fallback, ordered by grantor OID so the
-	// pick is stable. Before 16 there is at most one row per pair.
+	// pick is stable. When current_user is a superuser, PostgreSQL records
+	// the bootstrap superuser (OID 10) as grantor instead of current_user
+	// (check_role_grantor), and REVOKE removes that row, so OID 10 is the
+	// preferred grantor for a superuser. Before 16 there is at most one row
+	// per pair, so the ordering does not change anything there.
 	getGrantRoleQuery = `
 SELECT
   ur.rolname as role,
@@ -39,7 +43,10 @@ WHERE
   ur.rolname = $1 AND
   gr.rolname = $2
 ORDER BY
-  (m.grantor = (SELECT oid FROM pg_roles WHERE rolname = current_user)) DESC,
+  (m.grantor = (
+    SELECT CASE WHEN rolsuper THEN 10::oid ELSE oid END
+    FROM pg_roles WHERE rolname = current_user
+  )) DESC,
   m.grantor
 LIMIT 1;
 `
