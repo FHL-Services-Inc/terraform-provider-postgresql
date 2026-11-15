@@ -74,9 +74,13 @@ resource reads a missing entry as the built-in defaults. A resource such as
 `role = owner`, `privileges = ["ALL"]` therefore applies cleanly and shows no
 drift.
 
-Destroying such a resource revokes the privileges like any other, so the
-owner (or `PUBLIC`) is left without them on new objects, and PostgreSQL keeps a
-`pg_default_acl` entry for it.
+Destroying a resource without a `schema` for the owner itself, or for `PUBLIC`
+on functions, routines or types, gives back these built-in defaults instead of
+revoking everything. The owner (or `PUBLIC`) then gets the same privileges on
+new objects as before the resource existed, and PostgreSQL removes the
+`pg_default_acl` entry unless other roles still have default privileges in it,
+so it no longer blocks `DROP ROLE` of the owner. Destroying any other resource
+(another role, or one with a `schema`) revokes all its default privileges.
 
 ## Concurrency
 

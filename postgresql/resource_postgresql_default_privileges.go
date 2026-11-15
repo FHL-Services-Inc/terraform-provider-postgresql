@@ -209,7 +209,10 @@ func resourcePostgreSQLDefaultPrivilegesDelete(db *DBConnection, d *schema.Resou
 
 	// Needed in order to set the owner of the db if the connection user is not a superuser
 	if err := withRolesGranted(db, txn, []string{owner}, func() error {
-		return revokeRoleDefaultPrivileges(txn, d)
+		if err := revokeRoleDefaultPrivileges(txn, d); err != nil {
+			return err
+		}
+		return restoreBuiltinDefaultPrivileges(db, txn, d)
 	}); err != nil {
 		return err
 	}
@@ -470,6 +473,38 @@ func grantRoleDefaultPrivileges(txn *sql.Tx, d *schema.ResourceData) error {
 		return fmt.Errorf("could not alter default privileges: %w", err)
 	}
 
+	return nil
+}
+
+// restoreBuiltinDefaultPrivileges grants back, after the REVOKE ALL of a
+// destroy, the built-in defaults (acldefault) a global entry gives the role:
+// everything for the owner itself, EXECUTE on functions and USAGE on types for
+// PUBLIC. Without it the destroy leaves the owner or PUBLIC with fewer
+// privileges on new objects than before the resource existed, and the
+// pg_default_acl row it leaves behind blocks DROP ROLE of the owner.
+// PostgreSQL deletes a global entry once it equals acldefault again. Per-schema
+// entries only add to the global one, so they have nothing to restore.
+func restoreBuiltinDefaultPrivileges(db *DBConnection, txn *sql.Tx, d *schema.ResourceData) error {
+	if d.Get("schema").(string) != "" {
+		return nil
+	}
+	role := d.Get("role").(string)
+	owner := d.Get("owner").(string)
+	objectType := d.Get("object_type").(string)
+	privileges := builtinDefaultPrivileges(db, objectType, role == owner, role == publicRole)
+	if len(privileges) == 0 {
+		return nil
+	}
+
+	query := fmt.Sprintf("ALTER DEFAULT PRIVILEGES FOR ROLE %s GRANT %s ON %sS TO %s",
+		pq.QuoteIdentifier(owner),
+		strings.Join(privileges, ","),
+		strings.ToUpper(objectType),
+		pq.QuoteIdentifier(role),
+	)
+	if _, err := txn.Exec(query); err != nil {
+		return fmt.Errorf("could not restore the built-in default privileges: %w", err)
+	}
 	return nil
 }
 
