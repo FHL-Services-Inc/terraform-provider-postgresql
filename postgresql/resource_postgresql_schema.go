@@ -527,7 +527,7 @@ func setSchemaPolicy(db *DBConnection, txn *sql.Tx, d *schema.ResourceData) erro
 			case err != nil:
 				return fmt.Errorf("error reading schema: %w", err)
 			default:
-				queries = append(queries, rolePolicy.Revokes(schemaName)...)
+				queries = append(queries, revokeAllSchemaPolicy(rolePolicy, schemaName)...)
 			}
 		}
 	}
@@ -547,7 +547,7 @@ func setSchemaPolicy(db *DBConnection, txn *sql.Tx, d *schema.ResourceData) erro
 		{
 			oldPolicies := policies[0].(map[string]any)
 			rolePolicy := schemaPolicyToACL(oldPolicies)
-			queries = append(queries, rolePolicy.Revokes(schemaName)...)
+			queries = append(queries, revokeAllSchemaPolicy(rolePolicy, schemaName)...)
 		}
 
 		{
@@ -574,6 +574,15 @@ func setSchemaPolicy(db *DBConnection, txn *sql.Tx, d *schema.ResourceData) erro
 		}
 		return nil
 	})
+}
+
+// revokeAllSchemaPolicy returns the statements that revoke the privileges of
+// p on schemaName, with their grant options. acl.Schema.Revokes only revokes the
+// grant option of a privilege held WITH GRANT OPTION, which leaves the
+// privilege itself in place.
+func revokeAllSchemaPolicy(p acl.Schema, schemaName string) []string {
+	p.GrantOptions = 0
+	return p.Revokes(schemaName)
 }
 
 // schemaChangedPolicies walks old and new to create a set of queries that can
