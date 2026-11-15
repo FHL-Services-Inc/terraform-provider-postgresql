@@ -215,6 +215,9 @@ resources, 10 ms round-trip time) went from 39.9 s to 14.6 s; with
 - Performance tuning guide: connection reuse, connection limits, binary
   parameters, catalog snapshot, configuration layout and benchmark numbers
   (#153, #162).
+- Amazon RDS and Aurora: owner roles with `rds_iam` break the password logins
+  of the provider while it is a temporary member of them; use a separate login
+  role with `rds_iam` (#208, #145).
 
 ### Tests and CI
 
