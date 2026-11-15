@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"database/sql/driver"
+	"errors"
 	"io"
 	"strings"
 	"sync"
@@ -21,6 +22,9 @@ type sessionRoleDriver struct {
 	statements []string
 	// superuser is the rolsuper attribute of the login role "admin".
 	superuser bool
+	// failGrant makes every GRANT statement fail like a GRANT of a role
+	// without ADMIN OPTION on PostgreSQL 16+.
+	failGrant bool
 }
 
 func (d *sessionRoleDriver) Open(string) (driver.Conn, error) {
@@ -62,6 +66,12 @@ func (c *sessionRoleConn) Begin() (driver.Tx, error)           { return sessionR
 
 func (c *sessionRoleConn) ExecContext(_ context.Context, query string, _ []driver.NamedValue) (driver.Result, error) {
 	c.driver.record(query)
+	c.driver.mu.Lock()
+	failGrant := c.driver.failGrant
+	c.driver.mu.Unlock()
+	if failGrant && strings.HasPrefix(query, "GRANT ") {
+		return nil, errors.New(`permission denied to grant role "owner"`)
+	}
 	return driver.RowsAffected(0), nil
 }
 
@@ -201,9 +211,9 @@ func TestSessionRoleMemoizedNonSuperuser(t *testing.T) {
 	if got := drv.count("information_schema"); got != 0 {
 		t.Errorf("information_schema probed %d times, want 0; statements: %q", got, drv.all())
 	}
-	// Each call: revoke check + grant check + revoke check after fn.
-	if got := drv.count("FROM pg_auth_members"); got != 6 {
-		t.Errorf("membership checks = %d, want 6; statements: %q", got, drv.all())
+	// Each call: one batched membership query + revoke check after fn.
+	if got := drv.count("FROM pg_auth_members"); got != 4 {
+		t.Errorf("membership checks = %d, want 4; statements: %q", got, drv.all())
 	}
 }
 
