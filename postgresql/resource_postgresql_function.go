@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"slices"
 	"strings"
 
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
@@ -218,9 +219,9 @@ func resourcePostgreSQLFunctionReadImpl(db *DBConnection, d *schema.ResourceData
 		functionId = generatedFunctionId
 	}
 
-	databaseName, functionSignature, expandErr := expandFunctionID(functionId, d, db)
-	if expandErr != nil {
-		return expandErr
+	databaseName, fn, err := functionRefFromID(functionId, d, db)
+	if err != nil {
+		return err
 	}
 
 	var (
@@ -233,7 +234,7 @@ func resourcePostgreSQLFunctionReadImpl(db *DBConnection, d *schema.ResourceData
 	query := `SELECT pg_get_functiondef(p.oid), n.nspname, p.proname, ` + functionArgsQuery + ` ` +
 		`FROM pg_proc p ` +
 		`JOIN pg_namespace n ON p.pronamespace = n.oid ` +
-		`WHERE p.oid = to_regprocedure($1)`
+		`WHERE ` + functionMatch
 
 	dbc, err := initConnection(db.client, databaseName)
 	if err != nil {
@@ -245,7 +246,7 @@ func resourcePostgreSQLFunctionReadImpl(db *DBConnection, d *schema.ResourceData
 		return err
 	}
 
-	err = dbc.QueryRow(query, functionSignature).Scan(&funcDefinition, &funcSchema, &funcName, &funcArgs)
+	err = dbc.QueryRow(query, fn.schema, fn.name, pq.Array(fn.argTypes)).Scan(&funcDefinition, &funcSchema, &funcName, &funcArgs)
 	switch {
 	case err == sql.ErrNoRows:
 		log.Printf("[WARN] PostgreSQL function: %s", functionId)
@@ -343,11 +344,24 @@ func resourcePostgreSQLFunctionDelete(db *DBConnection, d *schema.ResourceData) 
 	}
 	defer deferredRollback(txn)
 
-	if _, err := txn.Exec(sql); err != nil {
+	// Dropping the function needs its owner, and USAGE on its schema to
+	// resolve the name (#209).
+	_, fn, err := functionRefFromID(d.Id(), d, db)
+	if err != nil {
+		return err
+	}
+	roles, err := functionOwnerRoles(txn, fn.schema, "USAGE", &fn)
+	if err != nil {
+		return err
+	}
+	if err := withRolesGranted(db, txn, roles, func() error {
+		_, err := txn.Exec(sql)
+		return err
+	}); err != nil {
 		return err
 	}
 
-	if err := txn.Commit(); err != nil {
+	if err := commitTxn(txn); err != nil {
 		return err
 	}
 
@@ -444,15 +458,139 @@ func createFunction(db *DBConnection, d *schema.ResourceData, replace bool) erro
 	}
 	defer deferredRollback(txn)
 
-	if _, err := txn.Exec(sql); err != nil {
+	// Creating the function needs CREATE on its schema (its owner), and
+	// replacing it also needs the function's owner (#209).
+	var existing *functionRef
+	if replace {
+		_, fn, err := functionRefFromID(d.Id(), d, db)
+		if err != nil {
+			return err
+		}
+		existing = &fn
+	}
+	roles, err := functionOwnerRoles(txn, pgFunction.Schema, "CREATE", existing)
+	if err != nil {
+		return err
+	}
+	if err := withRolesGranted(db, txn, roles, func() error {
+		_, err := txn.Exec(sql)
+		return err
+	}); err != nil {
 		return err
 	}
 
-	if err := txn.Commit(); err != nil {
-		return err
+	return commitTxn(txn)
+}
+
+// functionOwnerRoles returns the roles a non-superuser provider user has to
+// take temporarily to write a function and does not act as already: the owner
+// of schemaName when the user lacks schemaPrivilege on it (CREATE to create or
+// replace, USAGE to resolve the name in DROP), and the owner of the existing
+// function fn, to replace or drop it. fn can be nil. pg_database_owner, which
+// cannot have explicit members, is resolved to the database owner. The
+// function is still owned by the provider user, as it is for a superuser.
+func functionOwnerRoles(txn *sql.Tx, schemaName, schemaPrivilege string, fn *functionRef) ([]string, error) {
+	var owners []string
+	var schemaOwner string
+	var hasPrivilege bool
+	err := txn.QueryRow(
+		"SELECT pg_get_userbyid(nspowner), has_schema_privilege(oid, $2) FROM pg_namespace WHERE nspname = $1",
+		schemaName, schemaPrivilege,
+	).Scan(&schemaOwner, &hasPrivilege)
+	switch {
+	case err == sql.ErrNoRows:
+		// The schema is gone, and the function with it (DROP ... IF EXISTS).
+	case err != nil:
+		return nil, fmt.Errorf("could not check %s privilege on schema %s: %w", schemaPrivilege, schemaName, err)
+	case !hasPrivilege:
+		owners = append(owners, schemaOwner)
+	}
+	if fn != nil {
+		var owner string
+		var actsAsOwner bool
+		err := txn.QueryRow(
+			"SELECT pg_get_userbyid(p.proowner), pg_has_role(p.proowner, 'USAGE') "+
+				"FROM pg_proc p JOIN pg_namespace n ON p.pronamespace = n.oid WHERE "+functionMatch,
+			fn.schema, fn.name, pq.Array(fn.argTypes),
+		).Scan(&owner, &actsAsOwner)
+		switch {
+		case err == sql.ErrNoRows:
+		case err != nil:
+			return nil, fmt.Errorf("could not read the owner of function %s.%s: %w", fn.schema, fn.name, err)
+		case !actsAsOwner:
+			owners = append(owners, owner)
+		}
 	}
 
-	return nil
+	owners, err = resolveOwners(txn, owners)
+	if err != nil {
+		return nil, err
+	}
+	var roles []string
+	for _, owner := range owners {
+		if owner != "" && !slices.Contains(roles, owner) {
+			roles = append(roles, owner)
+		}
+	}
+	return roles, nil
+}
+
+// functionMatch finds a function in pg_proc p joined to pg_namespace n by its
+// schema ($1), name ($2) and argument types ($3, text[]). Unlike
+// to_regprocedure it needs no USAGE on the schema of the function, which the
+// provider user does not have when another role owns the schema (#209).
+// proargtypes prints as space-separated OIDs; a type that does not exist
+// prints as "-" and matches nothing.
+const functionMatch = `n.nspname = $1 AND p.proname = $2 AND p.proargtypes::text = array_to_string(ARRAY(` +
+	`SELECT to_regtype(t)::oid FROM unnest($3::text[]) WITH ORDINALITY AS a(t, i) ORDER BY i), ' ', '-')`
+
+// functionRef is a function as its ID names it: schema, name and the types of
+// its arguments (OUT arguments excluded), as written in the configuration.
+type functionRef struct {
+	schema, name string
+	argTypes     []string
+}
+
+// functionRefFromID parses a function ID like expandFunctionID.
+func functionRefFromID(functionId string, d *schema.ResourceData, db *DBConnection) (string, functionRef, error) {
+	databaseName, schemaName, name, args, err := parseFunctionID(functionId)
+	if err != nil {
+		return "", functionRef{}, err
+	}
+	if databaseName == "" {
+		clientDatabaseName := "postgres"
+		if db != nil {
+			clientDatabaseName = db.client.databaseName
+		}
+		databaseName = getDatabase(d, clientDatabaseName)
+	}
+	return databaseName, functionRef{schema: schemaName, name: name, argTypes: splitFunctionArgTypes(args)}, nil
+}
+
+// splitFunctionArgTypes splits the argument list of a function ID at the
+// commas that are not inside parentheses or double quotes, e.g.
+// "integer, numeric(10,2)".
+func splitFunctionArgTypes(args string) []string {
+	var types []string
+	depth, quoted, start := 0, false, 0
+	for i, c := range args {
+		switch {
+		case c == '"':
+			quoted = !quoted
+		case quoted:
+		case c == '(':
+			depth++
+		case c == ')':
+			depth--
+		case c == ',' && depth == 0:
+			types = append(types, strings.TrimSpace(args[start:i]))
+			start = i + 1
+		}
+	}
+	if last := strings.TrimSpace(args[start:]); last != "" || len(types) > 0 {
+		types = append(types, last)
+	}
+	return types
 }
 
 func generateFunctionID(db *DBConnection, d *schema.ResourceData) (string, error) {

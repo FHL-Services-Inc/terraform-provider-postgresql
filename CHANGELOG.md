@@ -203,6 +203,11 @@ resources, 10 ms round-trip time) went from 39.9 s to 14.6 s; with
 - **`postgresql_function`**: argument defaults and types containing commas are
   read from the catalog; IDs are parsed up to the argument list, so argument
   types can be schema-qualified (#192, #126, #127).
+- **`postgresql_function`** in a schema owned by another role works for a
+  non-superuser provider: create, replace and drop take the owner of the
+  schema and of the function when the provider lacks the privilege, and the
+  function is read from the catalog without `USAGE` on its schema (#212,
+  #209).
 - **Data sources**: `postgresql_tables` and `postgresql_sequences` read from
   `pg_class` (#187, #125, #139); pattern filters are bound instead of
   interpolated (#75, #74).
