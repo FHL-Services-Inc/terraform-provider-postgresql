@@ -12,7 +12,12 @@ setup() {
 }
 
 run() {
-  go test -count=1 ./postgresql -v -timeout 120m
+  # TEST_RUN, if set, is passed to -run (CI uses it to run one shard).
+  args=(-count=1 ./postgresql -v -timeout 120m)
+  if [ -n "${TEST_RUN:-}" ]; then
+    args+=(-run "$TEST_RUN")
+  fi
+  go test "${args[@]}"
   
   # keep the return value for the scripts to fail and clean properly
   return $?

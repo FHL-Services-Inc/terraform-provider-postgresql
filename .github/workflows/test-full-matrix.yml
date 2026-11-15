@@ -1,0 +1,19 @@
+name: test (full matrix)
+
+# Adding the `full-matrix` label to a PR runs the tests on every PostgreSQL
+# version right away. Later pushes to a PR with that label run the full matrix
+# from test.yml itself.
+
+on:
+  pull_request:
+    types: [labeled]
+
+permissions:
+  contents: read
+
+jobs:
+  full-matrix:
+    if: github.event.label.name == 'full-matrix'
+    uses: ./.github/workflows/test.yml
+    with:
+      full_matrix: true
