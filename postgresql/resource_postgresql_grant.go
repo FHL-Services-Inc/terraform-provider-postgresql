@@ -2,9 +2,12 @@ package postgresql
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 	"log"
+	"regexp"
 	"strings"
+	"unicode"
 
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/validation"
@@ -550,44 +553,286 @@ LEFT JOIN LATERAL (
 	return query, args
 }
 
+// functionProkindFilter returns the pg_proc.prokind condition matching what a
+// GRANT of the object type applies to: ON FUNCTION / ALL FUNCTIONS covers plain,
+// aggregate and window functions but not procedures, ON PROCEDURE only
+// procedures, ON ROUTINE all of them. Before PostgreSQL 11 (no procedures, no
+// prokind column) every routine is a function and no filter is needed.
+func functionProkindFilter(objectType string, hasProkind bool) string {
+	if !hasProkind {
+		return ""
+	}
+	switch objectType {
+	case "function":
+		return "p.prokind <> 'p'"
+	case "procedure":
+		return "p.prokind = 'p'"
+	}
+	return ""
+}
+
+// isFunctionSignature reports whether an objects entry of a function/
+// procedure/routine grant carries an argument list, e.g. "f(integer)". The
+// GRANT splits such entries on the first "(" (see quoteIdentifyIdent).
+func isFunctionSignature(entry string) bool {
+	return strings.Contains(entry, "(")
+}
+
+// multiWordArgType matches the SQL standard type names made of several words
+// (and their typmods / array suffixes). Their first word must not be taken for
+// an argument name when reducing a signature to its types.
+var multiWordArgType = regexp.MustCompile(`(?i)^(` +
+	`double\s+precision` +
+	`|(character|char|nchar|national\s+(character|char)|bit)\s+varying(\s*\(\s*\d+\s*\))?` +
+	`|national\s+(character|char)(\s*\(\s*\d+\s*\))?` +
+	`|(timestamp|time)(\s*\(\s*\d+\s*\))?(\s+(with|without)\s+time\s+zone)?` +
+	`|interval(\s*\(\s*\d+\s*\))?(\s+(year|month|day|hour|minute|second)(\s+to\s+(month|hour|minute|second))?)?(\s*\(\s*\d+\s*\))?` +
+	`)(\s*\[\s*\d*\s*\])*$`)
+
+// splitSQLTopLevel splits s on the separator runes found outside of
+// parentheses, brackets, double-quoted identifiers and single-quoted literals.
+// Empty parts are dropped when skipEmpty is set.
+func splitSQLTopLevel(s string, isSep func(rune) bool, skipEmpty bool) []string {
+	var parts []string
+	var cur strings.Builder
+	depth := 0
+	var quote rune
+	flush := func() {
+		part := strings.TrimSpace(cur.String())
+		if part != "" || !skipEmpty {
+			parts = append(parts, part)
+		}
+		cur.Reset()
+	}
+	for _, r := range s {
+		switch {
+		case quote != 0:
+			if r == quote {
+				quote = 0
+			}
+		case r == '"' || r == '\'':
+			quote = r
+		case r == '(' || r == '[':
+			depth++
+		case r == ')' || r == ']':
+			depth--
+		case depth == 0 && isSep(r):
+			flush()
+			continue
+		}
+		cur.WriteRune(r)
+	}
+	flush()
+	return parts
+}
+
+// functionArgType reduces one argument of a GRANT signature,
+// "[argmode] [argname] argtype [DEFAULT expr]", to its type. ok is false for
+// an OUT argument, which is not part of the signature.
+func functionArgType(arg string) (argType string, ok bool) {
+	tokens := splitSQLTopLevel(arg, unicode.IsSpace, true)
+
+	// Drop a default value ("DEFAULT expr" or "= expr").
+	for i, tok := range tokens {
+		if strings.EqualFold(tok, "default") || strings.HasPrefix(tok, "=") {
+			tokens = tokens[:i]
+			break
+		}
+		if before, _, found := strings.Cut(tok, "="); found && !strings.ContainsAny(before, "\"'") {
+			tokens = append(tokens[:i:i], before)
+			break
+		}
+	}
+
+	if len(tokens) > 1 {
+		switch strings.ToUpper(tokens[0]) {
+		case "OUT":
+			return "", false
+		case "IN", "INOUT", "VARIADIC":
+			tokens = tokens[1:]
+		}
+	}
+
+	// "name type": the first token is an argument name unless the tokens
+	// form a multi-word type name or the second one only continues the type
+	// ("integer []", "numeric (10,2)").
+	if len(tokens) > 1 && !multiWordArgType.MatchString(strings.Join(tokens, " ")) &&
+		!strings.HasPrefix(tokens[1], "[") && !strings.HasPrefix(tokens[1], "(") {
+		tokens = tokens[1:]
+	}
+	return strings.Join(tokens, " "), true
+}
+
+// functionLookupSignature reduces a function/procedure/routine objects entry
+// to the form to_regprocedure accepts: GRANT takes argument modes, names (and
+// ignores OUT arguments), to_regprocedure only a list of types. "f(IN x
+// integer, OUT y text)" becomes "f(integer)"; the types are kept as written.
+// An entry without a complete argument list is returned unchanged.
+func functionLookupSignature(entry string) string {
+	name, rest, found := strings.Cut(entry, "(")
+	if !found || !strings.HasSuffix(strings.TrimSpace(rest), ")") {
+		return entry
+	}
+	rest = strings.TrimSpace(rest)
+	args := rest[:len(rest)-1]
+
+	var types []string
+	for _, arg := range splitSQLTopLevel(args, func(r rune) bool { return r == ',' }, true) {
+		if argType, ok := functionArgType(arg); ok {
+			types = append(types, argType)
+		}
+	}
+	return name + "(" + strings.Join(types, ", ") + ")"
+}
+
+// hasFunctionSignature reports whether any objects entry carries an argument
+// list.
+func hasFunctionSignature(objects *schema.Set) bool {
+	for _, o := range objects.List() {
+		if isFunctionSignature(o.(string)) {
+			return true
+		}
+	}
+	return false
+}
+
 // buildReadFunctionRolePrivilegesQuery builds the Read query for the
 // function/procedure/routine object types: role_exists and schema_exists on
-// every row, then one row per routine name in the schema (overloads merged)
-// with the privileges granted to the role, or a single row with a NULL name.
+// every row, then one row per routine (overload) of the kinds granted by the
+// object type (prokindFilter, see functionProkindFilter) with the privileges
+// granted to the role, or a single row with a NULL name. Each row is reported
+// under the objects entry that selected it, so readRolePrivileges compares
+// every overload a grant covers.
 //
-// With an explicit objects list only the listed names are returned
-// ("proname = ANY($3)"), so the planner can use the pg_proc name index instead
-// of exploding the ACL of every routine in the schema. The entries are bound
-// verbatim: rows are matched to objects by name, so an entry carrying an
-// argument signature (e.g. "f(integer)") selects no row, as it never matched
-// the name-based filter in readRolePrivileges either.
-func buildReadFunctionRolePrivilegesQuery(role, schemaName string, objects *schema.Set) (string, []interface{}) {
+// With an empty objects set every routine of the schema is returned (GRANT ON
+// ALL ... IN SCHEMA). Otherwise:
+//   - bare entries ("f") select every overload of that name in the schema
+//     ("proname = ANY($3)", served by the pg_proc name index);
+//   - entries with an argument list ("f(integer)") are resolved with
+//     to_regprocedure on the text the GRANT uses ("schema"."f"(integer)), once
+//     reduced to the argument types (functionLookupSignature drops argument
+//     modes, names and OUT arguments, which GRANT accepts and to_regprocedure
+//     does not), so any spelling PostgreSQL accepts selects the same overload,
+//     and an entry that resolves to nothing (dropped routine) yields no row, like
+//     a missing bare name. resolveSignatures=false leaves them out of the query
+//     (they are then not compared).
+//
+// It is still one statement: the signature entries and their rendering are
+// bound as two parallel text arrays.
+func buildReadFunctionRolePrivilegesQuery(
+	role, schemaName, prokindFilter string, objects *schema.Set, resolveSignatures bool,
+) (string, []any) {
+	args := []any{role, schemaName}
+
+	where := func(conds ...string) string {
+		var parts []string
+		for _, c := range conds {
+			if c != "" {
+				parts = append(parts, c)
+			}
+		}
+		if len(parts) == 0 {
+			return ""
+		}
+		return "\n        WHERE " + strings.Join(parts, " AND ")
+	}
+
+	var routines string
+	if objects.Len() == 0 {
+		routines = `
+        SELECT p.proname AS name, p.oid, p.proacl
+        FROM pg_proc p
+        JOIN n ON n.oid = p.pronamespace` + where(prokindFilter)
+	} else {
+		bare := []string{}
+		var sigEntries, signatures []string
+		for _, o := range objects.List() {
+			entry := o.(string)
+			if !isFunctionSignature(entry) {
+				bare = append(bare, entry)
+			} else if resolveSignatures {
+				sigEntries = append(sigEntries, entry)
+				signatures = append(signatures, pq.QuoteIdentifier(schemaName)+"."+quoteIdentifyIdent(functionLookupSignature(entry)))
+			}
+		}
+
+		args = append(args, pq.Array(bare))
+		routines = `
+        SELECT p.proname AS name, p.oid, p.proacl
+        FROM pg_proc p
+        JOIN n ON n.oid = p.pronamespace` + where("p.proname = ANY($3)", prokindFilter)
+
+		if len(sigEntries) > 0 {
+			args = append(args, pq.Array(sigEntries), pq.Array(signatures))
+			routines += `
+        UNION ALL
+        SELECT e.entry, p.oid, p.proacl
+        FROM unnest($4::text[], $5::text[]) AS e(entry, signature)
+        JOIN pg_proc p ON p.oid = to_regprocedure(e.signature)
+        JOIN n ON n.oid = p.pronamespace` + where(prokindFilter)
+		}
+	}
+
 	query := grantReadRoleCTE + grantReadSchemaCTE + `
-SELECT r.oid IS NOT NULL, EXISTS (SELECT 1 FROM n), o.proname, o.privileges
+SELECT r.oid IS NOT NULL, EXISTS (SELECT 1 FROM n), o.name, o.privileges
 FROM r
 LEFT JOIN LATERAL (
-    SELECT p.proname, array_remove(array_agg(a.privilege_type), NULL) AS privileges
-    FROM pg_proc p
-    JOIN n ON n.oid = p.pronamespace
+    SELECT o.name, array_remove(array_agg(a.privilege_type), NULL) AS privileges
+    FROM (` + routines + `
+    ) o
     LEFT JOIN LATERAL (
-        SELECT privilege_type FROM aclexplode(p.proacl) WHERE grantee = r.oid
-    ) a ON true`
-	args := []interface{}{role, schemaName}
-
-	if objects.Len() > 0 {
-		objectNames := make([]string, 0, objects.Len())
-		for _, o := range objects.List() {
-			objectNames = append(objectNames, o.(string))
-		}
-		query += `
-    WHERE p.proname = ANY($3)`
-		args = append(args, pq.Array(objectNames))
-	}
-	query += `
-    GROUP BY p.proname
+        SELECT privilege_type FROM aclexplode(o.proacl) WHERE grantee = r.oid
+    ) a ON true
+    GROUP BY o.name, o.oid
 ) o ON true
 `
 	return query, args
+}
+
+// grantReadRow is one row of the table/sequence/function Read queries.
+type grantReadRow struct {
+	roleExists, schemaExists bool
+	objName                  sql.NullString
+	privileges               pq.ByteaArray
+}
+
+// fetchGrantReadRows runs one Read query through queryGrantRead and returns all
+// its rows. Reading them up front means an error raised while the statement
+// executes (reported by rows.Next/rows.Err, not by Query) is returned here.
+// gone is true when the database no longer exists (the resource was removed
+// from state).
+func fetchGrantReadRows(db *DBConnection, d *schema.ResourceData, query string, args []any) (result []grantReadRow, gone bool, err error) {
+	rows, err := queryGrantRead(db, d, query, args...)
+	if err != nil {
+		return nil, false, err
+	}
+	if rows == nil {
+		return nil, true, nil
+	}
+	defer closeGrantReadRows(rows)
+
+	for rows.Next() {
+		var row grantReadRow
+		if err := rows.Scan(&row.roleExists, &row.schemaExists, &row.objName, &row.privileges); err != nil {
+			return nil, false, err
+		}
+		result = append(result, row)
+	}
+	return result, false, rows.Err()
+}
+
+// isFunctionSignatureError reports whether the function Read failed because
+// to_regprocedure could not parse one of the signature entries: before
+// PostgreSQL 16 an unknown type name raises instead of returning NULL, and so
+// does, on every version, an argument list functionLookupSignature could not
+// reduce to plain types.
+func isFunctionSignatureError(err error) bool {
+	var pqErr *pq.Error
+	if !errors.As(err, &pqErr) {
+		return false
+	}
+	class := pqErr.Code.Class()
+	return class == "42" || class == "22"
 }
 
 // readRolePrivileges reads the privileges granted to the role with a single
@@ -601,7 +846,9 @@ func readRolePrivileges(db *DBConnection, d *schema.ResourceData) error {
 	objects := d.Get("objects").(*schema.Set)
 
 	var query string
-	var args []interface{}
+	var args []any
+	var prokindFilter string
+	isFunction := false
 
 	switch objectType {
 	case "database", "schema", "foreign_data_wrapper", "foreign_server":
@@ -611,7 +858,11 @@ func readRolePrivileges(db *DBConnection, d *schema.ResourceData) error {
 		return readColumnRolePrivileges(db, d)
 
 	case "function", "procedure", "routine":
-		query, args = buildReadFunctionRolePrivilegesQuery(role, d.Get("schema").(string), objects)
+		isFunction = true
+		prokindFilter = functionProkindFilter(objectType, db.featureSupported(featureProcedure))
+		query, args = buildReadFunctionRolePrivilegesQuery(
+			role, d.Get("schema").(string), prokindFilter, objects, true,
+		)
 
 	default:
 		query, args = buildReadTableRolePrivilegesQuery(
@@ -624,35 +875,39 @@ func readRolePrivileges(db *DBConnection, d *schema.ResourceData) error {
 	// with the list of the currently applied privileges (aggregation of privilege_type)
 	//
 	// Our goal is to check that every object has the same privileges as saved in the state.
-	rows, err := queryGrantRead(db, d, query, args...)
+	rows, gone, err := fetchGrantReadRows(db, d, query, args)
+	if err != nil && isFunction && isFunctionSignatureError(err) && hasFunctionSignature(objects) {
+		// A signature entry the Read cannot resolve (see
+		// isFunctionSignatureError) must not break the refresh: read again
+		// without the signature entries, which are then not compared.
+		log.Printf(
+			"[WARN] could not resolve the argument signatures in %v on refresh, they are not compared: %v",
+			objects.List(), err,
+		)
+		query, args = buildReadFunctionRolePrivilegesQuery(
+			role, d.Get("schema").(string), prokindFilter, objects, false,
+		)
+		rows, gone, err = fetchGrantReadRows(db, d, query, args)
+	}
 	if err != nil {
 		return err
 	}
-	if rows == nil {
+	if gone {
 		return nil
 	}
-	defer closeGrantReadRows(rows)
 
 	var objectPrivileges []*schema.Set
 	checked := false
-	for rows.Next() {
-		var roleExists, schemaExists bool
-		var objName sql.NullString
-		var privileges pq.ByteaArray
-
-		if err := rows.Scan(&roleExists, &schemaExists, &objName, &privileges); err != nil {
-			return err
-		}
-
+	for _, row := range rows {
 		if !checked {
-			if grantTargetGone(d, roleExists, schemaExists) {
+			if grantTargetGone(d, row.roleExists, row.schemaExists) {
 				return nil
 			}
 			d.SetId(generateGrantID(d))
 			checked = true
 		}
 
-		if !objName.Valid {
+		if !row.objName.Valid {
 			// The schema has no object of this type: only the existence flags
 			// were returned.
 			continue
@@ -660,21 +915,18 @@ func readRolePrivileges(db *DBConnection, d *schema.ResourceData) error {
 
 		// The objects filter already runs in SQL for every object type; this
 		// check only keeps the Read independent of the exact query shape.
-		if objects.Len() > 0 && !objects.Contains(objName.String) {
+		if objects.Len() > 0 && !objects.Contains(row.objName.String) {
 			continue
 		}
 
-		privilegesSet := pgArrayToSet(privileges)
+		privilegesSet := pgArrayToSet(row.privileges)
 		if !resourcePrivilegesEqual(privilegesSet, db, d) {
 			log.Printf(
 				"[DEBUG] %s %s has not the expected privileges %v for role %s",
-				strings.ToTitle(objectType), objName.String, privileges, d.Get("role"),
+				strings.ToTitle(objectType), row.objName.String, row.privileges, d.Get("role"),
 			)
 		}
 		objectPrivileges = append(objectPrivileges, privilegesSet)
-	}
-	if err := rows.Err(); err != nil {
-		return err
 	}
 	if !checked {
 		return fmt.Errorf("could not read privileges: query returned no row")
