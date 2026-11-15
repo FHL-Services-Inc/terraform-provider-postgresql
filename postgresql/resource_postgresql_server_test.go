@@ -202,6 +202,18 @@ func TestAccPostgresqlServer_Update(t *testing.T) {
 				),
 			},
 			{
+				// Option values may contain "=" (#190); the plan after apply
+				// must stay empty.
+				Config: fmt.Sprintf(testAccPostgresqlServerChangesEqualsInValue, updatedName),
+				Check: resource.ComposeTestCheckFunc(
+					testAccCheckPostgresqlServerExists("postgresql_server.myserver_postgres"),
+					resource.TestCheckResourceAttr(
+						"postgresql_server.myserver_postgres", "options.host", "foo"),
+					resource.TestCheckResourceAttr(
+						"postgresql_server.myserver_postgres", "options.options", "-c statement_timeout=0"),
+				),
+			},
+			{
 				Config: fmt.Sprintf(testAccPostgresqlServerChanges8, updatedName),
 				Check: resource.ComposeTestCheckFunc(
 					testAccCheckPostgresqlServerExists("postgresql_server.myserver_postgres"),
@@ -493,6 +505,24 @@ resource "postgresql_server" "myserver_postgres" {
 		port   = "25432"
 	}
   
+	depends_on = [postgresql_extension.ext_postgres_fdw]
+}
+`
+
+var testAccPostgresqlServerChangesEqualsInValue = `
+resource "postgresql_extension" "ext_postgres_fdw" {
+	name = "postgres_fdw"
+}
+
+resource "postgresql_server" "myserver_postgres" {
+	server_name    = "%s"
+	server_version = "1.2.3"
+	fdw_name       = "postgres_fdw"
+	options = {
+		host    = "foo"
+		options = "-c statement_timeout=0"
+	}
+
 	depends_on = [postgresql_extension.ext_postgres_fdw]
 }
 `

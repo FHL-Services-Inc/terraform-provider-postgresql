@@ -180,21 +180,27 @@ func resourcePostgreSQLServerReadImpl(db *DBConnection, d *schema.ResourceData) 
 		return fmt.Errorf("error reading foreign server: %w", err)
 	}
 
-	mappedOptions := make(map[string]any)
-	for _, v := range serverOptions {
-		pair := strings.Split(v, "=")
-		mappedOptions[pair[0]] = pair[1]
-	}
-
 	d.Set(serverNameAttr, serverName)
 	d.Set(serverTypeAttr, serverType)
 	d.Set(serverVersionAttr, serverVersion)
 	d.Set(serverOwnerAttr, serverOwner)
-	d.Set(serverOptionsAttr, mappedOptions)
+	d.Set(serverOptionsAttr, parseServerOptions(serverOptions))
 	d.Set(serverFDWAttr, serverFDW)
 	d.SetId(serverName)
 
 	return nil
+}
+
+// parseServerOptions turns srvoptions entries ("key=value") into a map.
+// Only the first "=" separates the key: values may contain "=" themselves,
+// e.g. postgres_fdw's options = "-c statement_timeout=0".
+func parseServerOptions(opts []string) map[string]any {
+	mapped := make(map[string]any, len(opts))
+	for _, v := range opts {
+		key, value, _ := strings.Cut(v, "=")
+		mapped[key] = value
+	}
+	return mapped
 }
 
 func resourcePostgreSQLServerDelete(db *DBConnection, d *schema.ResourceData) error {
