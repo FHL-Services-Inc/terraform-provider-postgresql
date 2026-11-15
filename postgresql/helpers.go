@@ -727,7 +727,10 @@ func roleOIDAndExists(db QueryAble, role string) (uint32, bool, error) {
 	return oid, true, nil
 }
 
-// Lock a role and all his members to avoid concurrent updates on some resources
+// pgLockRole locks a role and all its members, for the paths that change role
+// memberships (dropping or altering a role). Grant and default privileges
+// writes change ACLs, not memberships: they lock the role alone, then the
+// objects they change (pgLockGranteeAndObjects, grant_locks.go).
 func pgLockRole(txn *sql.Tx, role string) error {
 	// Disable statement timeout for this connection otherwise the lock could fail
 	if _, err := txn.Exec("SET statement_timeout = 0"); err != nil {
@@ -858,19 +861,6 @@ func revokeRoleMembershipDeferred(db QueryAble, setOption bool, role, member str
 	if _, err := revokeRoleMembership(db, setOption, role, member); err != nil {
 		log.Printf("[ERR] could not revoke role %s from %s: %v", role, member, err)
 	}
-}
-
-// Lock a database and all his members to avoid concurrent updates on some resources
-func pgLockDatabase(txn *sql.Tx, database string) error {
-	// Disable statement timeout for this connection otherwise the lock could fail
-	if _, err := txn.Exec("SET statement_timeout = 0"); err != nil {
-		return fmt.Errorf("could not disable statement_timeout: %w", err)
-	}
-	if _, err := txn.Exec("SELECT pg_advisory_xact_lock(oid::bigint) FROM pg_database WHERE datname = $1", database); err != nil {
-		return fmt.Errorf("could not get advisory lock for database %s: %w", database, err)
-	}
-
-	return nil
 }
 
 func arrayDifference(a, b []any) (diff []any) {

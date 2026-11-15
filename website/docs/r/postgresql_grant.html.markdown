@@ -88,6 +88,26 @@ resource "postgresql_grant" "revoke_public" {
 }
 ```
 
+## Concurrency
+
+Several `postgresql_grant` resources on the same objects (for example, one per
+role, plus one for `public`) can be applied in parallel. Before it changes
+privileges, a grant takes PostgreSQL advisory locks on the grantee role and on
+the objects whose privileges it changes. Grants on the same objects then wait
+for each other instead of failing with `tuple concurrently updated`:
+
+* a grant on all objects of a type in a schema (no `objects`) waits for every
+  other grant on objects of that type in that schema;
+* grants on listed `objects` wait for each other only if they share an object;
+* `function`, `procedure` and `routine` grants count as one type, and a
+  `column` grant counts as a grant on its table.
+
+Advisory locks are scoped to one database. Writers of the same objects always
+run in the database the objects are in, so this covers parallel applies and
+several Terraform processes. The members of the grantee are not locked. As a
+last resort, a write that still fails with `tuple concurrently updated` (for
+example because another tool changed the same privileges) is retried once.
+
 ## Import
 
 `postgresql_grant` can be imported using the resource ID, which is the

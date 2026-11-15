@@ -64,6 +64,15 @@ resource "postgresql_default_privileges" "revoke_public" {
 }
 ```
 
+## Concurrency
+
+Before it changes default privileges, the resource takes PostgreSQL advisory
+locks on the owner role and on the default privileges entry it changes (owner,
+schema and object type), so resources that change the same entry for
+different roles wait for each other instead of failing with
+`tuple concurrently updated`. A write that still fails with that error is
+retried once.
+
 ## Import
 
 `postgresql_default_privileges` can be imported using the resource ID,
