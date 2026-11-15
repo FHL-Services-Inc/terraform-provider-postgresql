@@ -157,7 +157,7 @@ func setPubOwner(txn *sql.Tx, d *schema.ResourceData) error {
 	n := nraw.(string)
 	pubName := d.Get(pubNameAttr).(string)
 
-	sql := fmt.Sprintf("ALTER PUBLICATION %s OWNER TO %s", pubName, n)
+	sql := fmt.Sprintf("ALTER PUBLICATION %s OWNER TO %s", pq.QuoteIdentifier(pubName), pq.QuoteIdentifier(n))
 	if _, err := txn.Exec(sql); err != nil {
 		return fmt.Errorf("error updating publication owner: %w", err)
 	}
@@ -182,12 +182,12 @@ func setPubTables(txn *sql.Tx, d *schema.ResourceData) error {
 	added := arrayDifference(newList, oldList)
 
 	for _, p := range added {
-		query := fmt.Sprintf("ALTER PUBLICATION %s ADD TABLE %s", pubName, quoteTableName(p.(string)))
+		query := fmt.Sprintf("ALTER PUBLICATION %s ADD TABLE %s", pq.QuoteIdentifier(pubName), quoteTableName(p.(string)))
 		queries = append(queries, query)
 	}
 
 	for _, p := range dropped {
-		query := fmt.Sprintf("ALTER PUBLICATION %s DROP TABLE %s", pubName, quoteTableName(p.(string)))
+		query := fmt.Sprintf("ALTER PUBLICATION %s DROP TABLE %s", pq.QuoteIdentifier(pubName), quoteTableName(p.(string)))
 		queries = append(queries, query)
 	}
 
@@ -207,7 +207,7 @@ func setPubParams(txn *sql.Tx, d *schema.ResourceData, pubViaRootEnabled bool) e
 		return fmt.Errorf("error getting publication parameters: %w", err)
 	}
 	if publicationParametersString != "" {
-		sql := fmt.Sprintf(paramAlterTemplate, pubName, publicationParametersString)
+		sql := fmt.Sprintf(paramAlterTemplate, pq.QuoteIdentifier(pubName), publicationParametersString)
 		if _, err := txn.Exec(sql); err != nil {
 			return fmt.Errorf("error updating publication parameters: %w", err)
 		}
@@ -239,7 +239,7 @@ func resourcePostgreSQLPublicationCreate(db *DBConnection, d *schema.ResourceDat
 	}
 	defer deferredRollback(txn)
 
-	sql := fmt.Sprintf("CREATE PUBLICATION %s %s %s", name, tables, publicationParameters)
+	sql := fmt.Sprintf("CREATE PUBLICATION %s %s %s", pq.QuoteIdentifier(name), tables, publicationParameters)
 
 	if _, err := txn.Exec(sql); err != nil {
 		return fmt.Errorf("error creating Publication: %w", err)
@@ -364,9 +364,10 @@ func resourcePostgreSQLPublicationReadImpl(db *DBConnection, d *schema.ResourceD
 		publishParams = append(publishParams, "truncate")
 	}
 
-	d.SetId(generatePublicationID(d, database))
 	d.Set(pubNameAttr, PublicationName)
 	d.Set(pubDatabaseAttr, database)
+	// After pubNameAttr: on import the name only comes from the ID.
+	d.SetId(generatePublicationID(d, database))
 	d.Set(pubOwnerAttr, pubowner)
 	d.Set(pubTablesAttr, tables)
 	d.Set(pubAllTablesAttr, puballtables)
@@ -544,7 +545,9 @@ func getDBPublicationName(d *schema.ResourceData, client *Client) (string, strin
 	return database, PublicationName, nil
 }
 
+// getPublicationNameFromID returns the publication name part of a
+// "<database>.<publication>" ID.
 func getPublicationNameFromID(ID string) string {
-	splitted := strings.Split(ID, ".")
-	return splitted[0]
+	_, name, _ := strings.Cut(ID, ".")
+	return name
 }
