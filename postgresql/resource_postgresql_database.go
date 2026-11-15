@@ -238,6 +238,15 @@ func createDatabase(db *DBConnection, d *schema.ResourceData) error {
 }
 
 func resourcePostgreSQLDatabaseDelete(db *DBConnection, d *schema.ResourceData) error {
+	dbName := d.Get(dbNameAttr).(string)
+	// db is connected to the provider's own database, which PostgreSQL never
+	// lets us drop ("cannot drop the currently open database"). Fail before
+	// blocking connections to it and terminating every other session on it,
+	// including the other resources sharing our pool.
+	if dbName == db.client.databaseName {
+		return fmt.Errorf("cannot drop database %q: it is the database the provider connects to (provider \"database\" setting); configure the provider with another database to drop it", dbName)
+	}
+
 	currentUser := db.client.config.getDatabaseUsername()
 	owner := d.Get(dbOwnerAttr).(string)
 
@@ -265,7 +274,6 @@ func resourcePostgreSQLDatabaseDelete(db *DBConnection, d *schema.ResourceData) 
 		}
 	}
 
-	dbName := d.Get(dbNameAttr).(string)
 	if db.featureSupported(featureDBIsTemplate) {
 		if isTemplate := d.Get(dbIsTemplateAttr).(bool); isTemplate {
 			// Template databases must have this attribute cleared before
@@ -282,9 +290,7 @@ func resourcePostgreSQLDatabaseDelete(db *DBConnection, d *schema.ResourceData) 
 
 	// Close our own pooled connections to the database (only kept with
 	// max_idle_connections > 0) before terminating the remaining ones.
-	if db.client.config.evictDBConnection(dbName) {
-		log.Printf("[DEBUG] evicted pooled connections to database %q before dropping it", dbName)
-	}
+	evictOtherDBPool(db, dbName)
 
 	// Terminate all active connections and block new one
 	if err := terminateBConnections(db, conn, dbName); err != nil {
@@ -445,7 +451,7 @@ func setDBName(db *DBConnection, d *schema.ResourceData) error {
 // evictOtherDBPool closes this provider's pooled connections to database
 // (see evictDBConnection), unless database is the one db itself is connected
 // to: the statement that follows still needs that pool, and PostgreSQL refuses
-// to rename or copy the database of the current session anyway.
+// to rename, copy or drop the database of the current session anyway.
 func evictOtherDBPool(db *DBConnection, database string) {
 	if database == db.client.databaseName {
 		return
