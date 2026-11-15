@@ -13,7 +13,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-	"unicode"
 
 	"github.com/blang/semver"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/retry"
@@ -563,28 +562,36 @@ func isRetryableConnectionError(err error) bool {
 
 // fingerprintCapabilities queries PostgreSQL to populate a local catalog of
 // capabilities.  This is only run once per Client.
+//
+// It reads server_version_num rather than parsing SELECT VERSION(): the
+// version text carries vendor suffixes (e.g. "13.23-rds.20250508" on RDS
+// Extended Support) that are not valid semver, while server_version_num is a
+// plain integer everywhere, RDS and Aurora included.
 func fingerprintCapabilities(db *sql.DB) (*semver.Version, error) {
-	var pgVersion string
-	err := db.QueryRow(`SELECT VERSION()`).Scan(&pgVersion)
-	if err != nil {
+	var versionNum string
+	if err := db.QueryRow(`SHOW server_version_num`).Scan(&versionNum); err != nil {
 		return nil, fmt.Errorf("error PostgreSQL version: %w", err)
 	}
 
-	// PostgreSQL 9.2.21 on x86_64-apple-darwin16.5.0, compiled by Apple LLVM version 8.1.0 (clang-802.0.42), 64-bit
-	// PostgreSQL 9.6.7, compiled by Visual C++ build 1800, 64-bit
-	fields := strings.FieldsFunc(pgVersion, func(c rune) bool {
-		return unicode.IsSpace(c) || c == ','
-	})
-	if len(fields) < 2 {
-		return nil, fmt.Errorf("error determining the server version: %q", pgVersion)
-	}
-
-	version, err := semver.ParseTolerant(fields[1])
+	version, err := parseServerVersionNum(versionNum)
 	if err != nil {
-		return nil, fmt.Errorf("error parsing version: %w", err)
+		return nil, err
 	}
-
 	return &version, nil
+}
+
+// parseServerVersionNum converts a server_version_num value to a version:
+// major * 10000 + minor from PostgreSQL 10 on (170006 is 17.6.0), and
+// major * 10000 + minor * 100 + patch before (90621 is 9.6.21).
+func parseServerVersionNum(s string) (semver.Version, error) {
+	n, err := strconv.ParseUint(strings.TrimSpace(s), 10, 32)
+	if err != nil || n == 0 {
+		return semver.Version{}, fmt.Errorf("error parsing server_version_num %q", s)
+	}
+	if n >= 100000 {
+		return semver.Version{Major: n / 10000, Minor: n % 10000}, nil
+	}
+	return semver.Version{Major: n / 10000, Minor: (n / 100) % 100, Patch: n % 100}, nil
 }
 
 func openImpersonatedGCPDBConnection(ctx context.Context, dsn string, targetServiceAccountEmail string) (*sql.DB, error) {
