@@ -97,6 +97,26 @@ func (k *keyedMutex) lock(keys ...string) (unlock func()) {
 //     operations do not take under the mutex. Callers of withRolesGranted that
 //     run DDL before it (resourcePostgreSQLSchemaUpdate) take the mutexes
 //     first with lockMembershipsForTxn.
+//
+// The paths added since keep these rules:
+//   - withRolesGrantedOrDirect takes the mutexes before it reads the
+//     membership states, so a membership another operation granted in
+//     autocommit is never seen as "already a member". Everything it runs
+//     under them (the savepointed GRANT, the circular-chain lookup, the
+//     directGrant check of postgresql_grant) uses the caller's transaction:
+//     no new connection, no advisory lock;
+//   - postgresql_role Delete runs REASSIGN/DROP OWNED in one transaction per
+//     database, each one opened on its pool and holding pgLockRole before
+//     withRolesGranted, and committed before the next database starts; the
+//     transaction in the provider's database is only opened after them;
+//   - with max_total_connections the connections of every pool share one
+//     budget, so "no pool connection is awaited under a mutex" now means no
+//     new connection at all. None of the paths above dials under a mutex.
+//
+// Limit: the mutexes are keyed by the roles the caller names. A membership
+// the provider user inherits through another role (pg_has_role) is not
+// serialized when that other role is the one a postgresql_database operation
+// grants.
 var membershipLocks = newKeyedMutex()
 
 // lockDatabaseMemberships takes the membership locks of roles for a
