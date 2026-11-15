@@ -5,11 +5,13 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/resource"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/terraform"
+	"github.com/lib/pq"
 )
 
 func TestAccPostgresqlDatabase_Basic(t *testing.T) {
@@ -280,6 +282,105 @@ resource postgresql_database "test_db" {
 }
 
 // Test the case where the owned objects by the previous database owner are altered.
+// A database owner change with alter_object_ownership runs REASSIGN OWNED
+// while grants on tables of the database run in the same apply. The grants
+// must not take the membership of the previous owner and then find the tables
+// reassigned to the new one ("permission denied for table", #181).
+func TestAccPostgresqlDatabase_AlterObjectOwnershipConcurrentGrants(t *testing.T) {
+	skipIfNotAcc(t)
+
+	databaseSuffix := testUniqueName("reassign_grants")
+	databaseName := fmt.Sprintf("%s_%s", dbNamePrefix, databaseSuffix)
+	previousOwner := testUniqueName("previous_owner")
+	newOwner := testUniqueName("new_owner")
+	reader := testUniqueName("reader")
+	const tableCount = 10
+	var tables []string
+	for i := range tableCount {
+		tables = append(tables, fmt.Sprintf("t%d", i))
+	}
+
+	testConfig := getTestConfig(t)
+	dsn := testConfig.connStr("postgres")
+	for _, role := range []string{previousOwner, newOwner, reader} {
+		dbExecute(t, dsn, fmt.Sprintf("CREATE ROLE %s", role))
+		defer dbExecute(t, dsn, fmt.Sprintf("DROP ROLE IF EXISTS %s", role))
+	}
+
+	config := func(owner string, grants bool) string {
+		b := &strings.Builder{}
+		fmt.Fprintf(b, `
+resource "postgresql_database" "test_db" {
+  name                   = "%s"
+  owner                  = "%s"
+  alter_object_ownership = true
+}
+`, databaseName, owner)
+		if grants {
+			// The database is a literal: the grants don't wait for the owner
+			// change.
+			for _, table := range tables {
+				fmt.Fprintf(b, `
+resource "postgresql_grant" "%s" {
+  database    = "%s"
+  role        = "%s"
+  schema      = "public"
+  object_type = "table"
+  objects     = ["%s"]
+  privileges  = ["SELECT"]
+}
+`, table, databaseName, reader, table)
+			}
+		}
+		return b.String()
+	}
+
+	checkTables := func(*terraform.State) error {
+		db, err := sql.Open("postgres", testConfig.connStr(databaseName))
+		if err != nil {
+			return err
+		}
+		defer closeDB(t, db)
+		var owned, readable int
+		if err := db.QueryRow(
+			`SELECT count(*) FILTER (WHERE pg_get_userbyid(relowner) = $1),
+			        count(*) FILTER (WHERE has_table_privilege($2, oid, 'SELECT'))
+			   FROM pg_class WHERE relnamespace = 'public'::regnamespace AND relname = ANY($3)`,
+			newOwner, reader, pq.Array(tables),
+		).Scan(&owned, &readable); err != nil {
+			return err
+		}
+		if owned != tableCount || readable != tableCount {
+			return fmt.Errorf("%d of %d tables owned by %s, %d readable by %s", owned, tableCount, newOwner, readable, reader)
+		}
+		return nil
+	}
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:     func() { testAccPreCheck(t) },
+		Providers:    testAccProviders,
+		CheckDestroy: testAccCheckPostgresqlDatabaseDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config: config(previousOwner, false),
+				Check: func(*terraform.State) error {
+					_ = createTestTables(t, databaseSuffix, tables, previousOwner)
+					return nil
+				},
+			},
+			{
+				Config: config(newOwner, true),
+				Check:  checkTables,
+			},
+			// The grants don't depend on the database: remove them before the
+			// final destroy drops it.
+			{
+				Config: config(newOwner, false),
+			},
+		},
+	})
+}
+
 func TestAccPostgresqlDatabase_AlterObjectOwnership(t *testing.T) {
 	skipIfNotAcc(t)
 

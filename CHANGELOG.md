@@ -158,6 +158,11 @@ resources, 10 ms round-trip time) went from 39.9 s to 14.6 s; with
     lock members of the grantee (#99, #26, #53).
   - Cross-database membership changes (owner changes, temporary memberships)
     are serialized (#144, #25), also for `postgresql_database` (#178, #152).
+  - `REASSIGN OWNED` (a database owner change with `alter_object_ownership`,
+    a role delete) and grant or default privileges writes in the same
+    database are serialized: a grant no longer takes the membership of an
+    owner the objects are being reassigned away from and fails with
+    `permission denied` (#213, #181).
 - **Grants**
   - Owners of the granted objects (sequences, functions, views, foreign tables)
     are looked up instead of only table owners; `rows.Err()` is checked

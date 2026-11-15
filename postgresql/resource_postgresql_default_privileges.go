@@ -225,11 +225,12 @@ func resourcePostgreSQLDefaultPrivilegesDelete(db *DBConnection, d *schema.Resou
 }
 
 // lockDefaultPrivileges locks the owner role (not its members: default
-// privileges change no membership), then the pg_default_acl row of the
-// resource (see grant_locks.go).
+// privileges change no membership), then, shared, the REASSIGN OWNED key of
+// the database (it changes the role of pg_default_acl rows), then the
+// pg_default_acl row of the resource (see grant_locks.go).
 func lockDefaultPrivileges(txn *sql.Tx, d *schema.ResourceData) error {
 	return pgLockGranteeAndObjects(txn, d.Get("owner").(string), "",
-		[]advisoryLockKey{defaultPrivilegesLockKey(d)})
+		[]advisoryLockKey{reassignOwnedLockKey(true), defaultPrivilegesLockKey(d)})
 }
 
 // buildReadRoleDefaultPrivilegesQuery builds the default privileges Read query.

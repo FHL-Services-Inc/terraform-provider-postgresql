@@ -122,11 +122,41 @@ func TestGrantLockKeys(t *testing.T) {
 			for k, v := range tc.values {
 				values[k] = v
 			}
-			got := grantLockKeys(grantResourceData(t, values).Get)
+			got := grantObjectLockKeys(grantResourceData(t, values).Get)
 			if fmt.Sprint(got) != fmt.Sprint(tc.want) {
-				t.Fatalf("grantLockKeys =\n  %v\nwant\n  %v", got, tc.want)
+				t.Fatalf("grantObjectLockKeys =\n  %v\nwant\n  %v", got, tc.want)
 			}
 		})
+	}
+}
+
+// Grants in a database take the REASSIGN OWNED key shared before their object
+// keys, so a concurrent REASSIGN OWNED can't change the owners they read
+// (#181). Database grants run on the maintenance database and take none.
+func TestGrantLockKeysTakeReassignOwnedShared(t *testing.T) {
+	values := map[string]any{"database": "db1", "role": "r1", "privileges": []any{"SELECT"},
+		"schema": "s1", "object_type": "table", "objects": []any{"t1"}}
+	get := grantResourceData(t, values).Get
+	want := append([]advisoryLockKey{reassignOwnedLockKey(true)}, grantObjectLockKeys(get)...)
+	if got := grantLockKeys(get); fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Errorf("grantLockKeys =\n  %v\nwant\n  %v", got, want)
+	}
+
+	values = map[string]any{"database": "db1", "role": "r1", "privileges": []any{"CONNECT"}, "object_type": "database"}
+	if got := grantLockKeys(grantResourceData(t, values).Get); got != nil {
+		t.Errorf("grantLockKeys of a database grant = %v, want none", got)
+	}
+
+	// The REASSIGN OWNED key comes first in the lock order.
+	keys := []advisoryLockKey{
+		newAdvisoryLockKey(advisoryLockNamespaceDefaultACL, false, "o", "s", "r"),
+		newAdvisoryLockKey(advisoryLockNamespaceObject, false, "table", "s", "t"),
+		newAdvisoryLockKey(advisoryLockNamespaceSchemaObjects, true, "table", "s"),
+		reassignOwnedLockKey(true),
+	}
+	sortAdvisoryLockKeys(keys)
+	if keys[0] != reassignOwnedLockKey(true) {
+		t.Errorf("first key = %v, want the REASSIGN OWNED key", keys[0])
 	}
 }
 
@@ -376,9 +406,12 @@ func TestGrantWritesLockObjectsNotMembers(t *testing.T) {
 			objects: advisoryLockStatement(grantLockKeys(grantResourceData(t, map[string]any{"schema": "s1", "object_type": "table", "objects": []any{"t1"}}).Get)),
 		},
 		{
-			name:    "all tables in schema",
-			values:  map[string]any{"schema": "s1", "object_type": "table"},
-			objects: "SELECT " + newAdvisoryLockKey(advisoryLockNamespaceSchemaObjects, false, "table", "s1").call(),
+			name:   "all tables in schema",
+			values: map[string]any{"schema": "s1", "object_type": "table"},
+			objects: advisoryLockStatement([]advisoryLockKey{
+				reassignOwnedLockKey(true),
+				newAdvisoryLockKey(advisoryLockNamespaceSchemaObjects, false, "table", "s1"),
+			}),
 		},
 		{
 			name:     "database",
@@ -416,8 +449,10 @@ func TestDefaultPrivilegesWritesLockRowNotMembers(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			stmts := recordWriteStatements(t, write, defaultPrivilegesResourceData(t, values))
-			assertLockPreamble(t, stmts, "o1", "",
-				"SELECT "+newAdvisoryLockKey(advisoryLockNamespaceDefaultACL, false, "o1", "s1", "r").call())
+			assertLockPreamble(t, stmts, "o1", "", advisoryLockStatement([]advisoryLockKey{
+				reassignOwnedLockKey(true),
+				newAdvisoryLockKey(advisoryLockNamespaceDefaultACL, false, "o1", "s1", "r"),
+			}))
 		})
 	}
 }

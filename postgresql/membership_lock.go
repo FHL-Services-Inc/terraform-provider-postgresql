@@ -111,7 +111,11 @@ func (k *keyedMutex) lock(keys ...string) (unlock func()) {
 //     transaction in the provider's database is only opened after them;
 //   - with max_total_connections the connections of every pool share one
 //     budget, so "no pool connection is awaited under a mutex" now means no
-//     new connection at all. None of the paths above dials under a mutex.
+//     new connection at all. None of the paths above dials under a mutex;
+//   - REASSIGN OWNED (setAlterOwnership, the role delete) takes the
+//     database-wide REASSIGN OWNED key exclusively before the mutexes, and
+//     grant and default privileges writes take it shared before theirs (see
+//     grant_locks.go, #181). No path waits for it under a mutex.
 //
 // Limit: the mutexes are keyed by the roles the caller names. A membership
 // the provider user inherits through another role (pg_has_role) is not

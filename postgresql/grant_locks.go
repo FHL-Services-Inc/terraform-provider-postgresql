@@ -39,7 +39,14 @@ import (
 //   - schemas, foreign data wrappers and foreign servers: one exclusive lock
 //     on the object; databases keep the database OID lock;
 //   - default privileges: one exclusive lock on (owner, schema, object type),
-//     i.e. the pg_default_acl row.
+//     i.e. the pg_default_acl row;
+//   - REASSIGN OWNED (a postgresql_database owner change with
+//     alter_object_ownership, a postgresql_role delete) changes the owner of
+//     objects in the whole database: it takes one database-wide key
+//     exclusively, and grant and default privileges writes take it shared,
+//     before they read the owners of their objects. Without it a grant could
+//     take the membership of the previous owner while REASSIGN OWNED gives
+//     the objects to the new one, and fail with "permission denied" (#181).
 //
 // Lock order. Every transaction of the provider takes its advisory locks in
 // one global order, so two of them can't wait for each other in a cycle:
@@ -47,8 +54,9 @@ import (
 //  1. the single-bigint OID keys (roles, members, the database of a database
 //     grant), in one statement ordered by OID (roleLockQuery,
 //     granteeLockQuery);
-//  2. then the two-int4 object keys of this file, schema-wide keys first, then
-//     object keys sorted by key value (advisoryLockStatement).
+//  2. then the two-int4 object keys of this file: the database-wide REASSIGN
+//     OWNED key, then schema-wide keys, then object keys sorted by key value
+//     (advisoryLockStatement).
 //
 // No path takes an OID key after an object key, and nothing takes an advisory
 // lock after withRolesGranted took its membership mutexes (membershipLocks).
@@ -59,6 +67,7 @@ import (
 // of key; the second is a 32-bit FNV-1a hash of the parts. A hash collision
 // only makes two unrelated writes wait for each other.
 const (
+	advisoryLockNamespaceReassignOwned int32 = 0x74667072 // "tfpr": REASSIGN OWNED in the current database
 	advisoryLockNamespaceSchemaObjects int32 = 0x74667073 // "tfps": all objects of a class in a schema
 	advisoryLockNamespaceObject        int32 = 0x7466706f // "tfpo": one object
 	advisoryLockNamespaceDefaultACL    int32 = 0x74667064 // "tfpd": one pg_default_acl row
@@ -100,9 +109,16 @@ func (k advisoryLockKey) String() string {
 
 // namespaceOrder is the acquisition order of the namespaces: wider scopes first.
 var namespaceOrder = map[int32]int{
-	advisoryLockNamespaceSchemaObjects: 0,
-	advisoryLockNamespaceObject:        1,
-	advisoryLockNamespaceDefaultACL:    2,
+	advisoryLockNamespaceReassignOwned: 0,
+	advisoryLockNamespaceSchemaObjects: 1,
+	advisoryLockNamespaceObject:        2,
+	advisoryLockNamespaceDefaultACL:    3,
+}
+
+// reassignOwnedLockKey is the database-wide key of REASSIGN OWNED: exclusive
+// for REASSIGN OWNED, shared for the writes that read object owners (#181).
+func reassignOwnedLockKey(shared bool) advisoryLockKey {
+	return newAdvisoryLockKey(advisoryLockNamespaceReassignOwned, shared, "reassign owned")
 }
 
 func sortAdvisoryLockKeys(keys []advisoryLockKey) {
@@ -168,9 +184,19 @@ func grantLockClass(objectType string) string {
 }
 
 // grantLockKeys returns the object-keyed advisory locks a postgresql_grant
-// write takes, in acquisition order. Database grants return none: they lock
-// the database OID with the grantee (granteeLockQuery).
+// write takes, in acquisition order: the shared REASSIGN OWNED key, then the
+// object keys. Database grants return none: they run on the maintenance
+// database and lock the database OID with the grantee (granteeLockQuery).
 func grantLockKeys(get ResourceSchemeGetter) []advisoryLockKey {
+	keys := grantObjectLockKeys(get)
+	if len(keys) == 0 {
+		return nil
+	}
+	return append([]advisoryLockKey{reassignOwnedLockKey(true)}, keys...)
+}
+
+// grantObjectLockKeys returns the object keys of grantLockKeys.
+func grantObjectLockKeys(get ResourceSchemeGetter) []advisoryLockKey {
 	objectType := get("object_type").(string)
 	schemaName, _ := get("schema").(string)
 	var objects []string
