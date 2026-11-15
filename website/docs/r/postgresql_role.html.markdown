@@ -16,10 +16,12 @@ automatically run a [`REASSIGN
 OWNED`](https://www.postgresql.org/docs/current/static/sql-reassign-owned.html)
 and [`DROP
 OWNED`](https://www.postgresql.org/docs/current/static/sql-drop-owned.html) to
-the `CURRENT_USER` (normally the connected user for the provider).  If the
-specified PostgreSQL ROLE owns objects in multiple PostgreSQL databases in the
-same PostgreSQL Cluster, one PostgreSQL provider per database must be created
-and all but the final ``postgresql_role`` must specify a `skip_drop_role`.
+the `CURRENT_USER` (normally the connected user for the provider).  This runs
+in every database of the cluster where the role owns objects or holds
+privileges (found through the shared `pg_shdepend` catalog), one database at a
+time, and then in the provider's database before the `DROP ROLE`. The provider
+user must be able to connect to these databases. Databases that do not allow
+connections are skipped.
 
 ~> **Note:** All arguments including role name and password will be stored in the raw state as plain-text.
 [Read more about sensitive data in state](https://www.terraform.io/docs/state/sensitive-data.html).
@@ -180,6 +182,8 @@ resource "postgresql_role" "app_user" {
   second steps taken when removing a ROLE from a database (the second step being
   an implicit
   [`DROP OWNED`](https://www.postgresql.org/docs/current/static/sql-drop-owned.html)).
+  By default both run in every database where the role owns objects or holds
+  privileges; set this option to true to skip them in all databases.
 
 * `statement_timeout` - (Optional) Defines [`statement_timeout`](https://www.postgresql.org/docs/current/runtime-config-client.html#RUNTIME-CONFIG-CLIENT-STATEMENT) setting for this role which allows to abort any statement that takes more than the specified amount of time.
 

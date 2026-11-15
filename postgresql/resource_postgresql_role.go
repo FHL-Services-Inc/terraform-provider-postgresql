@@ -381,6 +381,16 @@ func resourcePostgreSQLRoleCreate(db *DBConnection, d *schema.ResourceData) erro
 
 func resourcePostgreSQLRoleDelete(db *DBConnection, d *schema.ResourceData) error {
 	roleName := d.Get(roleNameAttr).(string)
+	skipReassignOwned := d.Get(roleSkipReassignOwnedAttr).(bool)
+
+	// REASSIGN OWNED and DROP OWNED only act on the current database (and on
+	// shared objects), so they first run in every other database where the
+	// role owns objects or holds privileges, one database at a time (#137).
+	if !skipReassignOwned {
+		if err := reassignOwnedInOtherDatabases(db, roleName); err != nil {
+			return err
+		}
+	}
 
 	txn, err := startTransaction(db.client, "")
 	if err != nil {
@@ -392,18 +402,8 @@ func resourcePostgreSQLRoleDelete(db *DBConnection, d *schema.ResourceData) erro
 		return err
 	}
 
-	if !d.Get(roleSkipReassignOwnedAttr).(bool) {
-		if err := withRolesGranted(db, txn, []string{roleName}, func() error {
-			currentUser := db.client.config.getDatabaseUsername()
-			if _, err := txn.Exec(fmt.Sprintf("REASSIGN OWNED BY %s TO %s", pq.QuoteIdentifier(roleName), pq.QuoteIdentifier(currentUser))); err != nil {
-				return fmt.Errorf("could not reassign owned by role %s to %s: %w", roleName, currentUser, err)
-			}
-
-			if _, err := txn.Exec(fmt.Sprintf("DROP OWNED BY %s", pq.QuoteIdentifier(roleName))); err != nil {
-				return fmt.Errorf("could not drop owned by role %s: %w", roleName, err)
-			}
-			return nil
-		}); err != nil {
+	if !skipReassignOwned {
+		if err := reassignAndDropOwned(db, txn, roleName); err != nil {
 			return err
 		}
 	}
@@ -420,6 +420,116 @@ func resourcePostgreSQLRoleDelete(db *DBConnection, d *schema.ResourceData) erro
 	d.SetId("")
 
 	return nil
+}
+
+// reassignAndDropOwned gives the objects role owns in the database of txn (and
+// the shared objects it owns) to the provider user, then drops the privileges
+// role still holds there. The caller holds pgLockRole on txn.
+func reassignAndDropOwned(db *DBConnection, txn *sql.Tx, role string) error {
+	return withRolesGranted(db, txn, []string{role}, func() error {
+		currentUser := db.client.config.getDatabaseUsername()
+		if _, err := txn.Exec(fmt.Sprintf("REASSIGN OWNED BY %s TO %s", pq.QuoteIdentifier(role), pq.QuoteIdentifier(currentUser))); err != nil {
+			return fmt.Errorf("could not reassign owned by role %s to %s: %w", role, currentUser, err)
+		}
+
+		if _, err := txn.Exec(fmt.Sprintf("DROP OWNED BY %s", pq.QuoteIdentifier(role))); err != nil {
+			return fmt.Errorf("could not drop owned by role %s: %w", role, err)
+		}
+		return nil
+	})
+}
+
+// roleDependentDatabasesQuery lists the databases, other than the current one,
+// that hold objects owned by role or privileges granted to it. pg_shdepend is
+// a shared catalog readable by any user, so this needs no connection to these
+// databases. Dependencies on shared objects (dbid = 0) are handled by
+// REASSIGN/DROP OWNED in the provider's database. Databases that do not allow
+// connections (template0) are left out: DROP ROLE then reports what is left.
+const roleDependentDatabasesQuery = `SELECT DISTINCT d.datname
+FROM pg_shdepend s
+JOIN pg_roles r ON r.oid = s.refobjid
+JOIN pg_database d ON d.oid = s.dbid
+WHERE s.refclassid = 'pg_authid'::regclass
+  AND r.rolname = $1
+  AND d.datname <> current_database()
+  AND d.datallowconn
+ORDER BY d.datname`
+
+func roleDependentDatabases(db QueryAble, role string) ([]string, error) {
+	rows, err := db.Query(roleDependentDatabasesQuery, role)
+	if err != nil {
+		return nil, fmt.Errorf("could not list the databases where role %s owns objects: %w", role, err)
+	}
+	defer func() {
+		if err := rows.Close(); err != nil {
+			log.Printf("[ERR] could not close rows: %v", err)
+		}
+	}()
+
+	var names []string
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, fmt.Errorf("could not scan database name: %w", err)
+		}
+		names = append(names, name)
+	}
+	return names, rows.Err()
+}
+
+// reassignOwnedInOtherDatabases runs REASSIGN OWNED / DROP OWNED for role in
+// every database other than the provider's one where role owns objects or
+// holds privileges.
+//
+// Each database gets its own transaction on that database's pool (shared with
+// the other resources, so max_idle_connections and the eviction before DROP
+// DATABASE apply), committed before the next one starts: at most one
+// connection is held at any time, so no pool is ever asked for a second
+// connection while one of its connections is pinned by this operation. This
+// also keeps the lock order of withRolesGranted (advisory locks first, then
+// the membership locks until the transaction ends).
+//
+// A database dropped since the catalog was read is skipped.
+func reassignOwnedInOtherDatabases(db *DBConnection, role string) error {
+	dbNames, err := roleDependentDatabases(db, role)
+	if err != nil {
+		return err
+	}
+
+	for _, dbName := range dbNames {
+		if dbName == db.client.databaseName {
+			continue
+		}
+		if err := reassignOwnedInDatabase(db.client, dbName, role); err != nil {
+			if isDatabaseDoesNotExistError(err) {
+				log.Printf("[DEBUG] database %s no longer exists, skipping REASSIGN OWNED BY %s there", dbName, role)
+				continue
+			}
+			return fmt.Errorf("in database %s: %w", dbName, err)
+		}
+	}
+	return nil
+}
+
+func reassignOwnedInDatabase(client *Client, dbName, role string) error {
+	dbConn, err := initConnection(client, dbName)
+	if err != nil {
+		return err
+	}
+
+	txn, err := dbConn.Begin()
+	if err != nil {
+		return fmt.Errorf("could not start transaction: %w", err)
+	}
+	defer deferredRollback(txn)
+
+	if err := pgLockRole(txn, role); err != nil {
+		return err
+	}
+	if err := reassignAndDropOwned(dbConn, txn, role); err != nil {
+		return err
+	}
+	return commitTxn(txn)
 }
 
 func resourcePostgreSQLRoleRead(db *DBConnection, d *schema.ResourceData) error {
