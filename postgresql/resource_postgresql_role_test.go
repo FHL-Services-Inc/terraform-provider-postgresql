@@ -12,6 +12,7 @@ import (
 
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/resource"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/terraform"
+	"github.com/lib/pq"
 )
 
 func TestAccPostgresqlRole_Basic(t *testing.T) {
@@ -717,4 +718,52 @@ func TestAccRolePasswordClauseStandardConformingStrings(t *testing.T) {
 			}
 		}
 	}
+}
+
+// A role whose statement_timeout / idle_in_transaction_session_timeout was set
+// with a unit outside Terraform (e.g. '12s') must still be readable, and the
+// value must compare equal to the same duration in milliseconds.
+func TestAccPostgresqlRole_TimeoutsWithUnits(t *testing.T) {
+	roleName := testUniqueName("role_timeout_units")
+	config := fmt.Sprintf(`
+resource "postgresql_role" "role" {
+  name                                = "%s"
+  statement_timeout                   = 12000
+  idle_in_transaction_session_timeout = 120000
+}
+`, roleName)
+
+	resource.Test(t, resource.TestCase{
+		PreCheck: func() {
+			testAccPreCheck(t)
+		},
+		Providers:    testAccProviders,
+		CheckDestroy: testAccCheckPostgresqlRoleDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config: config,
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr("postgresql_role.role", "statement_timeout", "12000"),
+					resource.TestCheckResourceAttr("postgresql_role.role", "idle_in_transaction_session_timeout", "120000"),
+				),
+			},
+			{
+				PreConfig: func() {
+					dbConfig := getTestConfig(t)
+					dsn := dbConfig.connStr("postgres")
+					dbExecute(t, dsn, fmt.Sprintf("ALTER ROLE %s SET statement_timeout = '12s'", pq.QuoteIdentifier(roleName)))
+					dbExecute(t, dsn, fmt.Sprintf("ALTER ROLE %s SET idle_in_transaction_session_timeout = '2min'", pq.QuoteIdentifier(roleName)))
+				},
+				Config:   config,
+				PlanOnly: true,
+			},
+			{
+				Config: config,
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr("postgresql_role.role", "statement_timeout", "12000"),
+					resource.TestCheckResourceAttr("postgresql_role.role", "idle_in_transaction_session_timeout", "120000"),
+				),
+			},
+		},
+	})
 }
