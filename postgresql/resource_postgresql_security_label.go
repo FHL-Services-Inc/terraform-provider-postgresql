@@ -52,9 +52,11 @@ type securityLabelObjectType struct {
 const (
 	securityLabelLookupRelation = `SELECT to_regclass($1)::oid, 0`
 	securityLabelLookupType     = `SELECT to_regtype($1)::oid, 0`
-	securityLabelLookupRoutine  = `SELECT CASE WHEN strpos($1, '(') > 0 THEN to_regprocedure($1)::oid ELSE to_regproc($1)::oid END, 0`
-	securityLabelLookupColumn   = `SELECT attrelid, attnum::int FROM pg_attribute WHERE attrelid = to_regclass($1) AND attname = $2`
-	securityLabelLookupOID      = `SELECT $1::oid, 0`
+	securityLabelLookupRoutine  = `SELECT to_regprocedure($1)::oid, 0`
+	// a routine named without argument types
+	securityLabelLookupRoutineName = `SELECT to_regproc($1)::oid, 0`
+	securityLabelLookupColumn      = `SELECT attrelid, attnum::int FROM pg_attribute WHERE attrelid = to_regclass($1) AND attname = $2`
+	securityLabelLookupOID         = `SELECT $1::oid, 0`
 )
 
 // securityLabelObjectTypes lists the object types of the SECURITY LABEL statement
@@ -218,11 +220,17 @@ func resourcePostgreSQLSecurityLabelReadImpl(db *DBConnection, d *schema.Resourc
 	if err != nil {
 		return err
 	}
+	lookupQuery := t.lookup
+	if t.style == securityLabelNameRoutine {
+		if _, signature := splitRoutineName(objectName); signature == "" {
+			lookupQuery = securityLabelLookupRoutineName
+		}
+	}
 
 	// The labels of the shared objects (roles, databases, ...) are in pg_shseclabel: the
 	// pg_seclabels view lists both kinds, and the objects are matched by their OID.
 	// An empty provider matches the label of any provider.
-	lookup := strings.NewReplacer("$1", pq.QuoteLiteral(lookupName), "$2", pq.QuoteLiteral(rawName)).Replace(t.lookup)
+	lookup := strings.NewReplacer("$1", pq.QuoteLiteral(lookupName), "$2", pq.QuoteLiteral(rawName)).Replace(lookupQuery)
 	query := fmt.Sprintf(`
 WITH object (oid, subid) AS (%s)
 SELECT l.provider, l.label
@@ -291,12 +299,14 @@ func resourcePostgreSQLSecurityLabelUpdate(db *DBConnection, d *schema.ResourceD
 }
 
 // resourcePostgreSQLSecurityLabelImport reads the ID written by generateSecurityLabelID:
-// <database>.<provider>.<object type>.<object name>. Only the first three dots separate
-// the parts, so object names can contain dots.
+// <database>.<provider>.<object type>.<object name>. A database or a provider whose name
+// contains a dot or a double quote is written between double quotes (a double quote inside
+// is doubled), the other names are written as they are. The object type has no dot, and
+// the object name is the rest of the ID, so it can contain dots.
 func resourcePostgreSQLSecurityLabelImport(_ context.Context, d *schema.ResourceData, _ any) ([]*schema.ResourceData, error) {
-	parts := strings.SplitN(d.Id(), ".", 4)
-	if len(parts) != 4 {
-		return nil, fmt.Errorf("invalid security label ID %q, expected <database>.<provider>.<object type>.<object name>", d.Id())
+	parts, err := parseSecurityLabelID(d.Id())
+	if err != nil {
+		return nil, err
 	}
 	d.Set(securityLabelDatabaseAttr, parts[0])
 	d.Set(securityLabelProviderAttr, parts[1])
@@ -304,6 +314,56 @@ func resourcePostgreSQLSecurityLabelImport(_ context.Context, d *schema.Resource
 	d.Set(securityLabelObjectNameAttr, parts[3])
 
 	return []*schema.ResourceData{d}, nil
+}
+
+func parseSecurityLabelID(id string) ([4]string, error) {
+	var parts [4]string
+	rest := id
+	for i := 0; i < 3; i++ {
+		var part string
+		var ok bool
+		if i < 2 && strings.HasPrefix(rest, `"`) {
+			part, rest, ok = cutQuotedIDPart(rest)
+		} else {
+			part, rest, ok = strings.Cut(rest, ".")
+		}
+		if !ok {
+			return parts, fmt.Errorf("invalid security label ID %q, expected <database>.<provider>.<object type>.<object name>", id)
+		}
+		parts[i] = part
+	}
+	parts[3] = rest
+
+	return parts, nil
+}
+
+// cutQuotedIDPart reads a "quoted" part and the dot which follows it.
+func cutQuotedIDPart(s string) (part, rest string, ok bool) {
+	var b strings.Builder
+	for i := 1; i < len(s); i++ {
+		if s[i] != '"' {
+			b.WriteByte(s[i])
+			continue
+		}
+		if i+1 < len(s) && s[i+1] == '"' {
+			b.WriteByte('"')
+			i++
+			continue
+		}
+		if i+1 < len(s) && s[i+1] == '.' {
+			return b.String(), s[i+2:], true
+		}
+		return "", "", false
+	}
+	return "", "", false
+}
+
+// quoteSecurityLabelIDPart quotes a part of the ID which contains a dot or a double quote.
+func quoteSecurityLabelIDPart(part string) string {
+	if !strings.ContainsAny(part, `."`) {
+		return part
+	}
+	return `"` + strings.ReplaceAll(part, `"`, `""`) + `"`
 }
 
 func getDatabaseForSecurityLabel(d *schema.ResourceData, databaseName string) string {
@@ -316,8 +376,8 @@ func getDatabaseForSecurityLabel(d *schema.ResourceData, databaseName string) st
 
 func generateSecurityLabelID(d *schema.ResourceData) string {
 	return strings.Join([]string{
-		d.Get(securityLabelDatabaseAttr).(string),
-		d.Get(securityLabelProviderAttr).(string),
+		quoteSecurityLabelIDPart(d.Get(securityLabelDatabaseAttr).(string)),
+		quoteSecurityLabelIDPart(d.Get(securityLabelProviderAttr).(string)),
 		d.Get(securityLabelObjectTypeAttr).(string),
 		d.Get(securityLabelObjectNameAttr).(string),
 	}, ".")
@@ -347,16 +407,48 @@ func securityLabelNames(t securityLabelObjectType, objectName string) (name, loo
 		column := parts[len(parts)-1]
 		return table + "." + pq.QuoteIdentifier(column), table, column, nil
 	case securityLabelNameRoutine:
-		qualified, signature := objectName, ""
-		if i := strings.Index(objectName, "("); i >= 0 {
-			qualified, signature = objectName[:i], objectName[i:]
-		}
+		qualified, signature := splitRoutineName(objectName)
 		quoted := quoteQualifiedName(qualified) + signature
 		return quoted, quoted, objectName, nil
 	default:
 		quoted := quoteQualifiedName(objectName)
 		return quoted, quoted, objectName, nil
 	}
+}
+
+// splitRoutineName splits name(argument types) into the name and the list of argument
+// types, with its parentheses. The list is the first parenthesised group which is balanced
+// up to the end of the string: the argument types can contain parentheses (varchar(10),
+// numeric(10,2)) and the name itself can contain one. Without such a group, the whole
+// string is the name.
+func splitRoutineName(objectName string) (name, signature string) {
+	for i := 0; i < len(objectName); i++ {
+		if objectName[i] == '(' && balancedGroup(objectName[i:]) {
+			return objectName[:i], objectName[i:]
+		}
+	}
+	return objectName, ""
+}
+
+// balancedGroup tells if s is one group "(...)" whose parentheses are balanced, the
+// parentheses inside double quotes being ignored.
+func balancedGroup(s string) bool {
+	depth, quoted := 0, false
+	for i := 0; i < len(s); i++ {
+		switch c := s[i]; {
+		case c == '"':
+			quoted = !quoted
+		case quoted:
+		case c == '(':
+			depth++
+		case c == ')':
+			depth--
+			if depth == 0 {
+				return i == len(s)-1
+			}
+		}
+	}
+	return false
 }
 
 // quoteQualifiedName quotes each part of a name written as schema.name

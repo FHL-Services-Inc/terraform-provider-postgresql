@@ -4,11 +4,13 @@ import (
 	"database/sql"
 	"fmt"
 	"net/url"
+	"regexp"
 	"strings"
 	"testing"
 
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/resource"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/terraform"
+	"github.com/lib/pq"
 )
 
 func TestAccPostgresqlSecurityLabel_Basic(t *testing.T) {
@@ -24,7 +26,7 @@ func TestAccPostgresqlSecurityLabel_Basic(t *testing.T) {
 			{
 				Config: testAccPostgresqlSecurityLabelConfig,
 				Check: resource.ComposeTestCheckFunc(
-					testAccCheckPostgresqlSecurityLabelExists("postgresql_security_label.test_label"),
+					testAccCheckSecurityLabelOfRole(t, "security_label_test_role", "classified"),
 					resource.TestCheckResourceAttr(
 						"postgresql_security_label.test_label", "object_type", "role"),
 					resource.TestCheckResourceAttr(
@@ -33,6 +35,14 @@ func TestAccPostgresqlSecurityLabel_Basic(t *testing.T) {
 						"postgresql_security_label.test_label", "label_provider", "dummy"),
 					resource.TestCheckResourceAttr(
 						"postgresql_security_label.test_label", "label", "classified"),
+				),
+			},
+			// the label is removed, the role stays: the catalog has no label
+			{
+				Config: testAccPostgresqlSecurityLabelRoleOnlyBasic,
+				Check: resource.ComposeTestCheckFunc(
+					testAccCheckSecurityLabelAbsentOfRole(t, "security_label_test_role"),
+					testAccCheckRoleExistsInCatalog("security_label_test_role"),
 				),
 			},
 		},
@@ -52,7 +62,7 @@ func TestAccPostgresqlSecurityLabel_Update(t *testing.T) {
 			{
 				Config: testAccPostgresqlSecurityLabelConfig,
 				Check: resource.ComposeTestCheckFunc(
-					testAccCheckPostgresqlSecurityLabelExists("postgresql_security_label.test_label"),
+					testAccCheckSecurityLabelOfRole(t, "security_label_test_role", "classified"),
 					resource.TestCheckResourceAttr(
 						"postgresql_security_label.test_label", "object_type", "role"),
 					resource.TestCheckResourceAttr(
@@ -66,7 +76,7 @@ func TestAccPostgresqlSecurityLabel_Update(t *testing.T) {
 			{
 				Config: testAccPostgresqlSecurityLabelChanges2,
 				Check: resource.ComposeTestCheckFunc(
-					testAccCheckPostgresqlSecurityLabelExists("postgresql_security_label.test_label"),
+					testAccCheckSecurityLabelOfRole(t, "security_label_test_role", "unclassified"),
 					resource.TestCheckResourceAttr(
 						"postgresql_security_label.test_label", "label", "unclassified"),
 				),
@@ -74,9 +84,19 @@ func TestAccPostgresqlSecurityLabel_Update(t *testing.T) {
 			{
 				Config: testAccPostgresqlSecurityLabelChanges3,
 				Check: resource.ComposeTestCheckFunc(
-					testAccCheckPostgresqlSecurityLabelExists("postgresql_security_label.test_label"),
 					resource.TestCheckResourceAttr(
 						"postgresql_security_label.test_label", "object_name", "security_label_test-role2"),
+					// the label is on the renamed role, not only in the state
+					testAccCheckSecurityLabelOfRole(t, "security_label_test-role2", "unclassified"),
+					testAccCheckSecurityLabelAbsentOfRole(t, "security_label_test_role"),
+				),
+			},
+			// the label is removed, the role stays: the catalog has no label
+			{
+				Config: testAccPostgresqlSecurityLabelRoleOnly,
+				Check: resource.ComposeTestCheckFunc(
+					testAccCheckSecurityLabelAbsentOfRole(t, "security_label_test-role2"),
+					testAccCheckRoleExistsInCatalog("security_label_test-role2"),
 				),
 			},
 		},
@@ -292,97 +312,69 @@ func testAccCheckSecurityLabelAbsent(t *testing.T, dbName, catalogType, catalogN
 	}
 }
 
-func checkSecurityLabelExists(txn *sql.Tx, objectType string, objectName string, provider string) (bool, error) {
-	var _rez bool
-	err := txn.QueryRow("SELECT TRUE FROM pg_seclabels WHERE objtype = $1 AND objname = quote_ident($2) AND provider = $3", objectType, objectName, provider).Scan(&_rez)
-	switch {
-	case err == sql.ErrNoRows:
-		return false, nil
-	case err != nil:
-		return false, fmt.Errorf("error reading info about security label: %s", err)
+// testAccRoleCatalogName returns the name of a role as pg_seclabels writes it (quote_ident).
+func testAccRoleCatalogName(role string) string {
+	if regexp.MustCompile(`^[a-z_][a-z0-9_]*$`).MatchString(role) {
+		return role
 	}
-
-	return true, nil
+	return pq.QuoteIdentifier(role)
 }
 
+// testAccCheckSecurityLabelOfRole checks the label of a role in pg_seclabels (the labels of the
+// roles are shared, any database shows them).
+func testAccCheckSecurityLabelOfRole(t *testing.T, role, label string) resource.TestCheckFunc {
+	return testAccCheckSecurityLabelInCatalog(t, "postgres", "role", testAccRoleCatalogName(role), "dummy", label)
+}
+
+// testAccCheckSecurityLabelAbsentOfRole checks that a role has no label of the provider.
+func testAccCheckSecurityLabelAbsentOfRole(t *testing.T, role string) resource.TestCheckFunc {
+	return testAccCheckSecurityLabelAbsent(t, "postgres", "role", testAccRoleCatalogName(role), "dummy")
+}
+
+// The label of each resource of the state is gone. The roles of the tests are dropped by the
+// destroy, so this proves that the label is not left in the catalog for any other object
+// either: pg_shseclabel has no row of the provider whose object does not exist.
 func testAccCheckPostgresqlSecurityLabelDestroy(s *terraform.State) error {
 	client := testAccProvider.Meta().(*Client)
+	db, err := client.Connect()
+	if err != nil {
+		return err
+	}
 
 	for _, rs := range s.RootModule().Resources {
 		if rs.Type != "postgresql_security_label" {
 			continue
 		}
+		objectType := rs.Primary.Attributes[securityLabelObjectTypeAttr]
+		objectName := rs.Primary.Attributes[securityLabelObjectNameAttr]
+		if objectType != "role" {
+			return fmt.Errorf("the destroy check only knows the roles, not %s %s", objectType, objectName)
+		}
 
-		txn, err := startTransaction(client, "")
+		var count int
+		err := db.QueryRow(
+			"SELECT count(*) FROM pg_seclabels WHERE objtype = 'role' AND objname = $1 AND provider = $2",
+			testAccRoleCatalogName(objectName), rs.Primary.Attributes[securityLabelProviderAttr],
+		).Scan(&count)
 		if err != nil {
-			return err
+			return fmt.Errorf("error checking security label: %w", err)
 		}
-		defer deferredRollback(txn)
-
-		exists, err := checkSecurityLabelExists(
-			txn,
-			rs.Primary.Attributes[securityLabelObjectTypeAttr],
-			rs.Primary.Attributes[securityLabelObjectNameAttr],
-			rs.Primary.Attributes[securityLabelProviderAttr],
-		)
-
-		if err != nil {
-			return fmt.Errorf("error checking security label%s", err)
+		if count != 0 {
+			return fmt.Errorf("the security label of role %s still exists after destroy", objectName)
 		}
+	}
 
-		if exists {
-			return fmt.Errorf("Security label still exists after destroy")
-		}
+	var orphans int
+	if err := db.QueryRow(`SELECT count(*) FROM pg_catalog.pg_shseclabel l
+		WHERE l.provider = 'dummy' AND l.classoid = 'pg_authid'::regclass
+		AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_authid a WHERE a.oid = l.objoid)`).Scan(&orphans); err != nil {
+		return fmt.Errorf("error checking security labels: %w", err)
+	}
+	if orphans != 0 {
+		return fmt.Errorf("%d security labels of dropped roles are left", orphans)
 	}
 
 	return nil
-}
-
-func testAccCheckPostgresqlSecurityLabelExists(n string) resource.TestCheckFunc {
-	return func(s *terraform.State) error {
-		rs, ok := s.RootModule().Resources[n]
-		if !ok {
-			return fmt.Errorf("Resource not found: %s", n)
-		}
-
-		if rs.Primary.ID == "" {
-			return fmt.Errorf("No ID is set")
-		}
-
-		objectType, ok := rs.Primary.Attributes[securityLabelObjectTypeAttr]
-		if !ok {
-			return fmt.Errorf("No Attribute for object type is set")
-		}
-
-		objectName, ok := rs.Primary.Attributes[securityLabelObjectNameAttr]
-		if !ok {
-			return fmt.Errorf("No Attribute for object name is set")
-		}
-
-		provider, ok := rs.Primary.Attributes[securityLabelProviderAttr]
-		if !ok {
-			return fmt.Errorf("No Attribute for security provider is set")
-		}
-
-		client := testAccProvider.Meta().(*Client)
-		txn, err := startTransaction(client, "")
-		if err != nil {
-			return err
-		}
-		defer deferredRollback(txn)
-
-		exists, err := checkSecurityLabelExists(txn, objectType, objectName, provider)
-
-		if err != nil {
-			return fmt.Errorf("error checking security label%s", err)
-		}
-
-		if !exists {
-			return fmt.Errorf("Security label not found")
-		}
-
-		return nil
-	}
 }
 
 var testAccPostgresqlSecurityLabelConfig = `
@@ -426,6 +418,39 @@ resource "postgresql_security_label" "test_label" {
   label          = "unclassified"
 }
 `
+
+var testAccPostgresqlSecurityLabelRoleOnlyBasic = `
+resource "postgresql_role" "test_role" {
+  name            = "security_label_test_role"
+  login           = true
+  create_database = true
+}
+`
+
+var testAccPostgresqlSecurityLabelRoleOnly = `
+resource "postgresql_role" "test_role" {
+  name            = "security_label_test-role2"
+  login           = true
+  create_database = true
+}
+`
+
+func testAccCheckRoleExistsInCatalog(role string) resource.TestCheckFunc {
+	return func(*terraform.State) error {
+		db, err := testAccProvider.Meta().(*Client).Connect()
+		if err != nil {
+			return err
+		}
+		var exists bool
+		if err := db.QueryRow("SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = $1)", role).Scan(&exists); err != nil {
+			return err
+		}
+		if !exists {
+			return fmt.Errorf("role %s does not exist", role)
+		}
+		return nil
+	}
+}
 
 // testCheckSecurityLabelSuperuser skips the test when the connected user is not a real superuser,
 // because PostgreSQL itself requires one to create the object.
@@ -731,5 +756,177 @@ func TestAccPostgresqlSecurityLabel_LargeObject(t *testing.T) {
 		catalogType: "large object",
 		catalogName: "424242",
 		setup:       []string{"SELECT lo_create(424242)"},
+	})
+}
+
+// The argument types can have a modifier or be schema-qualified.
+func TestAccPostgresqlSecurityLabel_FunctionTypeModifiers(t *testing.T) {
+	testAccPostgresqlSecurityLabelObject(t, securityLabelObjectCase{
+		objectType:  "function",
+		objectName:  "test_schema.sl_mod(varchar(10), numeric(10,2), test_schema.sl_t)",
+		sqlName:     "test_schema.sl_mod(varchar(10), numeric(10,2), test_schema.sl_t)",
+		catalogType: "function",
+		catalogName: "test_schema.sl_mod(a character varying, b numeric, c test_schema.sl_t)",
+		setup: []string{
+			"CREATE TYPE test_schema.sl_t AS (a int)",
+			"CREATE FUNCTION test_schema.sl_mod(a varchar(10), b numeric(10,2), c test_schema.sl_t) RETURNS int LANGUAGE sql AS 'SELECT 1'",
+		},
+	})
+}
+
+// The name of a routine can contain a parenthesis (the name is quoted by the provider).
+func TestAccPostgresqlSecurityLabel_FunctionParenthesisInName(t *testing.T) {
+	testAccPostgresqlSecurityLabelObject(t, securityLabelObjectCase{
+		objectType:  "function",
+		objectName:  "test_schema.sl(odd(varchar(10))",
+		sqlName:     `test_schema."sl(odd"(varchar(10))`,
+		catalogType: "function",
+		catalogName: `test_schema."sl(odd"(a character varying)`,
+		setup:       []string{`CREATE FUNCTION test_schema."sl(odd"(a varchar(10)) RETURNS int LANGUAGE sql AS 'SELECT 1'`},
+	})
+}
+
+// ... also when it has no arguments, and when the name of a table or a role contains one
+func TestAccPostgresqlSecurityLabel_FunctionParenthesisInNameNoArguments(t *testing.T) {
+	testAccPostgresqlSecurityLabelObject(t, securityLabelObjectCase{
+		objectType:  "function",
+		objectName:  "test_schema.sl(odd",
+		sqlName:     `test_schema."sl(odd"`,
+		catalogType: "function",
+		catalogName: `test_schema."sl(odd"()`,
+		setup:       []string{`CREATE FUNCTION test_schema."sl(odd"() RETURNS int LANGUAGE sql AS 'SELECT 1'`},
+	})
+}
+
+func TestAccPostgresqlSecurityLabel_ParenthesisInNames(t *testing.T) {
+	testAccPostgresqlSecurityLabelObject(t, securityLabelObjectCase{
+		objectType:  "table",
+		objectName:  "test_schema.sl(t)",
+		sqlName:     `test_schema."sl(t)"`,
+		catalogType: "table",
+		catalogName: `test_schema."sl(t)"`,
+		setup:       []string{`CREATE TABLE test_schema."sl(t)" (id int)`},
+	})
+}
+
+func TestAccPostgresqlSecurityLabel_RoleWithParenthesisAndDot(t *testing.T) {
+	testAccPostgresqlSecurityLabelObject(t, securityLabelObjectCase{
+		objectType:  "role",
+		objectName:  "sl.role(x)-{suffix}",
+		sqlName:     `"sl.role(x)-{suffix}"`,
+		catalogType: "role",
+		catalogName: `"sl.role(x)-{suffix}"`,
+		setup:       []string{`CREATE ROLE "sl.role(x)-{suffix}"`},
+		cleanup:     []string{`DROP ROLE IF EXISTS "sl.role(x)-{suffix}"`},
+	})
+}
+
+func TestSplitRoutineName(t *testing.T) {
+	cases := []struct{ in, name, signature string }{
+		{"f", "f", ""},
+		{"s.f", "s.f", ""},
+		{"f()", "f", "()"},
+		{"s.f(int, text)", "s.f", "(int, text)"},
+		{"f(varchar(10), numeric(10,2))", "f", "(varchar(10), numeric(10,2))"},
+		{"f(s.t)", "f", "(s.t)"},
+		{"f(o(int)", "f(o", "(int)"},
+		{"f(o", "f(o", ""},
+		{"a(b)(int)", "a(b)", "(int)"},
+		{`f("my(type")`, "f", `("my(type")`},
+	}
+	for _, c := range cases {
+		name, signature := splitRoutineName(c.in)
+		if name != c.name || signature != c.signature {
+			t.Errorf("splitRoutineName(%q) = %q, %q; expected %q, %q", c.in, name, signature, c.name, c.signature)
+		}
+	}
+}
+
+func TestSecurityLabelID(t *testing.T) {
+	cases := []struct {
+		id    string
+		parts [4]string
+	}{
+		{"mydb.dummy.role.my_role", [4]string{"mydb", "dummy", "role", "my_role"}},
+		{"mydb.dummy.table.s.t", [4]string{"mydb", "dummy", "table", "s.t"}},
+		{`"my.db".dummy.role.r`, [4]string{"my.db", "dummy", "role", "r"}},
+		{`mydb."my.prov".role.r`, [4]string{"mydb", "my.prov", "role", "r"}},
+		{`"a""b.c"."p.q".table.s.t`, [4]string{`a"b.c`, "p.q", "table", "s.t"}},
+		{".dummy.role.r", [4]string{"", "dummy", "role", "r"}},
+	}
+	for _, c := range cases {
+		parts, err := parseSecurityLabelID(c.id)
+		if err != nil || parts != c.parts {
+			t.Errorf("parseSecurityLabelID(%q) = %q, %v; expected %q", c.id, parts, err, c.parts)
+		}
+		// the ID is written back the same way
+		written := strings.Join([]string{quoteSecurityLabelIDPart(c.parts[0]), quoteSecurityLabelIDPart(c.parts[1]), c.parts[2], c.parts[3]}, ".")
+		if strings.HasPrefix(c.id, `"`) || strings.Contains(c.parts[0]+c.parts[1], ".") {
+			if written != c.id {
+				t.Errorf("the ID of %q is %q, expected %q", c.parts, written, c.id)
+			}
+		}
+	}
+	for _, id := range []string{"", "a.b.c", `"a.b.c.d`, `"a"b.c.d.e`} {
+		if _, err := parseSecurityLabelID(id); err == nil {
+			t.Errorf("parseSecurityLabelID(%q) did not fail", id)
+		}
+	}
+}
+
+// A database whose name contains a dot is imported (its ID has the name between quotes).
+func TestAccPostgresqlSecurityLabel_ImportDatabaseWithDot(t *testing.T) {
+	skipIfNotAcc(t)
+
+	dbSuffix, teardown := setupTestDatabase(t, false, false)
+	defer teardown()
+	dbName := "sl.db-" + dbSuffix
+	cfg := getTestConfig(t)
+	var created bool
+	defer func() {
+		if created {
+			dbExecute(t, cfg.connStr("postgres"), fmt.Sprintf("DROP DATABASE IF EXISTS %s", pq.QuoteIdentifier(dbName)))
+		}
+	}()
+
+	config := fmt.Sprintf(`
+resource "postgresql_security_label" "test" {
+  database       = %q
+  object_type    = "table"
+  object_name    = "sl_table"
+  label_provider = "dummy"
+  label          = "classified"
+}
+`, dbName)
+
+	resource.Test(t, resource.TestCase{
+		PreCheck: func() {
+			testAccPreCheck(t)
+			testCheckCompatibleVersion(t, featureSecurityLabel)
+			testCheckCanSetSecurityLabel(t)
+			dbExecute(t, cfg.connStr("postgres"), fmt.Sprintf("CREATE DATABASE %s", pq.QuoteIdentifier(dbName)))
+			created = true
+			dbExecute(t, cfg.connStr(dbName), "CREATE TABLE sl_table (id int)")
+		},
+		Providers: testAccProviders,
+		Steps: []resource.TestStep{
+			{
+				Config: config,
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr("postgresql_security_label.test", "id", fmt.Sprintf(`"%s".dummy.table.sl_table`, dbName)),
+					testAccCheckSecurityLabelInCatalog(t, dbName, "table", "sl_table", "dummy", "classified"),
+				),
+			},
+			{
+				ResourceName:      "postgresql_security_label.test",
+				ImportState:       true,
+				ImportStateVerify: true,
+			},
+			{
+				// nothing to do after the import
+				Config:   config,
+				PlanOnly: true,
+			},
+		},
 	})
 }
