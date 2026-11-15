@@ -3,6 +3,7 @@ package postgresql
 import (
 	"errors"
 	"fmt"
+	"reflect"
 	"testing"
 
 	"github.com/lib/pq"
@@ -51,4 +52,21 @@ func TestIsFunctionArgTypeMissingError(t *testing.T) {
 	assert.False(t, isFunctionArgTypeMissingError(&pq.Error{Code: "42501"}))
 	assert.False(t, isFunctionArgTypeMissingError(errors.New("3F000")))
 	assert.False(t, isFunctionArgTypeMissingError(nil))
+}
+
+func TestSplitFunctionArgTypes(t *testing.T) {
+	for _, c := range []struct {
+		args string
+		want []string
+	}{
+		{"", nil},
+		{"integer", []string{"integer"}},
+		{"integer, text", []string{"integer", "text"}},
+		{"numeric(10,2),character varying(5)", []string{"numeric(10,2)", "character varying(5)"}},
+		{`public."my,type", text[]`, []string{`public."my,type"`, "text[]"}},
+	} {
+		if got := splitFunctionArgTypes(c.args); !reflect.DeepEqual(got, c.want) {
+			t.Errorf("splitFunctionArgTypes(%q) = %#v, want %#v", c.args, got, c.want)
+		}
+	}
 }

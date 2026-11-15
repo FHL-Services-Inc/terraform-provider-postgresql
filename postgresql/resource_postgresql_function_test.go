@@ -7,6 +7,7 @@ import (
 
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/resource"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/terraform"
+	"github.com/lib/pq"
 )
 
 func TestAccPostgresqlFunction_Basic(t *testing.T) {
@@ -380,6 +381,97 @@ resource "postgresql_function" "f" {
 	})
 }
 
+// A non-superuser provider must be able to create, replace and drop a
+// function in a schema owned by another role, also when the function itself
+// is owned by that role (#209).
+func TestAccPostgresqlFunction_SchemaOwnedByOtherRole(t *testing.T) {
+	skipIfNotAcc(t)
+
+	dbSuffix, teardown := setupTestDatabase(t, true, true)
+	defer teardown()
+	dbName, _ := getTestDBNames(dbSuffix)
+	owner := testUniqueName("func_schema_owner")
+	funcName := testUniqueName("func")
+
+	config := func(result int) string {
+		return fmt.Sprintf(`
+resource "postgresql_role" "owner" {
+  name = "%s"
+}
+
+resource "postgresql_schema" "app" {
+  database = "%s"
+  name     = "app"
+  owner    = postgresql_role.owner.name
+}
+
+resource "postgresql_function" "func" {
+  database = "%s"
+  schema   = postgresql_schema.app.name
+  name     = "%s"
+  returns  = "integer"
+  language = "sql"
+  body     = "SELECT %d"
+}
+`, owner, dbName, dbName, funcName, result)
+	}
+
+	functionOwner := func(want string) resource.TestCheckFunc {
+		return func(*terraform.State) error {
+			dbConfig := getTestConfig(t)
+			db, err := sql.Open("postgres", dbConfig.connStr(dbName))
+			if err != nil {
+				return err
+			}
+			defer closeDB(t, db)
+			var got string
+			if err := db.QueryRow(
+				"SELECT pg_get_userbyid(p.proowner) FROM pg_proc p JOIN pg_namespace n ON p.pronamespace = n.oid WHERE "+functionMatch,
+				"app", funcName, pq.Array([]string{}),
+			).Scan(&got); err != nil {
+				return fmt.Errorf("could not read the owner of %s: %w", funcName, err)
+			}
+			if got != want {
+				return fmt.Errorf("owner of %s = %s, want %s", funcName, got, want)
+			}
+			return nil
+		}
+	}
+
+	resource.Test(t, resource.TestCase{
+		PreCheck: func() {
+			testAccPreCheck(t)
+			testCheckCompatibleVersion(t, featureFunction)
+		},
+		Providers:    testAccProviders,
+		CheckDestroy: testAccCheckPostgresqlFunctionDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config: config(1),
+				Check:  testAccCheckPostgresqlFunctionExists("postgresql_function.func", dbName),
+			},
+			// The owner of the schema takes the function over outside of
+			// Terraform: replacing and dropping it now need that owner.
+			{
+				PreConfig: func() {
+					dbConfig := getTestConfig(t)
+					dsn := dbConfig.connStr(dbName)
+					dbExecute(t, dsn, fmt.Sprintf("GRANT %s TO CURRENT_USER", owner))
+					// USAGE on app comes with the membership in its owner.
+					dbExecute(t, dsn, fmt.Sprintf("ALTER FUNCTION app.%s() OWNER TO %s", pq.QuoteIdentifier(funcName), owner))
+					dbExecute(t, dsn, fmt.Sprintf("REVOKE %s FROM CURRENT_USER", owner))
+				},
+				Config: config(2),
+				Check: resource.ComposeTestCheckFunc(
+					testAccCheckPostgresqlFunctionExists("postgresql_function.func", dbName),
+					resource.TestCheckResourceAttr("postgresql_function.func", "body", "SELECT 2"),
+					functionOwner(owner),
+				),
+			},
+		},
+	})
+}
+
 func testAccCheckPostgresqlFunctionExists(n string, database string) resource.TestCheckFunc {
 	return func(s *terraform.State) error {
 		rs, ok := s.RootModule().Resources[n]
@@ -391,11 +483,6 @@ func testAccCheckPostgresqlFunctionExists(n string, database string) resource.Te
 			return fmt.Errorf("No ID is set")
 		}
 
-		_, signature, err := expandFunctionID(rs.Primary.ID, nil, nil)
-		if err != nil {
-			return err
-		}
-
 		client := testAccProvider.Meta().(*Client)
 		txn, err := startTransaction(client, database)
 		if err != nil {
@@ -403,7 +490,7 @@ func testAccCheckPostgresqlFunctionExists(n string, database string) resource.Te
 		}
 		defer deferredRollback(txn)
 
-		exists, err := checkFunctionExists(txn, signature)
+		exists, err := checkFunctionExists(txn, rs.Primary.ID)
 
 		if err != nil {
 			return fmt.Errorf("error checking function %s", err)
@@ -431,13 +518,7 @@ func testAccCheckPostgresqlFunctionDestroy(s *terraform.State) error {
 		}
 		defer deferredRollback(txn)
 
-		_, functionSignature, expandErr := expandFunctionID(rs.Primary.ID, nil, nil)
-
-		if expandErr != nil {
-			return fmt.Errorf("Incorrect resource Id %s", expandErr)
-		}
-
-		exists, err := checkFunctionExists(txn, functionSignature)
+		exists, err := checkFunctionExists(txn, rs.Primary.ID)
 
 		if err != nil {
 			return fmt.Errorf("error checking function %s", err)
@@ -451,11 +532,20 @@ func testAccCheckPostgresqlFunctionDestroy(s *terraform.State) error {
 	return nil
 }
 
-func checkFunctionExists(txn *sql.Tx, signature string) (bool, error) {
+// checkFunctionExists looks the function of a resource ID up in the catalog,
+// like Read, so it needs no USAGE on the schema of the function.
+func checkFunctionExists(txn *sql.Tx, functionId string) (bool, error) {
+	_, fn, err := functionRefFromID(functionId, nil, nil)
+	if err != nil {
+		return false, fmt.Errorf("Incorrect resource Id %s", err)
+	}
 	var _rez bool
-	err := txn.QueryRow("SELECT to_regprocedure($1) IS NOT NULL", signature).Scan(&_rez)
+	err = txn.QueryRow(
+		"SELECT EXISTS (SELECT 1 FROM pg_proc p JOIN pg_namespace n ON p.pronamespace = n.oid WHERE "+functionMatch+")",
+		fn.schema, fn.name, pq.Array(fn.argTypes),
+	).Scan(&_rez)
 	switch {
-	case err == sql.ErrNoRows, isFunctionArgTypeMissingError(err):
+	case isFunctionArgTypeMissingError(err):
 		return false, nil
 	case err != nil:
 		return false, fmt.Errorf("error reading info about function: %s", err)
