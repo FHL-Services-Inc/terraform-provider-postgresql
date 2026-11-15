@@ -144,24 +144,35 @@ max_total_connections >= -parallelism + number of databases
 
 where the number of databases counts the provider's `database` plus every
 database named in a resource. With the default `-parallelism=10` and 4
-databases with resources, that is `10 + 5 = 15`.
+databases with resources, that is `10 + 5 = 15`. For close to the speed of
+no limit, use about `-parallelism + 2 × number of databases` (`20` in that
+example).
 
 The reason: Terraform works on up to `-parallelism` resources at a time, each
-using at most one connection, but a connection belongs to one database. With
-the rule, every pool can keep one idle connection while all workers hold one,
-so a worker that moves to another database usually finds a free slot or an
-idle connection of its own database. With a smaller budget, connections are
-closed in one pool and opened in another all the time, and each of those
-reconnects costs a full connection setup:
+usually holding one connection, and a connection belongs to one database. With
+the minimum, every pool can keep about one idle connection while all workers
+hold one; with twice that, about two. Whenever a worker needs a connection to
+a database whose pool has none idle and all slots are taken, the provider
+closes an idle connection of another pool and opens a new one, which costs a
+full connection setup. Measured with the benchmark below (1,143 resources over
+4 databases, so 5 pools, `-parallelism=10`, 10 ms RTT,
+`max_idle_connections = 10`, median of 5 runs):
 
-BENCH_TABLE
+| `max_total_connections` | plan | vs no limit | connections per plan | peak connections |
+|---|---:|---:|---:|---:|
+| none | 4.9 s | | 51 | 36 |
+| 15 (`-parallelism` + databases) | 6.1 s | +24 % | 264 | 15 |
+| 20 (`-parallelism` + 2 × databases) | 5.3 s | +8 % | 134 | 20 |
+| 25 | 5.1 s | +4 % | 77 | 25 |
 
-At or below `-parallelism` the plan still works, and peak connections stay at
-the limit, but it is slower. The budget never makes the provider hang: a
-resource that cannot get a connection fails after `connect_timeout`. Keep the
-server's `max_connections`, minus your applications' connections, above
-`max_total_connections` times the number of provider blocks that run at the
-same time.
+Below the minimum the plan still works and the peak stays at the limit, but it
+reconnects more and gets slower, and a `postgresql_database` that changes
+owners (it holds one connection while it opens another) can wait for
+`connect_timeout` and fail once the limit is at or below `-parallelism`. The
+limit never makes the provider hang: a resource that cannot get a connection
+fails after `connect_timeout`. Keep the server's `max_connections`, minus your
+applications' connections, above `max_total_connections` times the number of
+provider blocks that run at the same time.
 
 ## `binary_parameters`: one round-trip per statement
 

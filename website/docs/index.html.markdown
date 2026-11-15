@@ -244,7 +244,8 @@ The following arguments are supported:
   Terraform's `-parallelism` plus the number of databases the provider
   connects to (the provider's `database` plus every database named in a
   resource): with `-parallelism=10` and 4 databases with resources, at least
-  `15`. See the
+  `15`; about twice the number of databases on top of `-parallelism` (`20`)
+  keeps almost all of the speed of no limit. See the
   [performance tuning guide](guides/performance-tuning.html)
   for why.
 
