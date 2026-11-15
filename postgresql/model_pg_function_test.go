@@ -133,36 +133,6 @@ AS $function$pg_func_test_body$function$
 		Strict:          true,
 		Volatility:      "STABLE",
 		Body:            "pg_func_test_body",
-		Args: []PGFunctionArg{
-			{
-				Mode: "IN",
-				Name: "showtext",
-				Type: "boolean",
-			},
-			{
-				Mode: "OUT",
-				Name: "userid",
-				Type: "oid",
-			},
-			{
-				Mode:    "IN",
-				Name:    "default_null",
-				Type:    "integer",
-				Default: "NULL::integer",
-			},
-			{
-				Mode:    "IN",
-				Name:    "simple_default",
-				Type:    "integer",
-				Default: "42",
-			},
-			{
-				Mode:    "IN",
-				Name:    "long_default",
-				Type:    "character varying",
-				Default: "'foo'::character varying",
-			},
-		},
 	})
 }
 
@@ -196,45 +166,60 @@ $function$
 		Body: `
 MultiLine Function
 `,
-		Args: []PGFunctionArg{},
 	})
 }
 
-func TestPGFunctionArgParseWithDefault(t *testing.T) {
-
-	var functionArgDefinition = `default_null integer DEFAULT NULL::integer`
-
-	var pgFunctionArg PGFunctionArg
-
-	err := pgFunctionArg.Parse(functionArgDefinition)
+func TestParseFunctionArgs(t *testing.T) {
+	args, err := parseFunctionArgs([]byte(`[
+		{"name": "a", "mode": "i", "type": "text[]", "default": "ARRAY['a'::text, 'b'::text]"},
+		{"name": "b", "mode": "i", "type": "numeric", "default": "1.5"},
+		{"name": "", "mode": "i", "type": "double precision", "default": null},
+		{"name": "\"select\"", "mode": "b", "type": "integer", "default": null},
+		{"name": "rest", "mode": "v", "type": "text[]", "default": null},
+		{"name": "result", "mode": "o", "type": "integer", "default": null}
+	]`))
 	if err != nil {
 		t.Fatal(err)
 	}
+	assert.Equal(t, []PGFunctionArg{
+		{Mode: "IN", Name: "a", Type: "text[]", Default: "ARRAY['a'::text, 'b'::text]"},
+		{Mode: "IN", Name: "b", Type: "numeric", Default: "1.5"},
+		{Mode: "IN", Name: "", Type: "double precision"},
+		{Mode: "INOUT", Name: `"select"`, Type: "integer"},
+		{Mode: "VARIADIC", Name: "rest", Type: "text[]"},
+		{Mode: "OUT", Name: "result", Type: "integer"},
+	}, args)
 
-	assert.Equal(t, pgFunctionArg, PGFunctionArg{
-		Mode:    "IN",
-		Name:    "default_null",
-		Type:    "integer",
-		Default: "NULL::integer",
-	})
+	args, err = parseFunctionArgs([]byte(`[]`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	assert.Empty(t, args)
+
+	_, err = parseFunctionArgs([]byte(`[{"name": "x", "mode": "t", "type": "integer"}]`))
+	assert.Error(t, err)
 }
 
-func TestPGFunctionArgParseWithoutDefault(t *testing.T) {
-
-	var functionArgDefinition = `num integer`
-
-	var pgFunctionArg PGFunctionArg
-
-	err := pgFunctionArg.Parse(functionArgDefinition)
-	if err != nil {
-		t.Fatal(err)
+func TestSameFunctionArgType(t *testing.T) {
+	for _, tc := range []struct {
+		configured, read string
+		same             bool
+	}{
+		{"integer", "integer", true},
+		{"TEXT", "text", true},
+		{"numeric(10,2)", "numeric", true},
+		{"numeric(10, 2)[]", "numeric[]", true},
+		{"character varying(20)", "character varying", true},
+		{"pg_catalog.text", "text", true},
+		{"public.citext", "citext", true},
+		{"public.citext[]", "citext[]", true},
+		{"fn_types.dom", "fn_types.dom", true},
+		{"integer", "bigint", false},
+		{"public.citext", "text", false},
+		{"other.dom", "fn_types.dom", false},
+	} {
+		assert.Equal(t, tc.same, sameFunctionArgType(tc.configured, tc.read), "%q vs %q", tc.configured, tc.read)
 	}
-
-	assert.Equal(t, pgFunctionArg, PGFunctionArg{
-		Mode: "IN",
-		Name: "num",
-		Type: "integer",
-	})
 }
 
 func mockFunctionResourceData(t *testing.T, obj PGFunction) *schema.ResourceData {

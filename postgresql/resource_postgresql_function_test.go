@@ -226,6 +226,160 @@ resource "postgresql_function" "func" {
 	})
 }
 
+// An argument default with a comma, and a type modifier with a comma, read
+// back without a diff (#126).
+func TestAccPostgresqlFunction_ArgDefaultWithComma(t *testing.T) {
+	funcName := testUniqueName("comma_default")
+	config := fmt.Sprintf(`
+resource "postgresql_function" "f" {
+    name = "%s"
+    arg {
+        name    = "a"
+        type    = "text[]"
+        default = "ARRAY['a'::text, 'b'::text]"
+    }
+    arg {
+        name    = "b"
+        type    = "numeric(10,2)"
+        default = "1.5"
+    }
+    arg {
+        name    = "c"
+        type    = "text"
+        default = "'x, y'::text"
+    }
+    returns  = "integer"
+    language = "sql"
+    body     = "SELECT 1"
+}
+`, funcName)
+
+	resource.Test(t, resource.TestCase{
+		PreCheck: func() {
+			testAccPreCheck(t)
+			testCheckCompatibleVersion(t, featureFunction)
+		},
+		Providers:    testAccProviders,
+		CheckDestroy: testAccCheckPostgresqlFunctionDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config: config,
+				Check: resource.ComposeTestCheckFunc(
+					testAccCheckPostgresqlFunctionExists("postgresql_function.f", ""),
+					resource.TestCheckResourceAttr("postgresql_function.f", "arg.#", "3"),
+					resource.TestCheckResourceAttr("postgresql_function.f", "arg.0.default", "ARRAY['a'::text, 'b'::text]"),
+					resource.TestCheckResourceAttr("postgresql_function.f", "arg.1.type", "numeric(10,2)"),
+					resource.TestCheckResourceAttr("postgresql_function.f", "arg.1.default", "1.5"),
+					resource.TestCheckResourceAttr("postgresql_function.f", "arg.2.default", "'x, y'::text"),
+				),
+			},
+		},
+	})
+}
+
+// Schema-qualified argument types put extra dots into the resource ID (#127).
+func TestAccPostgresqlFunction_QualifiedArgType(t *testing.T) {
+	skipIfNotAcc(t)
+
+	dbSuffix, teardown := setupTestDatabase(t, true, true)
+	defer teardown()
+	dbName, _ := getTestDBNames(dbSuffix)
+
+	// A type outside the search_path, like an extension type (citext) in
+	// its own schema.
+	testConfig := getTestConfig(t)
+	dsn := testConfig.connStr(dbName)
+	dbExecute(t, dsn, "CREATE SCHEMA fn_types")
+	dbExecute(t, dsn, "CREATE DOMAIN fn_types.dom AS text")
+
+	config := fmt.Sprintf(`
+resource "postgresql_function" "f" {
+    database = "%s"
+    name     = "qualified_args"
+    arg {
+        name = "x"
+        type = "fn_types.dom"
+    }
+    arg {
+        name = "y"
+        type = "pg_catalog.text"
+    }
+    returns  = "integer"
+    language = "sql"
+    body     = "SELECT 1"
+}
+`, dbName)
+
+	resource.Test(t, resource.TestCase{
+		PreCheck: func() {
+			testAccPreCheck(t)
+			testCheckCompatibleVersion(t, featureFunction)
+		},
+		Providers:    testAccProviders,
+		CheckDestroy: testAccCheckPostgresqlFunctionDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config: config,
+				Check: resource.ComposeTestCheckFunc(
+					testAccCheckPostgresqlFunctionExists("postgresql_function.f", dbName),
+					resource.TestCheckResourceAttr("postgresql_function.f", "id",
+						dbName+".public.qualified_args(fn_types.dom,pg_catalog.text)"),
+					resource.TestCheckResourceAttr("postgresql_function.f", "arg.0.type", "fn_types.dom"),
+					resource.TestCheckResourceAttr("postgresql_function.f", "arg.1.type", "pg_catalog.text"),
+				),
+			},
+		},
+	})
+}
+
+// A dot in the function name puts an extra dot into the resource ID (#127).
+func TestAccPostgresqlFunction_DotInName(t *testing.T) {
+	skipIfNotAcc(t)
+
+	dbSuffix, teardown := setupTestDatabase(t, true, true)
+	defer teardown()
+	dbName, _ := getTestDBNames(dbSuffix)
+
+	config := fmt.Sprintf(`
+resource "postgresql_function" "f" {
+    database = "%s"
+    name     = "dotted.name"
+    arg {
+        name = "x"
+        type = "integer"
+    }
+    returns  = "integer"
+    language = "sql"
+    body     = "SELECT x"
+}
+`, dbName)
+
+	resource.Test(t, resource.TestCase{
+		PreCheck: func() {
+			testAccPreCheck(t)
+			testCheckCompatibleVersion(t, featureFunction)
+		},
+		Providers:    testAccProviders,
+		CheckDestroy: testAccCheckPostgresqlFunctionDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config: config,
+				Check: resource.ComposeTestCheckFunc(
+					testAccCheckPostgresqlFunctionExists("postgresql_function.f", dbName),
+					resource.TestCheckResourceAttr("postgresql_function.f", "name", "dotted.name"),
+					resource.TestCheckResourceAttr("postgresql_function.f", "schema", "public"),
+				),
+			},
+			{
+				ResourceName:            "postgresql_function.f",
+				ImportState:             true,
+				ImportStateVerify:       true,
+				ImportStateVerifyIgnore: []string{"drop_cascade"},
+			},
+		},
+	})
+}
+
 func testAccCheckPostgresqlFunctionExists(n string, database string) resource.TestCheckFunc {
 	return func(s *terraform.State) error {
 		rs, ok := s.RootModule().Resources[n]
@@ -237,7 +391,10 @@ func testAccCheckPostgresqlFunctionExists(n string, database string) resource.Te
 			return fmt.Errorf("No ID is set")
 		}
 
-		signature := rs.Primary.ID
+		_, signature, err := expandFunctionID(rs.Primary.ID, nil, nil)
+		if err != nil {
+			return err
+		}
 
 		client := testAccProvider.Meta().(*Client)
 		txn, err := startTransaction(client, database)
@@ -277,7 +434,7 @@ func testAccCheckPostgresqlFunctionDestroy(s *terraform.State) error {
 		_, functionSignature, expandErr := expandFunctionID(rs.Primary.ID, nil, nil)
 
 		if expandErr != nil {
-			return fmt.Errorf("Incorrect resource Id %s", err)
+			return fmt.Errorf("Incorrect resource Id %s", expandErr)
 		}
 
 		exists, err := checkFunctionExists(txn, functionSignature)
@@ -296,9 +453,9 @@ func testAccCheckPostgresqlFunctionDestroy(s *terraform.State) error {
 
 func checkFunctionExists(txn *sql.Tx, signature string) (bool, error) {
 	var _rez bool
-	err := txn.QueryRow(fmt.Sprintf("SELECT to_regprocedure('%s') IS NOT NULL", signature)).Scan(&_rez)
+	err := txn.QueryRow("SELECT to_regprocedure($1) IS NOT NULL", signature).Scan(&_rez)
 	switch {
-	case err == sql.ErrNoRows:
+	case err == sql.ErrNoRows, isFunctionArgTypeMissingError(err):
 		return false, nil
 	case err != nil:
 		return false, fmt.Errorf("error reading info about function: %s", err)

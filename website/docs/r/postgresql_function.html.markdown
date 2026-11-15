@@ -77,3 +77,8 @@ Where `my_database` is the name of the database containing the schema,
 `my_schema` is the name of the schema in the PostgreSQL database, `my_function_name` is the function name to be imported, `arguments` is the argument signature of the function including all non OUT types and
 `postgresql_schema.function_foo` is the name of the resource whose state will be
 populated as a result of the command.
+
+Argument types may be schema-qualified (`my_db.public.my_func(public.citext)`)
+and the function name may contain dots (`my_db.public.my.func(integer)`): only
+the dots before the argument list separate the database, the schema and the
+name, so the database and schema names cannot contain dots.
