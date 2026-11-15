@@ -79,7 +79,34 @@ func (k *keyedMutex) lock(keys ...string) (unlock func()) {
 // PostgreSQL already serializes these transactions on the unique index of
 // pg_auth_members (the second GRANT of the same membership waits for the first
 // transaction to end), so holding the mutexes costs no parallelism.
+//
+// The postgresql_database operations (createDatabase, resourcePostgreSQLDatabaseDelete,
+// setDBOwner, setAlterOwnership) take the same mutexes, for the roles they
+// grant to the provider user in autocommit, from before the GRANT until after
+// the REVOKE (lockDatabaseMemberships). Without that, withRolesGranted could
+// see such a membership, skip its own GRANT and run its statements after the
+// REVOKE, where GRANT/REVOKE on an object only emit a WARNING ("no privileges
+// were granted"); or grant it itself and then revoke the other one's
+// membership (#152). Their rules:
+//   - the role lock (lockRoleConn) and every connection they need are taken
+//     before the mutexes; nothing waits for a pool connection while holding
+//     one, so a transaction that waits for the mutex while holding the last
+//     connection of its pool cannot block the holder;
+//   - a transaction waiting for the mutexes holds nothing the holder can wait
+//     for in PostgreSQL other than advisory locks, which the database
+//     operations do not take under the mutex. Callers of withRolesGranted that
+//     run DDL before it (resourcePostgreSQLSchemaUpdate) take the mutexes
+//     first with lockMembershipsForTxn.
 var membershipLocks = newKeyedMutex()
+
+// lockDatabaseMemberships takes the membership locks of roles for a
+// postgresql_database operation that grants them to the provider user outside
+// of a transaction, and returns the function that releases them. The caller
+// must already hold every connection it needs (see membershipLocks) and
+// release the locks only after it has revoked the memberships again.
+func lockDatabaseMemberships(roles ...string) (unlock func()) {
+	return membershipLocks.lock(slices.DeleteFunc(slices.Clone(roles), func(r string) bool { return r == "" })...)
+}
 
 // txnMembershipUnlocks holds the release function of the membership locks
 // taken on a transaction (*sql.Tx), until the transaction ends.
