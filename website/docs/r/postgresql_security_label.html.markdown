@@ -55,4 +55,5 @@ terraform import postgresql_security_label.workload mydb.pgaadauth.role.my_role
 
 A database or a provider whose name contains a dot or a double quote is written between double quotes in the ID
 (a double quote inside is doubled), for example `"my.db".pgaadauth.role.my_role`; the other names are written as they are.
-The ID in the state is written the same way.
+The ID in the state is written the same way. The object type can be written in any case in the ID (`role` or `ROLE`);
+it is stored in lower case.

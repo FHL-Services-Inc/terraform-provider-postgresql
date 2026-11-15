@@ -248,7 +248,7 @@ func TestReadPrunesWhenDatabaseDropped(t *testing.T) {
 
 	for _, tc := range readStatementsCases() {
 		switch tc.name {
-		case "schema", "extension", "function":
+		case "schema", "extension", "function", "security_label":
 		default:
 			continue
 		}

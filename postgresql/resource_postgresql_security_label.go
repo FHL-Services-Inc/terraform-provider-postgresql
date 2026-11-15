@@ -241,6 +241,11 @@ SELECT l.provider, l.label
 
 	dbc, err := initConnection(db.client, database)
 	if err != nil {
+		if isDatabaseDoesNotExistError(err) {
+			log.Printf("[WARN] PostgreSQL database (%s) not found, removing security label from state", database)
+			d.SetId("")
+			return nil
+		}
 		return err
 	}
 
@@ -249,6 +254,10 @@ SELECT l.provider, l.label
 	switch {
 	case err == sql.ErrNoRows:
 		log.Printf("[WARN] PostgreSQL security label for (%s '%s') with provider %s not found", objectType, objectName, provider)
+		d.SetId("")
+		return nil
+	case isDatabaseDoesNotExistError(err):
+		log.Printf("[WARN] PostgreSQL database (%s) not found, removing security label from state", database)
 		d.SetId("")
 		return nil
 	case err != nil:
@@ -310,7 +319,9 @@ func resourcePostgreSQLSecurityLabelImport(_ context.Context, d *schema.Resource
 	}
 	d.Set(securityLabelDatabaseAttr, parts[0])
 	d.Set(securityLabelProviderAttr, parts[1])
-	d.Set(securityLabelObjectTypeAttr, parts[2])
+	// The object types are lower case in the configuration (validated) and in
+	// the catalog; accept them in any case in the ID.
+	d.Set(securityLabelObjectTypeAttr, strings.ToLower(parts[2]))
 	d.Set(securityLabelObjectNameAttr, parts[3])
 
 	return []*schema.ResourceData{d}, nil

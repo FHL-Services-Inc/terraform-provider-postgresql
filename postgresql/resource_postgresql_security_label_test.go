@@ -14,6 +14,8 @@ import (
 )
 
 func TestAccPostgresqlSecurityLabel_Basic(t *testing.T) {
+	roleName := testUniqueName("security_label_test_role")
+
 	resource.Test(t, resource.TestCase{
 		PreCheck: func() {
 			testAccPreCheck(t)
@@ -24,13 +26,13 @@ func TestAccPostgresqlSecurityLabel_Basic(t *testing.T) {
 		CheckDestroy: testAccCheckPostgresqlSecurityLabelDestroy,
 		Steps: []resource.TestStep{
 			{
-				Config: testAccPostgresqlSecurityLabelConfig,
+				Config: testAccPostgresqlSecurityLabelConfig(roleName),
 				Check: resource.ComposeTestCheckFunc(
-					testAccCheckSecurityLabelOfRole(t, "security_label_test_role", "classified"),
+					testAccCheckSecurityLabelOfRole(t, roleName, "classified"),
 					resource.TestCheckResourceAttr(
 						"postgresql_security_label.test_label", "object_type", "role"),
 					resource.TestCheckResourceAttr(
-						"postgresql_security_label.test_label", "object_name", "security_label_test_role"),
+						"postgresql_security_label.test_label", "object_name", roleName),
 					resource.TestCheckResourceAttr(
 						"postgresql_security_label.test_label", "label_provider", "dummy"),
 					resource.TestCheckResourceAttr(
@@ -39,10 +41,10 @@ func TestAccPostgresqlSecurityLabel_Basic(t *testing.T) {
 			},
 			// the label is removed, the role stays: the catalog has no label
 			{
-				Config: testAccPostgresqlSecurityLabelRoleOnlyBasic,
+				Config: testAccPostgresqlSecurityLabelRoleOnlyBasic(roleName),
 				Check: resource.ComposeTestCheckFunc(
-					testAccCheckSecurityLabelAbsentOfRole(t, "security_label_test_role"),
-					testAccCheckRoleExistsInCatalog("security_label_test_role"),
+					testAccCheckSecurityLabelAbsentOfRole(t, roleName),
+					testAccCheckRoleExistsInCatalog(roleName),
 				),
 			},
 		},
@@ -50,6 +52,10 @@ func TestAccPostgresqlSecurityLabel_Basic(t *testing.T) {
 }
 
 func TestAccPostgresqlSecurityLabel_Update(t *testing.T) {
+	roleName := testUniqueName("security_label_test_role")
+	// The hyphen checks that the role name is quoted.
+	roleName2 := testUniqueName("security_label_test-role2")
+
 	resource.Test(t, resource.TestCase{
 		PreCheck: func() {
 			testAccPreCheck(t)
@@ -60,13 +66,13 @@ func TestAccPostgresqlSecurityLabel_Update(t *testing.T) {
 		CheckDestroy: testAccCheckPostgresqlSecurityLabelDestroy,
 		Steps: []resource.TestStep{
 			{
-				Config: testAccPostgresqlSecurityLabelConfig,
+				Config: testAccPostgresqlSecurityLabelConfig(roleName),
 				Check: resource.ComposeTestCheckFunc(
-					testAccCheckSecurityLabelOfRole(t, "security_label_test_role", "classified"),
+					testAccCheckSecurityLabelOfRole(t, roleName, "classified"),
 					resource.TestCheckResourceAttr(
 						"postgresql_security_label.test_label", "object_type", "role"),
 					resource.TestCheckResourceAttr(
-						"postgresql_security_label.test_label", "object_name", "security_label_test_role"),
+						"postgresql_security_label.test_label", "object_name", roleName),
 					resource.TestCheckResourceAttr(
 						"postgresql_security_label.test_label", "label_provider", "dummy"),
 					resource.TestCheckResourceAttr(
@@ -74,29 +80,29 @@ func TestAccPostgresqlSecurityLabel_Update(t *testing.T) {
 				),
 			},
 			{
-				Config: testAccPostgresqlSecurityLabelChanges2,
+				Config: testAccPostgresqlSecurityLabelChanges2(roleName),
 				Check: resource.ComposeTestCheckFunc(
-					testAccCheckSecurityLabelOfRole(t, "security_label_test_role", "unclassified"),
+					testAccCheckSecurityLabelOfRole(t, roleName, "unclassified"),
 					resource.TestCheckResourceAttr(
 						"postgresql_security_label.test_label", "label", "unclassified"),
 				),
 			},
 			{
-				Config: testAccPostgresqlSecurityLabelChanges3,
+				Config: testAccPostgresqlSecurityLabelChanges3(roleName2),
 				Check: resource.ComposeTestCheckFunc(
 					resource.TestCheckResourceAttr(
-						"postgresql_security_label.test_label", "object_name", "security_label_test-role2"),
+						"postgresql_security_label.test_label", "object_name", roleName2),
 					// the label is on the renamed role, not only in the state
-					testAccCheckSecurityLabelOfRole(t, "security_label_test-role2", "unclassified"),
-					testAccCheckSecurityLabelAbsentOfRole(t, "security_label_test_role"),
+					testAccCheckSecurityLabelOfRole(t, roleName2, "unclassified"),
+					testAccCheckSecurityLabelAbsentOfRole(t, roleName),
 				),
 			},
 			// the label is removed, the role stays: the catalog has no label
 			{
-				Config: testAccPostgresqlSecurityLabelRoleOnly,
+				Config: testAccPostgresqlSecurityLabelRoleOnly(roleName2),
 				Check: resource.ComposeTestCheckFunc(
-					testAccCheckSecurityLabelAbsentOfRole(t, "security_label_test-role2"),
-					testAccCheckRoleExistsInCatalog("security_label_test-role2"),
+					testAccCheckSecurityLabelAbsentOfRole(t, roleName2),
+					testAccCheckRoleExistsInCatalog(roleName2),
 				),
 			},
 		},
@@ -104,6 +110,60 @@ func TestAccPostgresqlSecurityLabel_Update(t *testing.T) {
 }
 
 // The label provider can be omitted when only one provider is loaded: it is then read back.
+// TestAccPostgresqlSecurityLabel_Import imports a label by its ID, also with
+// the object type in upper case, and fails on an ID that matches no label
+// (issue #189).
+func TestAccPostgresqlSecurityLabel_Import(t *testing.T) {
+	roleName := testUniqueName("security_label_test_role")
+	labelID := func(edit func(string) string) resource.ImportStateIdFunc {
+		return func(s *terraform.State) (string, error) {
+			rs, ok := s.RootModule().Resources["postgresql_security_label.test_label"]
+			if !ok {
+				return "", fmt.Errorf("postgresql_security_label.test_label not found in state")
+			}
+			return edit(rs.Primary.ID), nil
+		}
+	}
+
+	resource.Test(t, resource.TestCase{
+		PreCheck: func() {
+			testAccPreCheck(t)
+			testCheckCompatibleVersion(t, featureSecurityLabel)
+			testCheckCanSetSecurityLabel(t)
+		},
+		Providers:    testAccProviders,
+		CheckDestroy: testAccCheckPostgresqlSecurityLabelDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config: testAccPostgresqlSecurityLabelConfig(roleName),
+				Check: resource.TestMatchResourceAttr(
+					"postgresql_security_label.test_label", "id", regexp.MustCompile(`\.dummy\.role\.`+regexp.QuoteMeta(roleName)+`$`)),
+			},
+			{
+				ResourceName:      "postgresql_security_label.test_label",
+				ImportState:       true,
+				ImportStateVerify: true,
+			},
+			{
+				ResourceName: "postgresql_security_label.test_label",
+				ImportState:  true,
+				ImportStateIdFunc: labelID(func(id string) string {
+					return strings.Replace(id, ".role.", ".ROLE.", 1)
+				}),
+				ImportStateVerify: true,
+			},
+			{
+				ResourceName: "postgresql_security_label.test_label",
+				ImportState:  true,
+				ImportStateIdFunc: labelID(func(id string) string {
+					return strings.TrimSuffix(id, roleName) + "no_such_" + roleName
+				}),
+				ExpectError: regexp.MustCompile("Cannot import non-existent remote object"),
+			},
+		},
+	})
+}
+
 func TestAccPostgresqlSecurityLabel_NoProvider(t *testing.T) {
 	skipIfNotAcc(t)
 
@@ -367,7 +427,7 @@ func testAccCheckPostgresqlSecurityLabelDestroy(s *terraform.State) error {
 	var orphans int
 	if err := db.QueryRow(`SELECT count(*) FROM pg_catalog.pg_shseclabel l
 		WHERE l.provider = 'dummy' AND l.classoid = 'pg_authid'::regclass
-		AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_authid a WHERE a.oid = l.objoid)`).Scan(&orphans); err != nil {
+		AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_roles a WHERE a.oid = l.objoid)`).Scan(&orphans); err != nil {
 		return fmt.Errorf("error checking security labels: %w", err)
 	}
 	if orphans != 0 {
@@ -377,9 +437,10 @@ func testAccCheckPostgresqlSecurityLabelDestroy(s *terraform.State) error {
 	return nil
 }
 
-var testAccPostgresqlSecurityLabelConfig = `
+func testAccPostgresqlSecurityLabelConfig(role string) string {
+	return fmt.Sprintf(`
 resource "postgresql_role" "test_role" {
-  name            = "security_label_test_role"
+  name            = %q
   login           = true
   create_database = true
 }
@@ -389,11 +450,13 @@ resource "postgresql_security_label" "test_label" {
   label_provider = "dummy"
   label          = "classified"
 }
-`
+`, role)
+}
 
-var testAccPostgresqlSecurityLabelChanges2 = `
+func testAccPostgresqlSecurityLabelChanges2(role string) string {
+	return fmt.Sprintf(`
 resource "postgresql_role" "test_role" {
-  name            = "security_label_test_role"
+  name            = %q
   login           = true
   create_database = true
 }
@@ -403,11 +466,13 @@ resource "postgresql_security_label" "test_label" {
   label_provider = "dummy"
   label          = "unclassified"
 }
-`
+`, role)
+}
 
-var testAccPostgresqlSecurityLabelChanges3 = `
+func testAccPostgresqlSecurityLabelChanges3(role string) string {
+	return fmt.Sprintf(`
 resource "postgresql_role" "test_role" {
-  name            = "security_label_test-role2"
+  name            = %q
   login           = true
   create_database = true
 }
@@ -417,23 +482,28 @@ resource "postgresql_security_label" "test_label" {
   label_provider = "dummy"
   label          = "unclassified"
 }
-`
+`, role)
+}
 
-var testAccPostgresqlSecurityLabelRoleOnlyBasic = `
+func testAccPostgresqlSecurityLabelRoleOnlyBasic(role string) string {
+	return fmt.Sprintf(`
 resource "postgresql_role" "test_role" {
-  name            = "security_label_test_role"
+  name            = %q
   login           = true
   create_database = true
 }
-`
+`, role)
+}
 
-var testAccPostgresqlSecurityLabelRoleOnly = `
+func testAccPostgresqlSecurityLabelRoleOnly(role string) string {
+	return fmt.Sprintf(`
 resource "postgresql_role" "test_role" {
-  name            = "security_label_test-role2"
+  name            = %q
   login           = true
   create_database = true
 }
-`
+`, role)
+}
 
 func testAccCheckRoleExistsInCatalog(role string) resource.TestCheckFunc {
 	return func(*terraform.State) error {
@@ -885,7 +955,7 @@ func TestAccPostgresqlSecurityLabel_ImportDatabaseWithDot(t *testing.T) {
 	var created bool
 	defer func() {
 		if created {
-			dbExecute(t, cfg.connStr("postgres"), fmt.Sprintf("DROP DATABASE IF EXISTS %s", pq.QuoteIdentifier(dbName)))
+			dropTestDatabase(t, cfg, dbName)
 		}
 	}()
 
