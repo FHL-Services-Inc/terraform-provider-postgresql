@@ -246,3 +246,56 @@ func TestWithRolesGrantedFallsBackToDirectGrant(t *testing.T) {
 		}
 	})
 }
+
+// A superuser owner cannot be granted to a non-superuser provider. Without
+// the membership a GRANT by a provider lacking GRANT OPTION is a no-op with
+// only a WARNING (#114), so postgresql_grant must check for the grant option
+// instead of skipping the owner.
+func TestWithRolesGrantedSuperuserOwner(t *testing.T) {
+	t.Run("grant option", func(t *testing.T) {
+		db, drv := newSessionRoleConnection(t, "17.0.0", false)
+		drv.superRoles = []string{"owner"}
+
+		asked := false
+		called, err := runWithRolesGrantedOrDirect(t, db, func() (bool, error) { asked = true; return true, nil })
+		if err != nil {
+			t.Fatalf("withRolesGrantedOrDirect: %v", err)
+		}
+		if !asked || !called {
+			t.Fatalf("directGrant asked = %v, fn called = %v; want both", asked, called)
+		}
+		if got := drv.count("GRANT"); got != 0 {
+			t.Errorf("tried to grant a superuser role; statements: %q", drv.all())
+		}
+	})
+
+	t.Run("no grant option", func(t *testing.T) {
+		db, drv := newSessionRoleConnection(t, "17.0.0", false)
+		drv.superRoles = []string{"owner"}
+
+		called, err := runWithRolesGrantedOrDirect(t, db, func() (bool, error) { return false, nil })
+		if err == nil || called {
+			t.Fatalf("err = %v, fn called = %v; want an error and fn not called", err, called)
+		}
+		for _, want := range []string{`cannot act as "owner"`, `"owner" is a superuser`, `"admin" WITH GRANT OPTION`} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("error %q does not contain %q", err, want)
+			}
+		}
+		for _, unwanted := range []string{`grant "owner" to`, "circular"} {
+			if strings.Contains(err.Error(), unwanted) {
+				t.Errorf("error %q contains %q", err, unwanted)
+			}
+		}
+	})
+
+	t.Run("no direct grant for this caller", func(t *testing.T) {
+		db, drv := newSessionRoleConnection(t, "17.0.0", false)
+		drv.superRoles = []string{"owner"}
+
+		called, err := runWithRolesGrantedOrDirect(t, db, nil)
+		if err != nil || !called {
+			t.Fatalf("err = %v, fn called = %v; want the superuser owner skipped as before", err, called)
+		}
+	})
+}

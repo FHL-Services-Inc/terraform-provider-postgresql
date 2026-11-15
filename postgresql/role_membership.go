@@ -158,6 +158,9 @@ type blockedRole struct {
 	// circular: the role is a member of the current user, so granting it to
 	// the current user is impossible, not only forbidden to it.
 	circular bool
+	// superuser: the role is a superuser, which the provider cannot grant
+	// to a non-superuser current user.
+	superuser bool
 }
 
 // blockedRolesError explains why the current user could not act as the
@@ -168,9 +171,12 @@ func blockedRolesError(currentUser string, blocked []blockedRole, directGrant bo
 	for _, b := range blocked {
 		reasons = append(reasons, b.reason)
 		names = append(names, pq.QuoteIdentifier(b.role))
-		if b.circular {
+		switch {
+		case b.circular:
 			circular = true
-		} else {
+		case b.superuser:
+			// Only the direct grant can fix it.
+		default:
 			grantable = append(grantable, pq.QuoteIdentifier(b.role))
 		}
 	}
