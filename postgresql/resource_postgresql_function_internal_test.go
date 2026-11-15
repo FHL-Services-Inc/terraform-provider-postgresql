@@ -1,8 +1,11 @@
 package postgresql
 
 import (
+	"errors"
+	"fmt"
 	"testing"
 
+	"github.com/lib/pq"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -40,4 +43,12 @@ func TestExpandFunctionIDQuotesParts(t *testing.T) {
 		assert.Equal(t, "db", database)
 		assert.Equal(t, `"public"."dotted.name"(public.citext)`, signature)
 	}
+}
+
+func TestIsFunctionArgTypeMissingError(t *testing.T) {
+	assert.True(t, isFunctionArgTypeMissingError(&pq.Error{Code: "3F000"}))
+	assert.True(t, isFunctionArgTypeMissingError(fmt.Errorf("wrapped: %w", &pq.Error{Code: "42704"})))
+	assert.False(t, isFunctionArgTypeMissingError(&pq.Error{Code: "42501"}))
+	assert.False(t, isFunctionArgTypeMissingError(errors.New("3F000")))
+	assert.False(t, isFunctionArgTypeMissingError(nil))
 }

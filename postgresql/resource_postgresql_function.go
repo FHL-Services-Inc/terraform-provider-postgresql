@@ -3,6 +3,7 @@ package postgresql
 import (
 	"bytes"
 	"database/sql"
+	"errors"
 	"fmt"
 	"log"
 	"strings"
@@ -254,6 +255,10 @@ func resourcePostgreSQLFunctionReadImpl(db *DBConnection, d *schema.ResourceData
 		log.Printf("[WARN] PostgreSQL database (%s) not found, removing function (%s) from state", databaseName, functionId)
 		d.SetId("")
 		return nil
+	case isFunctionArgTypeMissingError(err):
+		log.Printf("[WARN] PostgreSQL function %s: an argument type no longer exists, removing it from state", functionId)
+		d.SetId("")
+		return nil
 	case err != nil:
 		return fmt.Errorf("error reading function: %w", err)
 	}
@@ -489,6 +494,18 @@ func generateFunctionID(db *DBConnection, d *schema.ResourceData) (string, error
 	b.WriteRune(')')
 
 	return b.String(), nil
+}
+
+// isFunctionArgTypeMissingError reports whether to_regprocedure failed because
+// the schema or the type of an argument does not exist (any more). Before
+// PostgreSQL 16 it raises instead of returning NULL: a function whose argument
+// type was dropped, schema and all, is gone too.
+func isFunctionArgTypeMissingError(err error) bool {
+	var pqErr *pq.Error
+	if !errors.As(err, &pqErr) {
+		return false
+	}
+	return pqErr.Code == "3F000" || pqErr.Code == "42704" // invalid_schema_name, undefined_object
 }
 
 // parseFunctionID splits a function ID, database.schema.name(arguments) or

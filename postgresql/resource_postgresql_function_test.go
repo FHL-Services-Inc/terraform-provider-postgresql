@@ -455,7 +455,7 @@ func checkFunctionExists(txn *sql.Tx, signature string) (bool, error) {
 	var _rez bool
 	err := txn.QueryRow("SELECT to_regprocedure($1) IS NOT NULL", signature).Scan(&_rez)
 	switch {
-	case err == sql.ErrNoRows:
+	case err == sql.ErrNoRows, isFunctionArgTypeMissingError(err):
 		return false, nil
 	case err != nil:
 		return false, fmt.Errorf("error reading info about function: %s", err)
