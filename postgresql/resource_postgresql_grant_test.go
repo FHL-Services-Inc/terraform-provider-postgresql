@@ -907,6 +907,99 @@ func TestAccPostgresqlGrantObjects(t *testing.T) {
 	})
 }
 
+// TestAccPostgresqlGrantObjectsDroppedOutside checks that a table or sequence
+// grant can still be removed after some or all of its listed objects were
+// dropped outside Terraform: the REVOKE only names the objects that still
+// exist (#115).
+func TestAccPostgresqlGrantObjectsDroppedOutside(t *testing.T) {
+	skipIfNotAcc(t)
+
+	cases := []struct {
+		name       string
+		objectType string
+		privilege  string
+		dropped    []string
+		kept       []string
+	}{
+		{name: "one table", objectType: "table", privilege: "SELECT", dropped: []string{"o1"}, kept: []string{"o2"}},
+		{name: "all tables", objectType: "table", privilege: "SELECT", dropped: []string{"o1", "o2"}},
+		{name: "one sequence", objectType: "sequence", privilege: "USAGE", dropped: []string{"o1"}, kept: []string{"o2"}},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			config := getTestConfig(t)
+			dbSuffix, teardown := setupTestDatabase(t, true, true)
+			defer teardown()
+
+			dbName, roleName := getTestDBNames(dbSuffix)
+			dsn := config.connStr(dbName)
+			create := "CREATE TABLE test_schema.%s (id int)"
+			if tc.objectType == "sequence" {
+				create = "CREATE SEQUENCE test_schema.%s"
+			}
+			for _, object := range []string{"o1", "o2"} {
+				dbExecute(t, dsn, fmt.Sprintf(create, object))
+			}
+
+			testGrant := fmt.Sprintf(`
+			resource "postgresql_grant" "test" {
+				database    = "%s"
+				role        = "%s"
+				schema      = "test_schema"
+				object_type = "%s"
+				objects     = ["o1", "o2"]
+				privileges  = ["%s"]
+			}
+			`, dbName, roleName, tc.objectType, tc.privilege)
+
+			checkPrivilege := func(object string, want bool) resource.TestCheckFunc {
+				return func(*terraform.State) error {
+					got := testQueryBool(t, dsn, fmt.Sprintf("SELECT has_%s_privilege($1, $2, $3)", tc.objectType),
+						roleName, "test_schema."+object, tc.privilege)
+					if got != want {
+						return fmt.Errorf("%s privilege of %s on test_schema.%s = %v, want %v", tc.privilege, roleName, object, got, want)
+					}
+					return nil
+				}
+			}
+
+			grantedChecks := []resource.TestCheckFunc{}
+			revokedChecks := []resource.TestCheckFunc{}
+			for _, object := range []string{"o1", "o2"} {
+				grantedChecks = append(grantedChecks, checkPrivilege(object, true))
+			}
+			for _, object := range tc.kept {
+				revokedChecks = append(revokedChecks, checkPrivilege(object, false))
+			}
+
+			resource.Test(t, resource.TestCase{
+				PreCheck: func() {
+					testAccPreCheck(t)
+					testCheckCompatibleVersion(t, featurePrivileges)
+				},
+				Providers: testAccProviders,
+				Steps: []resource.TestStep{
+					{
+						Config: testGrant,
+						Check:  resource.ComposeTestCheckFunc(grantedChecks...),
+					},
+					{
+						PreConfig: func() {
+							for _, object := range tc.dropped {
+								dbExecute(t, dsn, fmt.Sprintf("DROP %s test_schema.%s", strings.ToUpper(tc.objectType), object))
+							}
+						},
+						Config:  testGrant,
+						Destroy: true,
+						Check:   resource.ComposeTestCheckFunc(revokedChecks...),
+					},
+				},
+			})
+		})
+	}
+}
+
 func TestAccPostgresqlGrantObjectsError(t *testing.T) {
 	skipIfNotAcc(t)
 
