@@ -10,6 +10,8 @@ import (
 )
 
 func TestAccPostgresqlReplicationSlot_Basic(t *testing.T) {
+	slotName := testUniqueName("slot")
+
 	resource.Test(t, resource.TestCase{
 		PreCheck: func() {
 			testAccPreCheck(t)
@@ -19,15 +21,15 @@ func TestAccPostgresqlReplicationSlot_Basic(t *testing.T) {
 		CheckDestroy: testAccCheckPostgresqlReplicationSlotDestroy,
 		Steps: []resource.TestStep{
 			{
-				Config: `
+				Config: fmt.Sprintf(`
 				resource "postgresql_replication_slot" "myslot" {
-					name   = "slot"
+					name   = "%s"
 					plugin = "test_decoding"
-				}`,
+				}`, slotName),
 				Check: resource.ComposeTestCheckFunc(
 					testAccCheckPostgresqlReplicationSlotExists("postgresql_replication_slot.myslot"),
 					resource.TestCheckResourceAttr(
-						"postgresql_replication_slot.myslot", "name", "slot"),
+						"postgresql_replication_slot.myslot", "name", slotName),
 					resource.TestCheckResourceAttr(
 						"postgresql_replication_slot.myslot", "plugin", "test_decoding"),
 				),
@@ -117,14 +119,15 @@ func TestAccPostgresqlReplicationSlot_Database(t *testing.T) {
 	defer teardown()
 
 	dbName, _ := getTestDBNames(dbSuffix)
+	slotName := testUniqueName("slot")
 
 	testAccPostgresqlReplicationSlotDatabaseConfig := fmt.Sprintf(`
 	resource "postgresql_replication_slot" "myslot" {
-		name     = "slot"
+		name     = "%s"
 		plugin   = "test_decoding"
 		database = "%s"
 	}
-	`, dbName)
+	`, slotName, dbName)
 
 	resource.Test(t, resource.TestCase{
 		PreCheck: func() {
@@ -139,7 +142,7 @@ func TestAccPostgresqlReplicationSlot_Database(t *testing.T) {
 				Check: resource.ComposeTestCheckFunc(
 					testAccCheckPostgresqlReplicationSlotExists("postgresql_replication_slot.myslot"),
 					resource.TestCheckResourceAttr(
-						"postgresql_replication_slot.myslot", "name", "slot"),
+						"postgresql_replication_slot.myslot", "name", slotName),
 					resource.TestCheckResourceAttr(
 						"postgresql_replication_slot.myslot", "plugin", "test_decoding"),
 					resource.TestCheckResourceAttr(

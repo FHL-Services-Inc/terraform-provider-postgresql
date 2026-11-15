@@ -12,6 +12,8 @@ import (
 func TestAccPostgresqlPhysicalReplicationSlot_Basic(t *testing.T) {
 	skipIfNotAcc(t)
 
+	slotName := testUniqueName("physical_slot")
+
 	resource.Test(t, resource.TestCase{
 		PreCheck: func() {
 			testAccPreCheck(t)
@@ -21,14 +23,14 @@ func TestAccPostgresqlPhysicalReplicationSlot_Basic(t *testing.T) {
 		CheckDestroy: testAccCheckPostgresqlPhysicalReplicationSlotDestroy,
 		Steps: []resource.TestStep{
 			{
-				Config: `
+				Config: fmt.Sprintf(`
 				resource "postgresql_physical_replication_slot" "myslot" {
-					name = "physical_slot"
-				}`,
+					name = "%s"
+				}`, slotName),
 				Check: resource.ComposeTestCheckFunc(
 					testAccCheckPostgresqlPhysicalReplicationSlotExists("postgresql_physical_replication_slot.myslot"),
 					resource.TestCheckResourceAttr(
-						"postgresql_physical_replication_slot.myslot", "name", "physical_slot"),
+						"postgresql_physical_replication_slot.myslot", "name", slotName),
 				),
 			},
 		},
@@ -42,6 +44,8 @@ func TestAccPostgresqlPhysicalReplicationSlot_Basic(t *testing.T) {
 func TestAccPostgresqlPhysicalReplicationSlot_Disappears(t *testing.T) {
 	skipIfNotAcc(t)
 
+	slotName := testUniqueName("physical_slot")
+
 	resource.Test(t, resource.TestCase{
 		PreCheck: func() {
 			testAccPreCheck(t)
@@ -51,13 +55,13 @@ func TestAccPostgresqlPhysicalReplicationSlot_Disappears(t *testing.T) {
 		CheckDestroy: testAccCheckPostgresqlPhysicalReplicationSlotDestroy,
 		Steps: []resource.TestStep{
 			{
-				Config: `
+				Config: fmt.Sprintf(`
 				resource "postgresql_physical_replication_slot" "myslot" {
-					name = "physical_slot"
-				}`,
+					name = "%s"
+				}`, slotName),
 				Check: resource.ComposeTestCheckFunc(
 					testAccCheckPostgresqlPhysicalReplicationSlotExists("postgresql_physical_replication_slot.myslot"),
-					testAccDropPhysicalReplicationSlot("physical_slot"),
+					testAccDropPhysicalReplicationSlot(slotName),
 				),
 				ExpectNonEmptyPlan: true,
 			},

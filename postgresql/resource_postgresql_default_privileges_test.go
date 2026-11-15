@@ -136,12 +136,13 @@ func TestAccPostgresqlDefaultPrivileges_GrantOwner(t *testing.T) {
 
 	config := getTestConfig(t)
 	dbName, roleName := getTestDBNames(dbSuffix)
+	ownerName := testUniqueName("test_owner")
 
 	// We set PGUSER as owner as he will create the test table
 	var stateConfig = fmt.Sprintf(`
 
 resource postgresql_role "test_owner" {
-    name = "test_owner"
+    name = "%s"
 }
 
 // From PostgreSQL 15, schema public is not wild open anymore
@@ -161,7 +162,7 @@ resource "postgresql_default_privileges" "test_ro" {
 	object_type = "table"
 	privileges  = ["SELECT"]
 }
-	`, dbName, dbName, roleName)
+	`, ownerName, dbName, dbName, roleName)
 
 	resource.Test(t, resource.TestCase{
 		PreCheck: func() {
@@ -177,7 +178,7 @@ resource "postgresql_default_privileges" "test_ro" {
 						tables := []string{"public.test_table"}
 						// To test default privileges, we need to create a table
 						// after having apply the state.
-						dropFunc := createTestTables(t, dbSuffix, tables, "test_owner")
+						dropFunc := createTestTables(t, dbSuffix, tables, ownerName)
 						defer dropFunc()
 
 						return testCheckTablesPrivileges(t, dbName, roleName, tables, []string{"SELECT"})
@@ -187,7 +188,7 @@ resource "postgresql_default_privileges" "test_ro" {
 					resource.TestCheckResourceAttr("postgresql_default_privileges.test_ro", "privileges.0", "SELECT"),
 
 					// check if connected user does not have test_owner granted anymore.
-					checkUserMembership(t, config.Username, "test_owner", false),
+					checkUserMembership(t, config.Username, ownerName, false),
 				),
 			},
 		},
@@ -429,8 +430,9 @@ func TestAccPostgresqlDefaultPrivileges_ReverseMembershipManyDatabases(t *testin
 	}
 
 	const databases = 3
-	const owner = "tf_tests_dp_reverse_owner"
-	const reader = "tf_tests_dp_reverse_reader"
+	owner := testUniqueName("tf_tests_dp_reverse_owner")
+	reader := testUniqueName("tf_tests_dp_reverse_reader")
+	dbSuffix := testUniqueName("dp_reverse")
 
 	config := getTestConfig(t)
 	dsn := config.connStr("postgres")
@@ -445,7 +447,7 @@ func TestAccPostgresqlDefaultPrivileges_ReverseMembershipManyDatabases(t *testin
 
 	dbNames := make([]string, databases)
 	for i := range databases {
-		dbNames[i], _ = getTestDBNames(fmt.Sprintf("dp_reverse_%d", i))
+		dbNames[i], _ = getTestDBNames(fmt.Sprintf("%s_%d", dbSuffix, i))
 		dbExecute(t, dsn, fmt.Sprintf("CREATE DATABASE %s", dbNames[i]))
 		defer dbExecute(t, dsn, fmt.Sprintf("DROP DATABASE %s", dbNames[i]))
 	}

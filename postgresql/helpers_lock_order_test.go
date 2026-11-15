@@ -1,6 +1,7 @@
 package postgresql
 
 import (
+	"fmt"
 	"testing"
 
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/resource"
@@ -15,13 +16,17 @@ import (
 func TestAccPostgresqlRoleLocksSharedMembers(t *testing.T) {
 	skipIfNotAcc(t)
 
-	config := `
+	owner := testUniqueName("tf_tests_lockorder_owner")
+	app := testUniqueName("tf_tests_lockorder_app")
+	dbName := testUniqueName("tf_tests_lockorder_db")
+
+	config := fmt.Sprintf(`
 resource "postgresql_role" "owner" {
-  name = "tf_tests_lockorder_owner"
+  name = "%s"
 }
 
 resource "postgresql_role" "app" {
-  name  = "tf_tests_lockorder_app"
+  name  = "%s"
   login = true
 
   lifecycle {
@@ -30,7 +35,7 @@ resource "postgresql_role" "app" {
 }
 
 resource "postgresql_database" "db" {
-  name  = "tf_tests_lockorder_db"
+  name  = "%s"
   owner = postgresql_role.owner.name
 }
 
@@ -69,7 +74,7 @@ resource "postgresql_grant_role" "member" {
   role       = postgresql_role.app.name
   grant_role = postgresql_role.owner.name
 }
-`
+`, owner, app, dbName)
 
 	resource.Test(t, resource.TestCase{
 		PreCheck: func() {
@@ -82,7 +87,7 @@ resource "postgresql_grant_role" "member" {
 			{
 				Config: config,
 				Check: resource.ComposeTestCheckFunc(
-					resource.TestCheckResourceAttr("postgresql_grant_role.member", "grant_role", "tf_tests_lockorder_owner"),
+					resource.TestCheckResourceAttr("postgresql_grant_role.member", "grant_role", owner),
 					resource.TestCheckResourceAttr("postgresql_default_privileges.tables", "privileges.#", "2"),
 				),
 			},
