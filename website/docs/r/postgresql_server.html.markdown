@@ -58,3 +58,11 @@ Changing this value
 * `server_version` - (Optional) Optional server version, potentially useful to foreign-data wrappers.
 * `server_owner` - (Optional) By default, the user who defines the server becomes its owner. Set this value to configure the new owner of the foreign server.
 * `drop_cascade` - (Optional) When true, will drop objects that depend on the server (such as user mappings), and in turn all objects that depend on those objects . (Default: false)
+
+## Import
+
+`postgresql_server` can be imported using the server name:
+
+```
+$ terraform import postgresql_server.myserver myserver
+```

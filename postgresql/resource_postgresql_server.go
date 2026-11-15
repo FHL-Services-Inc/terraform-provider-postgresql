@@ -160,6 +160,10 @@ func resourcePostgreSQLServerRead(db *DBConnection, d *schema.ResourceData) erro
 
 func resourcePostgreSQLServerReadImpl(db *DBConnection, d *schema.ResourceData) error {
 	serverName := d.Get(serverNameAttr).(string)
+	if serverName == "" {
+		// On import only the ID, which is the server name, is set.
+		serverName = d.Id()
+	}
 
 	var serverType, serverVersion, serverOwner, serverFDW string
 	var serverOptions []string
