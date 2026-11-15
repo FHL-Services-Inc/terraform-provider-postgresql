@@ -80,6 +80,11 @@ upgrading. Each one fixes behavior that was silently wrong before.
 - **`database = ""` on `postgresql_grant` is rejected at plan time** (#174,
   #136) instead of failing at apply.
 - **A failed `postgresql_role` update keeps the previous state** (#176, #119).
+- **`postgresql_security_label` has a `database` attribute and a new ID**,
+  `<database>.<provider>.<object type>.<object name>` (#206, #199). IDs in
+  the state are rewritten on the next refresh without a diff, and import uses
+  the new form. `object_type` is validated and must be lower case; an upper
+  case type was never read back before.
 
 ### Added
 
@@ -102,6 +107,9 @@ upgrading. Each one fixes behavior that was silently wrong before.
   `postgresql_grant_role` (#83, #69), `postgresql_user_mapping` (#168, #166),
   `postgresql_server` by name (#188, #124) and `postgresql_security_label`
   (#197, #189).
+- `postgresql_security_label`: `database` attribute (the provider database by
+  default), and `label_provider` can be omitted when one provider is loaded
+  (#206, #199).
 - `postgresql_user_mapping` supports `CURRENT_USER`, `CURRENT_ROLE` and `USER`
   (#170, #167) and reads back mappings for `PUBLIC` (#165, #121, #150).
 - `statement_timeout` and `idle_in_transaction_session_timeout` on
@@ -172,6 +180,12 @@ resources, 10 ms round-trip time) went from 39.9 s to 14.6 s; with
   keeps the name (#186, #122, #123).
 - **`postgresql_server`**: option values containing `=` are read back intact
   (#196, #190).
+- **`postgresql_security_label`**: schema-qualified names, objects outside the
+  `search_path`, columns (`table.column`), functions with or without their
+  argument types and provider names that need quoting are labelled and read
+  back; the label is read by the OID of the object. Ported from the
+  [cheeeee fork](https://github.com/cheeeee/terraform-provider-postgresql)
+  (#206, #199).
 - **Failed renames**: when a rename of a `postgresql_schema`,
   `postgresql_publication`, `postgresql_server` or `postgresql_role` fails (or
   the update fails after the rename), the state keeps the previous name and ID.

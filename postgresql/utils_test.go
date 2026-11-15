@@ -490,3 +490,39 @@ func testCheckColumnPrivileges(t *testing.T, dbName, roleName string, tables []s
 	}
 	return nil
 }
+
+// testCheckCanExecute skips the test if the connected user cannot execute the
+// statements, which are rolled back. It is used by the tests which need privileges
+// that depend on the environment (e.g.: the master user of a managed service is not
+// a superuser but is allowed to do most of what a superuser does).
+func testCheckCanExecute(t *testing.T, what string, statements ...string) {
+	client := testAccProvider.Meta().(*Client)
+	db, err := client.Connect()
+	if err != nil {
+		t.Fatalf("could not connect to database: %v", err)
+	}
+
+	txn, err := db.Begin()
+	if err != nil {
+		t.Fatalf("could not start transaction: %v", err)
+	}
+	defer func() {
+		_ = txn.Rollback()
+	}()
+
+	for _, statement := range statements {
+		if _, err := txn.Exec(statement); err != nil {
+			t.Skipf("Skip test: the connected user cannot %s: %v", what, err)
+		}
+	}
+}
+
+// testCheckCanSetSecurityLabel skips the test if the dummy label provider is not
+// loaded or if the connected user cannot set a label.
+func testCheckCanSetSecurityLabel(t *testing.T) {
+	testCheckCanExecute(
+		t, "set a security label of the dummy provider",
+		"CREATE ROLE tf_probe_label",
+		"SECURITY LABEL FOR dummy ON ROLE tf_probe_label IS 'classified'",
+	)
+}
