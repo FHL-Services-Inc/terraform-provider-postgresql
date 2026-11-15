@@ -70,6 +70,12 @@ resource "postgresql_grant" "read_insert_column" {
   database owner while it runs the statement, and revokes it afterwards. The
   provider's role needs the right to grant the owner role to itself (`ADMIN
   OPTION` on it, or `CREATEROLE` before PostgreSQL 16).
+* **Listed objects dropped outside of Terraform:** for `table`, `sequence`
+  and `column` grants, removing or changing the grant revokes the privileges
+  only on the listed objects that still exist, so dropping some of them
+  outside of Terraform does not make the `REVOKE` fail. When none of them
+  exists any more there is nothing to revoke and the grant is simply removed.
+  Granting on a listed object that does not exist still fails.
 * Privileges are read with a single statement per resource, outside of a
   transaction.
 

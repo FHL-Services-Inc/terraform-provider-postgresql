@@ -1390,6 +1390,29 @@ func revokeRolePrivileges(txn *sql.Tx, d *schema.ResourceData, usePrevious bool)
 		}
 	}
 
+	// A listed relation dropped outside Terraform would make the REVOKE fail
+	// (and the grant impossible to remove), so only the listed relations that
+	// still exist are revoked.
+	objectType := getter("object_type").(string)
+	if relkinds, ok := ownerRelkinds[objectType]; ok && getter("objects").(*schema.Set).Len() > 0 {
+		existing, err := existingRelations(txn, getter("schema").(string), relkinds, getter("objects").(*schema.Set))
+		if err != nil {
+			return err
+		}
+		if existing.Len() == 0 {
+			log.Printf("[WARN] %s objects %v of schema %s no longer exist, nothing to revoke",
+				objectType, getter("objects").(*schema.Set).List(), getter("schema").(string))
+			return nil
+		}
+		baseGetter := getter
+		getter = func(name string) any {
+			if name == "objects" {
+				return existing
+			}
+			return baseGetter(name)
+		}
+	}
+
 	query := createRevokeQuery(getter)
 	if len(query) == 0 {
 		// Query is empty, don't run anything
@@ -1399,6 +1422,42 @@ func revokeRolePrivileges(txn *sql.Tx, d *schema.ResourceData, usePrevious bool)
 		return fmt.Errorf("could not execute revoke query: %w", err)
 	}
 	return nil
+}
+
+// existingRelations returns the subset of objects that still exist in
+// schemaName as relations of one of the given relkinds.
+func existingRelations(txn *sql.Tx, schemaName string, relkinds []string, objects *schema.Set) (*schema.Set, error) {
+	names := make([]string, 0, objects.Len())
+	for _, object := range objects.List() {
+		names = append(names, object.(string))
+	}
+
+	rows, err := txn.Query(
+		`SELECT c.relname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE n.nspname = $1 AND c.relkind = ANY($2) AND c.relname = ANY($3)`,
+		schemaName, pq.Array(relkinds), pq.Array(names),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("could not look up the existing objects of schema %s: %w", schemaName, err)
+	}
+	defer func() {
+		if err := rows.Close(); err != nil {
+			log.Printf("[ERROR] could not close rows: %v", err)
+		}
+	}()
+
+	existing := schema.NewSet(schema.HashString, nil)
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, fmt.Errorf("could not scan existing object: %w", err)
+		}
+		existing.Add(name)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("could not read the existing objects of schema %s: %w", schemaName, err)
+	}
+	return existing, nil
 }
 
 func generateGrantID(d *schema.ResourceData) string {
