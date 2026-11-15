@@ -160,6 +160,22 @@ jobs:
           scripts/test-shard.sh tests "$((SHARD - 1))" "$SHARDS"
           echo "TEST_RUN=$(scripts/test-shard.sh regex "$((SHARD - 1))" "$SHARDS")" >> "$GITHUB_ENV"
 
+      # Build the test image (tests/build) through the Actions cache instead of
+      # running apt-get in every shard; docker compose then uses the loaded
+      # tests-postgres image as is. Only the first shard writes the cache.
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: build test image
+        uses: docker/build-push-action@v6
+        with:
+          context: tests/build
+          build-args: PGVERSION=${{ matrix.pgversion }}
+          tags: tests-postgres:latest
+          load: true
+          cache-from: type=gha,scope=pg${{ matrix.pgversion }}
+          cache-to: ${{ matrix.shard == 1 && format('type=gha,mode=max,scope=pg{0}', matrix.pgversion) || '' }}
+
       - name: testacc
         run: make testacc
 
