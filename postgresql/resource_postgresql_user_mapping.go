@@ -64,7 +64,7 @@ func resourcePostgreSQLUserMappingCreate(db *DBConnection, d *schema.ResourceDat
 	serverName := d.Get(userMappingServerNameAttr).(string)
 
 	b := bytes.NewBufferString("CREATE USER MAPPING ")
-	fmt.Fprint(b, " FOR ", pq.QuoteIdentifier(username))
+	fmt.Fprint(b, " FOR ", userMappingUserSQL(username))
 	fmt.Fprint(b, " SERVER ", pq.QuoteIdentifier(serverName))
 
 	if options, ok := d.GetOk(userMappingOptionsAttr); ok {
@@ -105,17 +105,30 @@ func resourcePostgreSQLUserMappingReadImpl(db *DBConnection, d *schema.ResourceD
 	username := d.Get(userMappingUserNameAttr).(string)
 	serverName := d.Get(userMappingServerNameAttr).(string)
 
+	// A PUBLIC mapping has umuser = 0. The views spell its user differently
+	// ('PUBLIC' in information_schema._pg_user_mappings, 'public' in
+	// pg_user_mappings) and a real role may be named "PUBLIC", so match it on
+	// umuser instead of the name.
+	userFilter := "umuser <> 0 AND authorization_identifier = $2"
+	fallbackFilter := "umuser <> 0 AND usename = $2"
+	args := []any{serverName, username}
+	if isPublicUserMapping(username) {
+		userFilter = "umuser = 0"
+		fallbackFilter = userFilter
+		args = args[:1]
+	}
+
 	var userMappingOptions []string
-	query := "SELECT umoptions FROM information_schema._pg_user_mappings WHERE authorization_identifier = $1 and foreign_server_name = $2"
-	err := db.QueryRow(query, username, serverName).Scan(pq.Array(&userMappingOptions))
+	query := "SELECT umoptions FROM information_schema._pg_user_mappings WHERE foreign_server_name = $1 AND " + userFilter
+	err := db.QueryRow(query, args...).Scan(pq.Array(&userMappingOptions))
 
 	// pg_user_mappings shows umoptions only to the mapped role itself or to a
 	// superuser; anyone else gets NULL, even the owner of the server.
 	optionsMasked := false
 	if err != sql.ErrNoRows && err != nil {
 		// Fallback to pg_user_mappings table if information_schema._pg_user_mappings is not available
-		query := "SELECT umoptions FROM pg_user_mappings WHERE usename = $1 and srvname = $2"
-		err = db.QueryRow(query, username, serverName).Scan(pq.Array(&userMappingOptions))
+		query := "SELECT umoptions FROM pg_user_mappings WHERE srvname = $1 AND " + fallbackFilter
+		err = db.QueryRow(query, args...).Scan(pq.Array(&userMappingOptions))
 		optionsMasked = err == nil && userMappingOptions == nil
 	}
 
@@ -165,7 +178,7 @@ func resourcePostgreSQLUserMappingDelete(db *DBConnection, d *schema.ResourceDat
 	}
 	defer deferredRollback(txn)
 
-	sql := fmt.Sprintf("DROP USER MAPPING FOR %s SERVER %s ", pq.QuoteIdentifier(username), pq.QuoteIdentifier(serverName))
+	sql := fmt.Sprintf("DROP USER MAPPING FOR %s SERVER %s ", userMappingUserSQL(username), pq.QuoteIdentifier(serverName))
 	if _, err := txn.Exec(sql); err != nil {
 		return err
 	}
@@ -203,7 +216,7 @@ func setUserMappingOptionsIfChanged(db *DBConnection, d *schema.ResourceData) er
 	serverName := d.Get(userMappingServerNameAttr).(string)
 
 	b := bytes.NewBufferString("ALTER USER MAPPING ")
-	fmt.Fprintf(b, " FOR %s SERVER %s ", pq.QuoteIdentifier(username), pq.QuoteIdentifier(serverName))
+	fmt.Fprintf(b, " FOR %s SERVER %s ", userMappingUserSQL(username), pq.QuoteIdentifier(serverName))
 
 	oldOptions, newOptions := d.GetChange(userMappingOptionsAttr)
 	fmt.Fprint(b, " OPTIONS ( ")
@@ -245,4 +258,19 @@ func generateUserMappingID(d *schema.ResourceData) string {
 		d.Get(userMappingUserNameAttr).(string),
 		d.Get(userMappingServerNameAttr).(string),
 	}, ".")
+}
+
+// isPublicUserMapping reports whether username means the PUBLIC pseudo-role,
+// like the unquoted keyword PUBLIC in SQL (any case).
+func isPublicUserMapping(username string) bool {
+	return strings.EqualFold(username, "public")
+}
+
+// userMappingUserSQL renders username for CREATE/ALTER/DROP USER MAPPING FOR.
+// PUBLIC must stay unquoted: "PUBLIC" (quoted) would name a regular role.
+func userMappingUserSQL(username string) string {
+	if isPublicUserMapping(username) {
+		return "PUBLIC"
+	}
+	return pq.QuoteIdentifier(username)
 }

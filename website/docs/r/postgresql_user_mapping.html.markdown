@@ -46,7 +46,7 @@ resource "postgresql_user_mapping" "remote" {
 
 ## Argument Reference
 
-* `user_name` - (Required) The name of an existing user that is mapped to foreign server. CURRENT_ROLE, CURRENT_USER, and USER match the name of the current user. When PUBLIC is specified, a so-called public mapping is created that is used when no user-specific mapping is applicable.
+* `user_name` - (Required) The name of an existing user that is mapped to foreign server. CURRENT_ROLE, CURRENT_USER, and USER match the name of the current user. When PUBLIC is specified (in any case, e.g. `"public"` or `"PUBLIC"`), a so-called public mapping is created that is used when no user-specific mapping is applicable. A role whose name is a case variant of `public`, such as `"PUBLIC"`, therefore cannot be mapped with this resource.
 Changing this value
   will force the creation of a new resource as this value can only be set
   when the user mapping is created.
@@ -61,8 +61,3 @@ Changing this value
   user mapping, even to the owner of the server. In that case the provider
   keeps the options from the Terraform state, so changes made to them outside
   of Terraform are not detected.
-
-~> **Known issue:** a user mapping for `PUBLIC` (`user_name = "public"`) is
-created but not read back, so the apply reports an inconsistent result and the
-next apply tries to create it again
-([#121](https://github.com/FHL-Services-Inc/terraform-provider-postgresql/issues/121)).

@@ -178,7 +178,14 @@ resource "postgresql_user_mapping" "masked" {
 
 func checkUserMappingExists(txn *sql.Tx, username string, serverName string) (bool, error) {
 	var _rez bool
-	err := txn.QueryRow("SELECT TRUE FROM pg_user_mappings WHERE usename = $1 AND srvname = $2", username, serverName).Scan(&_rez)
+	// pg_user_mappings reports a PUBLIC mapping as umuser = 0 (usename 'public').
+	query := "SELECT TRUE FROM pg_user_mappings WHERE srvname = $1 AND umuser <> 0 AND usename = $2"
+	args := []any{serverName, username}
+	if isPublicUserMapping(username) {
+		query = "SELECT TRUE FROM pg_user_mappings WHERE srvname = $1 AND umuser = 0"
+		args = args[:1]
+	}
+	err := txn.QueryRow(query, args...).Scan(&_rez)
 	switch {
 	case err == sql.ErrNoRows:
 		return false, nil
@@ -366,4 +373,96 @@ resource "postgresql_extension" "ext_postgres_fdw" {
 	user_name   = postgresql_role.remote.name
   }
 `, serverName, remoteRole)
+}
+
+// testUserMappingPublicPreCheck makes postgres_fdw available to the provider
+// user: a superuser installs it, a non-superuser (rds profile) needs it to be
+// installed and usable already.
+func testUserMappingPublicPreCheck(t *testing.T) {
+	if testAccProvider.Meta().(*Client).config.Superuser {
+		config := getTestConfig(t)
+		dbExecute(t, config.connStr("postgres"), "CREATE EXTENSION IF NOT EXISTS postgres_fdw")
+		return
+	}
+	testUserMappingMaskedPreCheck(t)
+}
+
+// TestAccPostgresqlUserMapping_Public covers user mappings for PUBLIC
+// (issues #121 and #150). The catalog reports them as 'PUBLIC' in
+// information_schema._pg_user_mappings and as 'public' in pg_user_mappings,
+// so Read must find them on both paths: superuser (primary query) and
+// non-superuser (fallback). Each step's follow-up plan must be empty.
+func TestAccPostgresqlUserMapping_Public(t *testing.T) {
+	lowerServer := testUniqueName("tf_tests_um_public_lower")
+	upperServer := testUniqueName("tf_tests_um_public_upper")
+
+	resource.Test(t, resource.TestCase{
+		PreCheck: func() {
+			testAccPreCheck(t)
+			testCheckCompatibleVersion(t, featureServer)
+			testUserMappingPublicPreCheck(t)
+		},
+		Providers:    testAccProviders,
+		CheckDestroy: testAccCheckPostgresqlUserMappingDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config: testAccPostgresqlUserMappingPublicConfig(lowerServer, upperServer, "pass"),
+				Check: resource.ComposeTestCheckFunc(
+					testAccCheckPostgresqlUserMappingExists("postgresql_user_mapping.lower"),
+					resource.TestCheckResourceAttr("postgresql_user_mapping.lower", "user_name", "public"),
+					resource.TestCheckResourceAttr("postgresql_user_mapping.lower", "options.password", "pass"),
+					testAccCheckPostgresqlUserMappingExists("postgresql_user_mapping.upper"),
+					resource.TestCheckResourceAttr("postgresql_user_mapping.upper", "user_name", "PUBLIC"),
+					resource.TestCheckResourceAttr("postgresql_user_mapping.upper", "options.password", "pass"),
+				),
+			},
+			{
+				Config: testAccPostgresqlUserMappingPublicConfig(lowerServer, upperServer, "passUpdated"),
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr("postgresql_user_mapping.lower", "options.password", "passUpdated"),
+					resource.TestCheckResourceAttr("postgresql_user_mapping.upper", "options.password", "passUpdated"),
+				),
+			},
+		},
+	})
+}
+
+func testAccPostgresqlUserMappingPublicConfig(lowerServer, upperServer, password string) string {
+	return fmt.Sprintf(`
+resource "postgresql_server" "lower" {
+  server_name = "%[1]s"
+  fdw_name    = "postgres_fdw"
+  options = {
+    host   = "foo"
+    dbname = "foodb"
+  }
+}
+
+resource "postgresql_server" "upper" {
+  server_name = "%[2]s"
+  fdw_name    = "postgres_fdw"
+  options = {
+    host   = "foo"
+    dbname = "foodb"
+  }
+}
+
+resource "postgresql_user_mapping" "lower" {
+  server_name = postgresql_server.lower.server_name
+  user_name   = "public"
+  options = {
+    user     = "remote"
+    password = "%[3]s"
+  }
+}
+
+resource "postgresql_user_mapping" "upper" {
+  server_name = postgresql_server.upper.server_name
+  user_name   = "PUBLIC"
+  options = {
+    user     = "remote"
+    password = "%[3]s"
+  }
+}
+`, lowerServer, upperServer, password)
 }
