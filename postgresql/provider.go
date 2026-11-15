@@ -311,13 +311,16 @@ func getRDSAuthToken(ctx context.Context, region string, profile string, role st
 	// credentials provider built from it doesn't know.
 	var sessionExpiry *time.Time
 
+	// The profile and the region are independent: an explicit region wins
+	// over the profile's and the environment's.
+	var opts []func(*awsConfig.LoadOptions) error
 	if profile != "" {
-		awscfg, err = awsConfig.LoadDefaultConfig(ctx, awsConfig.WithSharedConfigProfile(profile))
-	} else if region != "" {
-		awscfg, err = awsConfig.LoadDefaultConfig(ctx, awsConfig.WithRegion(region))
-	} else {
-		awscfg, err = awsConfig.LoadDefaultConfig(ctx)
+		opts = append(opts, awsConfig.WithSharedConfigProfile(profile))
 	}
+	if region != "" {
+		opts = append(opts, awsConfig.WithRegion(region))
+	}
+	awscfg, err = awsConfig.LoadDefaultConfig(ctx, opts...)
 	if err != nil {
 		return "", time.Time{}, err
 	}
@@ -334,18 +337,12 @@ func getRDSAuthToken(ctx context.Context, region string, profile string, role st
 			return "", time.Time{}, fmt.Errorf("could not assume AWS role: %w", err)
 		}
 
-		awscfg, err = awsConfig.LoadDefaultConfig(ctx,
-			awsConfig.WithCredentialsProvider(
-				aws.NewCredentialsCache(credentials.NewStaticCredentialsProvider(
-					*roleOutput.Credentials.AccessKeyId,
-					*roleOutput.Credentials.SecretAccessKey,
-					*roleOutput.Credentials.SessionToken,
-				)),
-			),
-		)
-		if err != nil {
-			return "", time.Time{}, fmt.Errorf("could not load AWS default config: %w", err)
-		}
+		// Swap only the credentials so the region resolved above is kept.
+		awscfg.Credentials = aws.NewCredentialsCache(credentials.NewStaticCredentialsProvider(
+			*roleOutput.Credentials.AccessKeyId,
+			*roleOutput.Credentials.SecretAccessKey,
+			*roleOutput.Credentials.SessionToken,
+		))
 		sessionExpiry = roleOutput.Credentials.Expiration
 	}
 
