@@ -164,3 +164,46 @@ func TestLockMembershipsForTxn(t *testing.T) {
 		t.Fatal("transaction still registered after release")
 	}
 }
+
+// TestLockDatabaseMemberships checks that the postgresql_database operations
+// and withRolesGranted transactions exclude each other on the same role
+// (#152), and that an empty role name is ignored.
+func TestLockDatabaseMemberships(t *testing.T) {
+	unlock := lockDatabaseMemberships("tf_db_owner_old", "", "tf_db_owner_new")
+
+	txn := &sql.Tx{}
+	acquired := make(chan struct{})
+	go func() {
+		defer close(acquired)
+		lockMembershipsForTxn(txn, []string{"tf_db_owner_new"})
+		releaseMembershipLocks(txn)
+	}()
+	select {
+	case <-acquired:
+		t.Fatal("withRolesGranted lock acquired while a database operation holds it")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	// The empty name was not locked.
+	membershipLocks.lock("")()
+
+	unlock()
+	waitOrFail(t, acquired, "withRolesGranted lock after the database operation released it")
+
+	// The other way round.
+	if !lockMembershipsForTxn(txn, []string{"tf_db_owner_old"}) {
+		t.Fatal("lock refused")
+	}
+	acquired = make(chan struct{})
+	go func() {
+		defer close(acquired)
+		lockDatabaseMemberships("tf_db_owner_old")()
+	}()
+	select {
+	case <-acquired:
+		t.Fatal("database operation lock acquired while a transaction holds it")
+	case <-time.After(50 * time.Millisecond):
+	}
+	releaseMembershipLocks(txn)
+	waitOrFail(t, acquired, "database operation lock after the transaction released it")
+}

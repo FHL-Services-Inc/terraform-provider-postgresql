@@ -350,6 +350,16 @@ func resourcePostgreSQLSchemaUpdate(db *DBConnection, d *schema.ResourceData) er
 	}
 	defer deferredRollback(txn)
 
+	// setSchemaPolicy takes the membership locks of the owner
+	// (withRolesGranted). Take them before the DDL below: waiting for them
+	// while holding locks on the schema could block, forever, an owner change
+	// of the database that holds them and runs REASSIGN OWNED on that schema
+	// (setAlterOwnership, see membershipLocks).
+	if owner := d.Get(schemaOwnerAttr).(string); owner != "" && d.HasChange(schemaPolicyAttr) &&
+		(d.HasChange(schemaNameAttr) || d.HasChange(schemaOwnerAttr)) {
+		lockMembershipsForTxn(txn, []string{owner})
+	}
+
 	if err := setSchemaName(txn, d, databaseName); err != nil {
 		return err
 	}

@@ -108,6 +108,14 @@ several Terraform processes. The members of the grantee are not locked. As a
 last resort, a write that still fails with `tuple concurrently updated` (for
 example because another tool changed the same privileges) is retried once.
 
+When the provider user is not a superuser, a grant temporarily makes it a
+member of the object owners. Role memberships are cluster-wide, so within one
+provider configuration these temporary memberships are serialized per owner,
+also against `postgresql_database` resources that create, drop or re-own a
+database of the same owner. Separate provider configurations (aliases, or
+another Terraform process) using the same login role are not serialized
+against each other.
+
 ## Import
 
 `postgresql_grant` can be imported using the resource ID, which is the
