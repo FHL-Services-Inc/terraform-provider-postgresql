@@ -239,6 +239,13 @@ func lockDefaultPrivileges(txn *sql.Tx, d *schema.ResourceData) error {
 // same entry the previous filter on pg_get_userbyid(grantor) = owner selected,
 // without calling that function for every default ACL item. A missing owner
 // matches no entry, exactly as before.
+//
+// Without a schema, a missing entry reads as acldefault(type, owner): this is
+// what the owner's new objects get, and PostgreSQL deletes a global entry that
+// becomes equal to it (e.g. ALL on tables for the owner itself, or EXECUTE on
+// functions for PUBLIC), so such an entry is present, not gone (#117). A
+// per-schema entry is only added to the global one, so a missing one grants
+// nothing.
 func buildReadRoleDefaultPrivilegesQuery(d *schema.ResourceData) (string, []any) {
 	pgSchema := d.Get("schema").(string)
 	args := []any{
@@ -247,24 +254,29 @@ func buildReadRoleDefaultPrivilegesQuery(d *schema.ResourceData) (string, []any)
 		objectTypes[d.Get("object_type").(string)],
 	}
 
-	namespace, schemaExists, withSchema := "0", "true", ""
+	const entry = `SELECT da.defaclacl FROM pg_default_acl da
+        WHERE da.defaclrole = (SELECT oid FROM o)
+          AND da.defaclnamespace = %s
+          AND da.defaclobjtype = $3`
+
+	acl, schemaExists, withSchema := "", "true", ""
 	if pgSchema != "" {
 		withSchema = `,
 n AS (SELECT oid FROM pg_namespace WHERE nspname = $4)`
-		namespace, schemaExists = "(SELECT oid FROM n)", "EXISTS (SELECT 1 FROM n)"
+		schemaExists = "EXISTS (SELECT 1 FROM n)"
+		acl = "(" + fmt.Sprintf(entry, "(SELECT oid FROM n)") + ")"
 		args = append(args, pgSchema)
+	} else {
+		acl = "COALESCE((" + fmt.Sprintf(entry, "0") + "),\n        acldefault(" +
+			pq.QuoteLiteral(defaultACLBuiltinType(d.Get("object_type").(string))) + ", (SELECT oid FROM o)))"
 	}
 
 	query := grantReadRoleCTE + `,
 o AS (SELECT oid FROM pg_roles WHERE rolname = $2)` + withSchema + `
 SELECT r.oid IS NOT NULL, ` + schemaExists + `, (
     SELECT array_agg(a.privilege_type)
-    FROM pg_default_acl da
-    CROSS JOIN LATERAL aclexplode(da.defaclacl) a
-    WHERE da.defaclrole = (SELECT oid FROM o)
-      AND da.defaclnamespace = ` + namespace + `
-      AND da.defaclobjtype = $3
-      AND a.grantee = r.oid
+    FROM aclexplode(` + acl + `) a
+    WHERE a.grantee = r.oid
 )
 FROM r
 `
@@ -334,7 +346,9 @@ func readRoleDefaultPrivileges(db *DBConnection, d *schema.ResourceData) error {
 // from the catalog snapshot, with the same outcome: the pg_default_acl entry
 // is the one keyed by the owner's OID, the schema's OID (0 without a schema)
 // and the object type; a missing role or schema removes the resource from
-// state; a missing owner or entry reads as no privileges.
+// state; a missing owner reads as no privileges, and so does a missing entry
+// in a schema, while a missing global entry reads as the built-in defaults
+// (builtinDefaultPrivileges).
 func readRoleDefaultPrivilegesFromSnapshot(snap *catalogSnapshot, db *DBConnection, d *schema.ResourceData) error {
 	role := d.Get("role").(string)
 	pgSchema := d.Get("schema").(string)
@@ -357,6 +371,8 @@ func readRoleDefaultPrivilegesFromSnapshot(snap *catalogSnapshot, db *DBConnecti
 			if privileges, err = aclPrivilegesGrantedTo(acl, grantee); err != nil {
 				return err
 			}
+		} else if pgSchema == "" {
+			privileges = builtinDefaultPrivileges(db, d.Get("object_type").(string), role == d.Get("owner").(string), role == publicRole)
 		}
 	}
 
@@ -380,6 +396,38 @@ func readRoleDefaultPrivilegesFromSnapshot(snap *catalogSnapshot, db *DBConnecti
 	d.SetId(generateDefaultPrivilegesID(d))
 
 	return nil
+}
+
+// defaultACLBuiltinType returns the acldefault object type of a default
+// privileges object type. It is the pg_default_acl.defaclobjtype of the object
+// type except for sequences: 'S' there, 's' for acldefault ('S' is a foreign
+// server).
+func defaultACLBuiltinType(objectType string) string {
+	if t := objectTypes[objectType]; t != "S" {
+		return t
+	}
+	return "s"
+}
+
+// builtinDefaultPrivileges returns the privileges acldefault(type, owner)
+// grants to the grantee of a default privileges resource, as the direct Read
+// gets them from the server: every privilege of the object type for the owner,
+// EXECUTE on functions and USAGE on types for PUBLIC, nothing for other roles.
+func builtinDefaultPrivileges(db *DBConnection, objectType string, isOwner, isPublic bool) []string {
+	var privileges []string
+	switch {
+	case isOwner:
+		for _, p := range allowedPrivilegesForObjectType(objectType, db) {
+			if p != "ALL" {
+				privileges = append(privileges, p)
+			}
+		}
+	case isPublic && (objectType == "function" || objectType == "routine"):
+		privileges = []string{"EXECUTE"}
+	case isPublic && objectType == "type":
+		privileges = []string{"USAGE"}
+	}
+	return privileges
 }
 
 func grantRoleDefaultPrivileges(txn *sql.Tx, d *schema.ResourceData) error {

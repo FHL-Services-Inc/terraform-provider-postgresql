@@ -1,6 +1,7 @@
 package postgresql
 
 import (
+	"database/sql"
 	"fmt"
 	"strings"
 	"testing"
@@ -8,6 +9,7 @@ import (
 	"github.com/lib/pq"
 
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/resource"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/terraform"
 )
 
@@ -506,4 +508,214 @@ resource "postgresql_default_privileges" "sequences" {
 			},
 		},
 	})
+}
+
+// TestAccPostgresqlDefaultPrivileges_BuiltinDefaults applies global default
+// privileges (no schema) that equal the built-in defaults: everything for the
+// owner itself, EXECUTE on functions and USAGE on types for PUBLIC. PostgreSQL
+// stores no pg_default_acl row for such an entry, so the Read must take the
+// missing row as acldefault instead of "resource gone" (#117), directly and
+// with catalog_snapshot.
+func TestAccPostgresqlDefaultPrivileges_BuiltinDefaults(t *testing.T) {
+	skipIfNotAcc(t)
+
+	for _, tc := range []struct{ name, snapshot string }{
+		{"direct", ""},
+		{"catalog_snapshot", "1"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("PGCATALOGSNAPSHOT", tc.snapshot)
+			isolateDBRegistry(t)
+			testAccDefaultPrivilegesBuiltinDefaults(t, tc.snapshot != "")
+		})
+	}
+}
+
+func testAccDefaultPrivilegesBuiltinDefaults(t *testing.T, snapshotOn bool) {
+	config := getTestConfig(t)
+	dbSuffix, teardown := setupTestDatabase(t, true, true)
+	dbName, _ := getTestDBNames(dbSuffix)
+	ownerName := testUniqueName("tf_dp_builtin_owner")
+
+	// The owner is created out of band: destroying these resources revokes
+	// the owner's own defaults, which leaves pg_default_acl rows in the test
+	// database that only dropping the database removes.
+	dbExecute(t, config.connStr("postgres"), fmt.Sprintf("CREATE ROLE %s", pq.QuoteIdentifier(ownerName)))
+	defer func() {
+		teardown()
+		dbExecute(t, config.connStr("postgres"), fmt.Sprintf("DROP ROLE IF EXISTS %s", pq.QuoteIdentifier(ownerName)))
+	}()
+
+	stateConfig := fmt.Sprintf(`
+resource "postgresql_default_privileges" "owner_tables" {
+	database    = "%[1]s"
+	role        = "%[2]s"
+	owner       = "%[2]s"
+	object_type = "table"
+	privileges  = ["ALL"]
+}
+
+resource "postgresql_default_privileges" "owner_sequences" {
+	database    = "%[1]s"
+	role        = "%[2]s"
+	owner       = "%[2]s"
+	object_type = "sequence"
+	privileges  = ["ALL"]
+}
+
+resource "postgresql_default_privileges" "owner_schemas" {
+	database    = "%[1]s"
+	role        = "%[2]s"
+	owner       = "%[2]s"
+	object_type = "schema"
+	privileges  = ["USAGE", "CREATE"]
+}
+
+resource "postgresql_default_privileges" "public_functions" {
+	database    = "%[1]s"
+	role        = "public"
+	owner       = "%[2]s"
+	object_type = "function"
+	privileges  = ["EXECUTE"]
+}
+
+resource "postgresql_default_privileges" "public_types" {
+	database    = "%[1]s"
+	role        = "public"
+	owner       = "%[2]s"
+	object_type = "type"
+	privileges  = ["USAGE"]
+}
+`, dbName, ownerName)
+
+	clearCatalogSnapshots()
+	builds := catalogSnapshotBuilds()
+	checkSnapshotUsed := func(*terraform.State) error {
+		now := catalogSnapshotBuilds()
+		if snapshotOn && now == builds {
+			return fmt.Errorf("no catalog snapshot built, the Reads did not use it")
+		}
+		if !snapshotOn && now != builds {
+			return fmt.Errorf("%d catalog snapshot(s) built with catalog_snapshot off", now-builds)
+		}
+		return nil
+	}
+
+	resource.Test(t, resource.TestCase{
+		PreCheck: func() {
+			testAccPreCheck(t)
+			testCheckCompatibleVersion(t, featurePrivilegesOnSchemas)
+		},
+		Providers: testAccProviders,
+		Steps: []resource.TestStep{
+			{
+				Config: stateConfig,
+				Check: resource.ComposeTestCheckFunc(
+					// PostgreSQL removed every entry: they equal acldefault.
+					testCheckDefaultACLCount(t, dbName, ownerName, 0),
+					resource.TestCheckResourceAttr("postgresql_default_privileges.owner_tables", "privileges.#", "1"),
+					resource.TestCheckResourceAttr("postgresql_default_privileges.public_functions", "privileges.#", "1"),
+				),
+			},
+			{
+				// The Reads of the next plan see the built-in defaults.
+				Config:   stateConfig,
+				PlanOnly: true,
+			},
+			{
+				// A change out of band is still drift. The connected role
+				// needs the owner's membership for it (rds profile).
+				PreConfig: func() {
+					dbExecute(t, config.connStr(dbName), fmt.Sprintf(
+						"GRANT %[1]s TO CURRENT_USER; "+
+							"ALTER DEFAULT PRIVILEGES FOR ROLE %[1]s REVOKE INSERT ON TABLES FROM %[1]s; "+
+							"REVOKE %[1]s FROM CURRENT_USER", pq.QuoteIdentifier(ownerName)))
+				},
+				Config:             stateConfig,
+				PlanOnly:           true,
+				ExpectNonEmptyPlan: true,
+			},
+			{
+				Config: stateConfig,
+				Check: resource.ComposeTestCheckFunc(
+					testCheckDefaultACLCount(t, dbName, ownerName, 0),
+					checkSnapshotUsed,
+				),
+			},
+		},
+	})
+}
+
+// testCheckDefaultACLCount checks the number of pg_default_acl entries of
+// owner in dbName.
+func testCheckDefaultACLCount(t *testing.T, dbName, owner string, want int) resource.TestCheckFunc {
+	return func(*terraform.State) error {
+		config := getTestConfig(t)
+		db, err := sql.Open("postgres", config.connStr(dbName))
+		if err != nil {
+			return err
+		}
+		defer closeDB(t, db)
+
+		var got int
+		if err := db.QueryRow(
+			"SELECT count(*) FROM pg_default_acl WHERE defaclrole = (SELECT oid FROM pg_roles WHERE rolname = $1)", owner,
+		).Scan(&got); err != nil {
+			return fmt.Errorf("could not count default ACLs: %w", err)
+		}
+		if got != want {
+			return fmt.Errorf("pg_default_acl entries of %s: got %d, want %d", owner, got, want)
+		}
+		return nil
+	}
+}
+
+// isolateDBRegistry gives the test an empty dbRegistry and restores the
+// previous one afterwards. A pooled DBConnection keeps the Client, and so the
+// provider settings, of the configure that opened it, so a test that changes
+// a setting such as catalog_snapshot between runs needs pools of its own.
+func isolateDBRegistry(t *testing.T) {
+	t.Helper()
+	dbRegistryLock.Lock()
+	saved := dbRegistry
+	dbRegistry = make(map[string]*DBConnection)
+	dbRegistryLock.Unlock()
+	t.Cleanup(func() {
+		dbRegistryLock.Lock()
+		own := dbRegistry
+		dbRegistry = saved
+		dbRegistryLock.Unlock()
+		for _, conn := range own {
+			_ = conn.Close()
+		}
+	})
+}
+
+// TestBuildReadRoleDefaultPrivilegesQueryBuiltin checks that only a global
+// entry falls back to acldefault, with the acldefault type of the object type.
+func TestBuildReadRoleDefaultPrivilegesQueryBuiltin(t *testing.T) {
+	for _, tc := range []struct {
+		schema, objectType, want string
+	}{
+		{"", "table", "acldefault('r', "},
+		{"", "sequence", "acldefault('s', "},
+		{"", "function", "acldefault('f', "},
+		{"", "routine", "acldefault('f', "},
+		{"", "type", "acldefault('T', "},
+		{"", "schema", "acldefault('n', "},
+		{"test_schema", "table", ""},
+	} {
+		d := schema.TestResourceDataRaw(t, resourcePostgreSQLDefaultPrivileges().Schema, map[string]any{
+			"database": "db", "role": "r", "owner": "o", "schema": tc.schema,
+			"object_type": tc.objectType, "privileges": []any{},
+		})
+		query, _ := buildReadRoleDefaultPrivilegesQuery(d)
+		if tc.want == "" {
+			if strings.Contains(query, "acldefault") {
+				t.Errorf("schema %q, %s: a per-schema entry must not fall back to acldefault:\n%s", tc.schema, tc.objectType, query)
+			}
+		} else if !strings.Contains(query, tc.want) {
+			t.Errorf("schema %q, %s: query does not contain %q:\n%s", tc.schema, tc.objectType, tc.want, query)
+		}
+	}
 }
