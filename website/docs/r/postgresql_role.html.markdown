@@ -186,6 +186,14 @@ resource "postgresql_role" "app_user" {
   privileges; set this option to true to skip them in all databases.
 
 * `statement_timeout` - (Optional) Defines [`statement_timeout`](https://www.postgresql.org/docs/current/runtime-config-client.html#RUNTIME-CONFIG-CLIENT-STATEMENT) setting for this role which allows to abort any statement that takes more than the specified amount of time.
+  The value is a number of milliseconds (`30000`) or a number with one of the units `us`, `ms`, `s`, `min`, `h`, `d`
+  (`"30s"`, `"2min"`); the same duration written differently shows no diff. `0` sets the timeout to 0 for the role,
+  which disables it even if the database or the server sets one. Leave the attribute unset for the role to inherit
+  the database or server value; removing it resets the setting.
+
+* `idle_in_transaction_session_timeout` - (Optional) Defines [`idle_in_transaction_session_timeout`](https://www.postgresql.org/docs/current/runtime-config-client.html#GUC-IDLE-IN-TRANSACTION-SESSION-TIMEOUT)
+  setting for this role, which terminates any session with an open transaction that has been idle for longer than
+  the specified amount of time. Same values and semantics as `statement_timeout`.
 
 * `assume_role` - (Optional) Defines the role to switch to at login via [`SET ROLE`](https://www.postgresql.org/docs/current/sql-set-role.html).
 
