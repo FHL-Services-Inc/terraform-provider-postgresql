@@ -1013,7 +1013,7 @@ func TestAccPostgresqlDatabase_DropWithIdleConnections(t *testing.T) {
 	dbName := testUniqueName("tf_tests_idle_conns_db")
 
 	// dbRegistry is process-wide and keyed by DSN only, so a pool opened by
-	// an earlier test (with max_idle_connections = 0) would be reused here.
+	// an earlier test (with other pool settings) would be reused here.
 	// A connect_timeout unique to this test gives the provider its own DSN,
 	// hence its own pools.
 	providerOnly := `

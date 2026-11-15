@@ -15,8 +15,12 @@ PostgreSQL. This page explains where the time goes, which provider settings
 reduce it, what they cost, and how to measure the effect on your own
 configuration.
 
-All settings on this page are opt-in. With the defaults, the provider behaves
-as it always has.
+Connection reuse (`max_idle_connections = 5`) and single round-trip statements
+(`binary_parameters = true`) are on by default. `max_total_connections` and
+`catalog_snapshot` are opt-in. Each section below says what a setting costs and
+how to turn it off; `max_idle_connections = 0` and `binary_parameters = false`
+(or `PGMAXIDLECONNECTIONS=0` and `PGBINARYPARAMETERS=false`) restore the
+provider's earlier behavior, which was the default before these two changed.
 
 ## Why large plans are slow
 
@@ -24,20 +28,23 @@ For every resource in state, Terraform calls the provider's Read, and the
 provider runs one or more SQL statements. Two things multiply the cost of each
 statement:
 
-* **A new connection for almost every statement.** By default
-  (`max_idle_connections = 0`) the provider closes each connection as soon as
+* **A new connection for almost every statement.** With
+  `max_idle_connections = 0` the provider closes each connection as soon as
   it is returned to its pool, so the next statement outside a transaction
   opens a new one. Every new connection costs a TCP handshake, the TLS
   handshake with `sslmode = require` or stricter, and the PostgreSQL startup
   and authentication exchange: several round-trips before the statement is
   even sent. In the benchmark below, a plan of 1,143 resources ran about
-  1,160 statements and opened about 1,180 connections with the defaults
-  (before the read optimizations of this release: about 7,000 statements and
-  2,600 connections).
-* **Two round-trips per parameterized statement.** By default the driver
+  1,160 statements and opened about 1,180 connections that way (before the
+  read optimizations of this release: about 7,000 statements and 2,600
+  connections). The default `max_idle_connections = 5` avoids most of these
+  connections.
+* **Two round-trips per parameterized statement.** With
+  `binary_parameters = false` the driver
   ([`lib/pq`](https://pkg.go.dev/github.com/lib/pq)) prepares each statement
   that has bind parameters (almost every query the provider runs) and executes
-  it in a second exchange.
+  it in a second exchange. The default `binary_parameters = true` sends both
+  in one.
 
 Against a server on the same machine a round-trip costs almost nothing and
 none of this shows. Against a server 10 ms away (another region, a VPN, a
@@ -45,27 +52,35 @@ bastion), it dominates the plan.
 
 ## `max_idle_connections`: reuse connections
 
+The default is `5`. To change it:
+
 ```hcl
 provider "postgresql" {
   # ...
-  max_idle_connections = 10
+  max_idle_connections = 10 # default 5; 0 closes every connection after use
 }
 ```
 
-or, without changing the configuration, `export PGMAXIDLECONNECTIONS=10`.
+or, without changing the configuration, `export PGMAXIDLECONNECTIONS=10`
+(a value in the provider block takes precedence over the variable).
 
 With a value above zero, each connection pool keeps up to that many idle
 connections open and the provider reuses them instead of reconnecting. In the
-benchmark below this took a plan from about 1,180 new connections to 38, and
-the plan time at 10 ms round-trip time from 12.9 s to 5.2 s.
+benchmark below `max_idle_connections = 10` took a plan from about 1,180 new
+connections (with `0`) to 38, and the plan time at 10 ms round-trip time from
+12.9 s to 5.2 s. In the pool size measurements below, `5` opened 74
+connections per plan where `10` opened 38, and was almost as fast.
 
 ### Recommended values
 
-* Set it to the `-parallelism` you run Terraform with (10 by default). That
-  gives the most reuse; the benchmark below found 5 almost as fast.
+* The default `5` suits most configurations. For the most reuse, set it to the
+  `-parallelism` you run Terraform with (10 by default).
 * If the provider manages objects in many databases, or the server is short on
-  connection slots, use a lower value such as 2 to 5. Even 2 kept most of the
-  gain in the measurements below.
+  connection slots, use a lower value such as 2, or cap the total with
+  `max_total_connections` (see below). Even 2 kept most of the gain in the
+  measurements below.
+* Set it to `0` to keep no idle connections at all; see
+  [Turning it off](#turning-it-off).
 * Keep `max_connections` (default `20`) at or above `-parallelism`. A smaller
   pool makes resources queue for a connection: in the measurements below,
   `max_connections = 5` lost almost all of the gain at 10 ms.
@@ -80,11 +95,11 @@ the plan time at 10 ms round-trip time from 12.9 s to 5.2 s.
   `(number of databases + 1) × max_idle_connections` sessions while Terraform
   runs, next to your other clients. Every `provider` block (alias) runs in its
   own plugin process with its own pools, so add them up across blocks too.
-  With the default `max_idle_connections = 0` the provider only holds
-  connections for the resources in progress. Measured peaks of concurrent
-  provider connections (`-parallelism=10`):
+  With `max_idle_connections = 0` the provider only holds connections for the
+  resources in progress. Measured peaks of concurrent provider connections
+  (`-parallelism=10`):
 
-  | databases with resources (pools: one more) | default | `max_idle_connections = 2` | `= 5` | `= 10` |
+  | databases with resources (pools: one more) | `max_idle_connections = 0` (old default) | `= 2` | `= 5` (default) | `= 10` |
   |---|---:|---:|---:|---:|
   | 1 | 10 | 12 | 15 | 20 |
   | 4 | 10 | 16–18 | 26–29 | 34–39 |
@@ -111,6 +126,23 @@ the plan time at 10 ms round-trip time from 12.9 s to 5.2 s.
   fail with `sql: database is closed`. Make the copy depend on them with
   `depends_on` (PostgreSQL refuses the copy while they are connected anyway);
   see [`postgresql_database`](../r/postgresql_database.html).
+
+### Turning it off
+
+Set `max_idle_connections = 0` (or `export PGMAXIDLECONNECTIONS=0` for provider
+blocks that do not set it) to close every connection as soon as it is returned
+to its pool, as the provider did before `5` became the default. Plans then open
+a new connection for almost every statement again and get correspondingly
+slower against a remote server, but the provider holds no session it is not
+using. Consider it when:
+
+* scripts or other tools drop, rename or copy (`CREATE DATABASE ... TEMPLATE`)
+  databases the provider works in while Terraform runs, and cannot terminate
+  the provider's sessions first;
+* the server, a role or a database has a tight connection limit, and even
+  `max_total_connections` (below) leaves no room for idle sessions;
+* several provider blocks manage the same database and one of them renames it
+  or uses it as a template.
 
 ## `max_total_connections`: one limit for all databases
 
@@ -176,16 +208,19 @@ provider blocks that run at the same time.
 
 ## `binary_parameters`: one round-trip per statement
 
+On by default. To turn it off:
+
 ```hcl
 provider "postgresql" {
   # ...
-  binary_parameters = true
+  binary_parameters = false # default true
 }
 ```
 
-or `export PGBINARYPARAMETERS=true`.
+or `export PGBINARYPARAMETERS=false` (a value in the provider block takes
+precedence over the variable).
 
-This adds `binary_parameters=yes` to the connection string. `lib/pq` then sends
+When enabled, this adds `binary_parameters=yes` to the connection string. `lib/pq` then sends
 the parse, bind and execute steps of a parameterized statement in one go and
 reads all the answers at once, so each statement costs one round-trip instead
 of two. The number of statements and connections stays the same.
@@ -195,18 +230,23 @@ and the provider passes none. Every other parameter, and every result column,
 is still exchanged as text, and the server still infers the parameter types
 the same way. The one encoding difference in `lib/pq` is for string
 parameters bound to a `bytea` column, which the provider does not have. The
-provider's acceptance tests pass with it enabled.
+provider's acceptance tests run with it enabled, and CI also runs them with it
+disabled.
 
 The gain is small while every statement still opens a new connection (the
 handshake round-trips are not affected), and large once connections are
 reused: at 10 ms round-trip time, about 12% on its own (12.9 s to 11.3 s),
 but 29% on top of `max_idle_connections = 10` (5.2 s to 3.7 s; see the numbers
-below). Enable both together.
+below). That is why both are on by default.
+
+There is little reason to turn it off. Do so if you suspect it in a problem
+with a proxy or pooler between the provider and PostgreSQL (none is known; see
+below), or to compare against the earlier behavior.
 
 ### Connection poolers
 
-`binary_parameters` does not add a requirement on poolers. In the default
-mode, a parameterized statement is prepared and executed in two exchanges,
+`binary_parameters` does not add a requirement on poolers. With
+`binary_parameters = false`, a parameterized statement is prepared and executed in two exchanges,
 each ending with a Sync message; with `binary_parameters` it is a single
 exchange.
 
@@ -229,7 +269,7 @@ or `export PGCATALOGSNAPSHOT=true`. Off by default.
 
 Without it, every `postgresql_grant` and `postgresql_default_privileges`
 resource reads its privileges with its own catalog query: one statement (and,
-without `max_idle_connections`, one new connection) per resource and per plan.
+with `max_idle_connections = 0`, one new connection) per resource and per plan.
 A grant on all tables of a schema also scans `pg_class` each time, which gets
 slower as the database holds more relations.
 
@@ -309,22 +349,27 @@ provider "postgresql" {
   sslmode  = "require"
 
   max_connections      = 20   # default; per database, keep >= -parallelism
-  max_idle_connections = 10   # = -parallelism; lower it for many databases
-  binary_parameters    = true
+  max_idle_connections = 10   # default 5; = -parallelism for the most reuse,
+                              # lower it for many databases
+  # binary_parameters = true  # default
 }
 ```
+
+The defaults (`max_idle_connections = 5`, `binary_parameters = true`) already
+give most of the gain; raising `max_idle_connections` to `-parallelism` gives
+the rest.
 
 Add `catalog_snapshot = true` if the configuration has many grant or default
 privileges resources and nothing else changes privileges while Terraform runs
 (see above).
 
-Before you enable it, check the connection budget: the server's
-`max_connections` (and any connection limit on the role, the database or a
-pooler in front) must leave room for about
+Check the connection budget, also with the default `max_idle_connections = 5`:
+the server's `max_connections` (and any connection limit on the role, the
+database or a pooler in front) must leave room for about
 `(number of databases + 1) × max_idle_connections` sessions per provider block,
 next to your applications. With many databases, cap that with
 `max_total_connections` (at least `-parallelism` + number of databases, see
-above).
+above), or lower `max_idle_connections`.
 
 `-parallelism` (default 10) is how many resources Terraform works on at the
 same time. Raising it can shorten plans that wait on round-trips, but every
@@ -365,8 +410,9 @@ server, TLS, the number of databases and the resource mix.
   change:
 
   ```shell
-  time terraform plan
-  time PGMAXIDLECONNECTIONS=10 PGBINARYPARAMETERS=true terraform plan
+  time terraform plan                                                  # defaults
+  time PGMAXIDLECONNECTIONS=10 terraform plan                          # more reuse
+  time PGMAXIDLECONNECTIONS=0 PGBINARYPARAMETERS=false terraform plan  # old defaults
   ```
 
   The variables only apply to provider blocks that do not set the argument.
@@ -407,6 +453,7 @@ server, TLS, the number of databases and the resource mix.
 
   ```shell
   tests/bench/run.sh -p idle0=. -p idle10=. \
+    -a 'idle0=max_idle_connections = 0' \
     -a 'idle10=max_idle_connections = 10' -l "0 10" -n 3
   ```
 
@@ -432,10 +479,15 @@ the numbers measured in that pull request).
 
 **`terraform plan`** with refresh, 10 ms RTT, median of 3 runs:
 
+"old defaults" is `max_idle_connections = 0` and `binary_parameters = false`,
+the defaults at the time. "both" is close to the current defaults
+(`max_idle_connections = 5`, `binary_parameters = true`), with
+`max_idle_connections = 10` instead of `5`.
+
 | build | plan | statements per plan | connections per plan |
 |---|---:|---:|---:|
 | base | 35.0 s | 7,005 | 2,587 |
-| main, defaults | 12.9 s | 1,163 | 1,183 |
+| main, old defaults | 12.9 s | 1,163 | 1,183 |
 | main, `max_idle_connections = 10` | 5.2 s | 1,163 | **38** |
 | main, `binary_parameters = true` | 11.3 s | 1,163 | 1,183 |
 | main, both | **3.7 s** | 1,163 | **38** |
@@ -449,7 +501,7 @@ Without added latency (0 ms RTT, one run) the same plans took 6.0 s, 4.0 s,
 | build | apply |
 |---|---:|
 | base | 417 s |
-| main, defaults | 367 s |
+| main, old defaults | 367 s |
 | main, `max_idle_connections = 10` | 226 s |
 | main, `binary_parameters = true` | 316 s |
 | main, both | **174 s** |
@@ -462,10 +514,22 @@ higher than they would be on an idle machine):
 |---|---:|---:|---:|
 | v1.28.0 | 30.3 s | 2,587 | 10 |
 | `max_idle_connections = 2` | 19.7 s | 504 | 12 |
-| `max_idle_connections = 5` | 18.2 s | 74 | 15 |
+| `max_idle_connections = 5` (current default) | 18.2 s | 74 | 15 |
 | `max_idle_connections = 10` | 17.8 s | 38 | 20 |
 | `max_idle_connections = 10`, `max_connections = 5` | 28.3 s | 27 | 10 |
 
 With 4 databases (5 pools), `max_idle_connections = 10` reached a peak of
 34–39 connections and `= 2` a peak of 16–18, at 16.8 s and 20.5 s for the
 10 ms plan (v1.28.0: 29.1 s, peak 10).
+
+A later run on `main` at `19ab9dc` (same fixture, 10 ms RTT,
+median of 3;
+[details](https://github.com/FHL-Services-Inc/terraform-provider-postgresql/issues/33#issuecomment-6897792659)),
+each row adding one setting to the one above:
+
+| setting | plan | connections per plan |
+|---|---:|---:|
+| old defaults | 14.6 s | 1,183 |
+| `max_idle_connections = 10` | 5.7 s | 38 |
+| + `binary_parameters = true` | 3.7 s | 38 |
+| + `catalog_snapshot = true` | 2.4 s | 31 |

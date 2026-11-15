@@ -25,7 +25,8 @@ import (
 
 const (
 	defaultProviderMaxOpenConnections            = 20
-	defaultProviderMaxIdleConnections            = 0
+	defaultProviderMaxIdleConnections            = 5
+	defaultProviderBinaryParameters              = true
 	defaultProviderMaxTotalConnections           = 0 // no limit across databases
 	defaultProviderConnectTimeoutSeconds         = 180
 	defaultProviderConnMaxLifetimeSeconds        = 0 // unlimited
@@ -219,7 +220,7 @@ func Provider() *schema.Provider {
 				Type:         schema.TypeInt,
 				Optional:     true,
 				DefaultFunc:  schema.EnvDefaultFunc("PGMAXIDLECONNECTIONS", defaultProviderMaxIdleConnections),
-				Description:  "Maximum number of idle connections kept open per database for reuse. Zero (the default) means connections are closed after each use. Capped to max_connections when the latter is non-zero.",
+				Description:  "Maximum number of idle connections kept open per database for reuse (default 5). Idle connections are closed after 30 seconds without use. Zero means connections are closed after each use. Capped to max_connections when the latter is non-zero.",
 				ValidateFunc: validation.IntAtLeast(0),
 			},
 			"max_total_connections": {
@@ -239,8 +240,8 @@ func Provider() *schema.Provider {
 			"binary_parameters": {
 				Type:        schema.TypeBool,
 				Optional:    true,
-				DefaultFunc: schema.EnvDefaultFunc("PGBINARYPARAMETERS", false),
-				Description: "Send statements with bind parameters in a single round-trip (lib/pq binary_parameters=yes) instead of a separate prepare round-trip.",
+				DefaultFunc: schema.EnvDefaultFunc("PGBINARYPARAMETERS", defaultProviderBinaryParameters),
+				Description: "Send statements with bind parameters in a single round-trip (lib/pq binary_parameters=yes) instead of a separate prepare round-trip. Enabled by default; set to false to prepare each parameterized statement in a separate round-trip.",
 			},
 			"expected_version": {
 				Type:         schema.TypeString,

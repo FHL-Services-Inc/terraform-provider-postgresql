@@ -447,12 +447,11 @@ func (c *Client) Connect() (*DBConnection, error) {
 // configurePool applies the provider's pool settings to a freshly opened
 // database handle.
 func (c *Config) configurePool(db *sql.DB) {
-	// By default (max_idle_connections = 0) no connection is retained: when we
-	// connect to a specific database which might be managed by terraform, we
-	// don't keep connections open in case the database has to be dropped in
-	// the plan. With max_idle_connections > 0 connections are reused, and
-	// postgresql_database evicts the pool of a database before dropping it
-	// (see evictDBConnection).
+	// With max_idle_connections > 0 (the default is 5) connections are reused
+	// for up to defaultConnMaxIdleTime, and postgresql_database evicts the pool
+	// of a database before dropping it (see evictDBConnection). With
+	// max_idle_connections = 0 no connection is retained, so nothing is left
+	// open to a database that might be dropped later in the plan.
 	db.SetMaxIdleConns(c.MaxIdleConns)
 	if c.MaxIdleConns > 0 {
 		db.SetConnMaxIdleTime(defaultConnMaxIdleTime)

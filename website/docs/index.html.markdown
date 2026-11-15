@@ -13,10 +13,11 @@ The PostgreSQL provider gives the ability to deploy and configure resources in a
 Use the navigation to the left to read about the available resources.
 
 For large configurations, see the [performance tuning
-guide](guides/performance-tuning.html): connection reuse
-(`max_idle_connections`), `binary_parameters` and `catalog_snapshot` can make
-plans and applies with many resources much faster, especially against a remote
-server.
+guide](guides/performance-tuning.html). Connection reuse
+(`max_idle_connections`, `5` by default) and `binary_parameters` (on by
+default) already make plans and applies with many resources much faster,
+especially against a remote server; the guide explains their costs, how to
+turn them off, and further settings such as `catalog_snapshot`.
 
 ## Usage
 
@@ -197,17 +198,21 @@ The following arguments are supported:
   free connection. To limit the connections to the server as a whole, use
   `max_total_connections`.
 * `max_idle_connections` - (Optional) Maximum number of idle connections each
-  pool keeps open for reuse. The default is `0`: every connection is closed as
-  soon as it is returned to the pool, so almost every statement outside a
-  transaction opens a new connection (TCP, TLS and authentication handshake).
-  Setting it above zero reuses connections instead, which makes plans and
-  applies with many resources considerably faster, especially when the server
-  is not close to where Terraform runs. See the
-  [performance tuning guide](guides/performance-tuning.html) for numbers and
-  recommended values. Can also be set with the `PGMAXIDLECONNECTIONS`
-  environment variable.
+  pool keeps open for reuse. The default is `5`. Reusing connections, instead
+  of opening a new one (TCP, TLS and authentication handshake) for almost
+  every statement, makes plans and applies with many resources considerably
+  faster, especially when the server is not close to where Terraform runs. See
+  the [performance tuning guide](guides/performance-tuning.html) for numbers
+  and recommended values. Can also be set with the `PGMAXIDLECONNECTIONS`
+  environment variable; a value set in the provider block takes precedence.
 
-  Things to know when it is enabled:
+  Set it to `0` (or `PGMAXIDLECONNECTIONS=0`) to close every connection as
+  soon as it is returned to the pool, which was the default before it changed
+  to `5`. That is the setting to use when scripts or other tools drop, rename
+  or copy databases the provider works in while Terraform runs, or when the
+  server has no room for the extra idle sessions described below.
+
+  Things to know when it is above zero (as by default):
 
   * The limit applies per pool, so per database, not in total. Idle
     connections are closed after 30 seconds without use, and when they reach
@@ -240,7 +245,8 @@ The following arguments are supported:
   variable.
 
   Use it to bound the sessions a configuration with many databases opens,
-  for example with `max_idle_connections` above zero. Set it to at least
+  since every pool keeps up to `max_idle_connections` (`5` by default) idle
+  connections. Set it to at least
   Terraform's `-parallelism` plus the number of databases the provider
   connects to (the provider's `database` plus every database named in a
   resource): with `-parallelism=10` and 4 databases with resources, at least
@@ -265,17 +271,21 @@ The following arguments are supported:
 * `conn_max_lifetime_seconds` - (Optional) Maximum lifetime of a connection,
   in seconds. Older connections are closed instead of being reused (a running
   statement is not interrupted). The default is `0`. Zero means unlimited.
-* `binary_parameters` - (Optional) If set to `true`, adds `binary_parameters=yes`
-  to the connection string. The driver ([`lib/pq`][libpq]) then sends each
-  statement that has bind parameters (almost every query the provider runs) in
-  a single round-trip instead of two (a separate prepare step followed by the
-  execution). The number of statements and connections does not change; only
-  the round-trips per statement do, so it mostly helps when the database is far
-  from where Terraform runs. Despite its name, only `[]byte` parameters are sent
-  in binary format, which the provider does not use; all other parameters and
-  all results are still sent as text. Works with every `scheme`. Can also be
-  set with the `PGBINARYPARAMETERS` environment variable. The default is
-  `false`.
+* `binary_parameters` - (Optional) If `true` (the default), adds
+  `binary_parameters=yes` to the connection string. The driver
+  ([`lib/pq`][libpq]) then sends each statement that has bind parameters
+  (almost every query the provider runs) in a single round-trip instead of two
+  (a separate prepare step followed by the execution). The number of
+  statements and connections does not change; only the round-trips per
+  statement do, so it mostly helps when the database is far from where
+  Terraform runs. Despite its name, only `[]byte` parameters are sent in
+  binary format, which the provider does not use; all other parameters and all
+  results are still sent as text. Works with every `scheme` and adds no
+  requirement on a connection pooler in front of the server. Set it to `false`
+  (or `PGBINARYPARAMETERS=false`) to prepare each statement in a separate
+  round-trip, which was the default before it changed to `true`. Can also be
+  set with the `PGBINARYPARAMETERS` environment variable; a value set in the
+  provider block takes precedence. The default is `true`.
 * `expected_version` - (Optional) The PostgreSQL version of the server, as a
   version number such as `16`, `15.4` or `9.6.24`. By default (`9.0.0`) the
   provider detects the version with `SELECT version()` on each new pool and
