@@ -76,6 +76,13 @@ resource "postgresql_grant" "read_insert_column" {
   outside of Terraform does not make the `REVOKE` fail. When none of them
   exists any more there is nothing to revoke and the grant is simply removed.
   Granting on a listed object that does not exist still fails.
+* **Objects owned by a superuser, with a non-superuser provider:** a
+  superuser role cannot be granted to the provider's role, so the provider
+  runs the `GRANT`/`REVOKE` itself. That needs the managed privileges `WITH
+  GRANT OPTION` on every target object (and `USAGE` on the schema of schema
+  objects); without it the apply fails with an error saying so. Earlier
+  versions ran the statement anyway, and PostgreSQL ignored it with only a
+  warning: the apply succeeded without granting anything.
 * Privileges are read with a single statement per resource, outside of a
   transaction.
 

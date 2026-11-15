@@ -6,6 +6,7 @@ import (
 	"database/sql/driver"
 	"errors"
 	"io"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -25,6 +26,8 @@ type sessionRoleDriver struct {
 	// failGrant makes every GRANT statement fail like a GRANT of a role
 	// without ADMIN OPTION on PostgreSQL 16+.
 	failGrant bool
+	// superRoles are other roles reported as superusers.
+	superRoles []string
 }
 
 func (d *sessionRoleDriver) Open(string) (driver.Conn, error) {
@@ -79,6 +82,7 @@ func (c *sessionRoleConn) QueryContext(_ context.Context, query string, args []d
 	c.driver.record(query)
 	c.driver.mu.Lock()
 	superuser := c.driver.superuser
+	superRoles := c.driver.superRoles
 	c.driver.mu.Unlock()
 
 	switch {
@@ -88,12 +92,12 @@ func (c *sessionRoleConn) QueryContext(_ context.Context, query string, args []d
 		return &sessionRoleRows{cols: []string{"rolsuper"}, rows: [][]driver.Value{{superuser}}}, nil
 	case strings.Contains(query, "rolname = ANY($1)"):
 		// Answer for every role named in the array argument: "admin" is the
-		// login role, any other role is a plain role.
+		// login role, any other role is a plain role unless in superRoles.
 		names := strings.Split(strings.Trim(args[0].Value.(string), "{}"), ",")
 		rows := make([][]driver.Value, 0, len(names))
 		for _, name := range names {
 			name = strings.Trim(name, `"`)
-			rows = append(rows, []driver.Value{name, name == "admin" && superuser})
+			rows = append(rows, []driver.Value{name, (name == "admin" && superuser) || slices.Contains(superRoles, name)})
 		}
 		return &sessionRoleRows{cols: []string{"rolname", "rolsuper"}, rows: rows}, nil
 	case strings.Contains(query, "information_schema.columns"):

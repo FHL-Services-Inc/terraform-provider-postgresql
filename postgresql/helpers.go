@@ -232,6 +232,18 @@ func withRolesGrantedOrDirect(db *DBConnection, txn *sql.Tx, roles []string, dir
 			return err
 		}
 		if superuser {
+			// Without the membership, the GRANT/REVOKE of a caller that can
+			// grant directly would only raise a WARNING and change nothing
+			// unless the current user holds the privileges WITH GRANT
+			// OPTION: let directGrant decide (#114).
+			if directGrant != nil {
+				blocked = append(blocked, blockedRole{
+					role:      role,
+					reason:    fmt.Sprintf("%s is a superuser and cannot be granted to %s", pq.QuoteIdentifier(role), pq.QuoteIdentifier(currentUser)),
+					superuser: true,
+				})
+				continue
+			}
 			log.Printf("withRolesGranted: WARN role %s could not be granted to current user (%s) as it's a superuser", role, currentUser)
 			continue
 		}
