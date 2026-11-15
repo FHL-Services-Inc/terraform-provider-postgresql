@@ -39,4 +39,19 @@ resource "postgresql_security_label" "workload" {
 
 ## Import
 
-Security label is an attribute that can be added multiple times, so no import is needed, simply apply again.
+`postgresql_security_label` can be imported using the resource ID,
+`<label_provider>.<object_type>.<object_name>`, with `object_type` in any case
+(`role` or `ROLE`); it is stored in lower case. As provider and object names
+may contain `.` themselves, the provider resolves the ID against the existing
+security labels in `pg_seclabels`; the import fails if no split of the ID
+matches a label, or if more than one does.
+
+```hcl
+import {
+  to = postgresql_security_label.workload
+  id = "pgaadauth.role.my_role"
+}
+```
+
+Applying the configuration again also adopts an existing label, as setting a
+security label replaces the previous one.
