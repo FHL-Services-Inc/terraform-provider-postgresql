@@ -1,1 +1,210 @@
-See [Github releases](https://github.com/cyrilgdn/terraform-provider-postgresql/releases/)
+# Changelog
+
+All notable changes to this fork
+([FHL-Services-Inc/terraform-provider-postgresql](https://github.com/FHL-Services-Inc/terraform-provider-postgresql))
+are documented in this file. The format is based on
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Numbers refer to pull
+requests and issues in this repository.
+
+Releases up to v1.27.0 were made upstream; see the
+[upstream releases](https://github.com/cyrilgdn/terraform-provider-postgresql/releases/).
+
+## [Unreleased]
+
+### Upgrade notes
+
+These changes can show up as a diff or an error on the first plan or apply after
+upgrading. Each one fixes behavior that was silently wrong before.
+
+- **`postgresql_grant` on superuser-owned objects fails without `WITH GRANT OPTION`**
+  (#201, #114). With a non-superuser provider, a grant on objects owned by a
+  superuser (a schema created `AUTHORIZATION postgres`, `public` before
+  PostgreSQL 15, a database owned by `postgres`) now fails unless the provider
+  holds the managed privileges `WITH GRANT OPTION`. Before, PostgreSQL ignored
+  the statement with a warning and the apply succeeded without granting
+  anything.
+- **Removing a schema `policy` revokes the privilege itself** (#200, #184). A
+  policy held `WITH GRANT OPTION` used to lose only the grant option; the role
+  now loses `USAGE`/`CREATE`. Removing every `policy` block still revokes
+  nothing (`policy` is optional and computed).
+- **`postgresql_grant` with `object_type = "table"` and empty `objects`** also
+  covers views, materialized views, partitioned and foreign tables (#141, #116),
+  which is what `GRANT ... ON ALL TABLES IN SCHEMA` grants. The first plan can
+  show changes for such relations created after the grant.
+- **Default ACLs are read for objects that were never granted on** (#95, #77):
+  a NULL ACL now reads as the built-in default instead of "no privileges". For
+  example, a `role = "public"`, `privileges = []` grant on functions shows drift
+  when a new function (which gets `EXECUTE` for `PUBLIC` by default) appears.
+- **Function grants check signatures and routine kinds on refresh** (#73, #63,
+  #78): an out-of-band `REVOKE EXECUTE` on a listed signature now shows as
+  drift.
+- **Grant drift stays visible across refreshes** (#101, #76). When the covered
+  objects have different privileges, the plan marks the entries
+  (`"X (on some objects only)"`) instead of showing one object's set.
+- **Destroying a global `postgresql_default_privileges` restores the built-in
+  defaults** for the owner itself, and for `PUBLIC` on functions, routines and
+  types (#191, #182), instead of leaving them without privileges on new
+  objects. Keep a resource with `privileges = []` to keep them revoked.
+- **`postgresql_role.roles` applies only the added and removed roles** (#104,
+  #93). A membership granted outside Terraform after the last refresh survives
+  an update.
+- **Deleting a role reassigns and drops its owned objects in every database**
+  of the cluster, not only in the provider's database (#175, #137).
+- **Role passwords, database options and publication names containing `\` are
+  stored exactly as configured** (#72, #65). A password with a backslash takes
+  effect the next time it is written; anyone who logged in with the doubled
+  backslash form needs to switch to the configured value.
+- **An explicit `aws_rds_iam_region` takes precedence** over the region of
+  `aws_rds_iam_profile` and the environment (#195, #143). Before, it was ignored
+  whenever a profile was set.
+- **`database = ""` on `postgresql_grant` is rejected at plan time** (#174,
+  #136) instead of failing at apply.
+- **A failed `postgresql_role` update keeps the previous state** (#176, #119).
+
+### Added
+
+- Opt-in performance settings, documented in the new
+  [performance tuning guide](website/docs/guides/performance-tuning.html.markdown)
+  (#153, #162):
+  - `max_idle_connections` / `PGMAXIDLECONNECTIONS`: reuse connections instead
+    of reconnecting for every statement (#17, #7, #23). Idle pools are evicted
+    before a database rename or template copy, and idle connections close after
+    30 s (#55, #24).
+  - `binary_parameters` / `PGBINARYPARAMETERS`: one round-trip per
+    parameterized statement (#45, #36).
+  - `catalog_snapshot` / `PGCATALOGSNAPSHOT` (and `catalog_snapshot_ttl_seconds`): read
+    `postgresql_grant` and `postgresql_default_privileges` from one catalog
+    snapshot per database (#98, #67).
+  - `max_total_connections` / `PGMAXTOTALCONNECTIONS`: one limit for the
+    connections across all database pools (#185, #57).
+- Import for `postgresql_grant`, `postgresql_default_privileges` and
+  `postgresql_grant_role` (#83, #69), `postgresql_user_mapping` (#168, #166),
+  `postgresql_server` by name (#188, #124) and `postgresql_security_label`
+  (#197, #189).
+- `postgresql_user_mapping` supports `CURRENT_USER`, `CURRENT_ROLE` and `USER`
+  (#170, #167) and reads back mappings for `PUBLIC` (#165, #121, #150).
+- `statement_timeout` and `idle_in_transaction_session_timeout` on
+  `postgresql_role` accept time units (#172, #120).
+- RDS IAM and Azure AD tokens are refreshed for every new connection instead
+  of once per provider run (#81, #13).
+
+### Performance
+
+With the default settings, a plan of the benchmark configuration (1,143
+resources, 10 ms round-trip time) went from 39.9 s to 14.6 s; with
+`max_idle_connections`, `binary_parameters` and `catalog_snapshot` it takes
+2.4 s (#33).
+
+- `postgresql_grant` and `postgresql_default_privileges` are read with one
+  statement, without a transaction or read lock (#51, #38, #52); the `objects`
+  filter of table, sequence and function grants runs in SQL (#61, #59).
+- Single-statement Reads run without an explicit transaction (#39, #37, #43),
+  as do publication and subscription Reads (#50, #44).
+- Fewer catalog round-trips for role checks: role existence and OID in one
+  query, batched superuser checks (#15, #9), session user and `rolsuper`
+  memoized per pool (#54, #47).
+- Fixed a regression from v1.28.0 where reading a table grant with `objects`
+  expanded the ACLs of every relation in the database (#40, #35).
+
+### Fixed
+
+- **Concurrency and locking**
+  - `postgresql_database` owner handling runs on a single connection: no more
+    deadlock with a small `max_connections` (#41, #31).
+  - Role advisory locks are taken in one statement ordered by OID, so roles
+    that share members no longer deadlock (#112, #111).
+  - Grant writes lock the granted objects: parallel grants on the same objects
+    wait instead of failing with `tuple concurrently updated`; grants no longer
+    lock members of the grantee (#99, #26, #53).
+  - Cross-database membership changes (owner changes, temporary memberships)
+    are serialized (#144, #25), also for `postgresql_database` (#178, #152).
+- **Grants**
+  - Owners of the granted objects (sequences, functions, views, foreign tables)
+    are looked up instead of only table owners; `rows.Err()` is checked
+    (#48, #32).
+  - Owners the provider cannot become a member of (PostgreSQL 16+, indirect
+    reverse membership) are handled (#179, #132, #133).
+  - Database grants take the database owner and run on the maintenance
+    database (#147, #113, #169, #148).
+  - Removing a table, sequence or column grant no longer fails when some of the
+    listed relations were dropped outside Terraform (#198, #115).
+- **`postgresql_grant_role`**: the read picks the membership row granted by
+  the current user, or by the bootstrap superuser for superuser providers, on
+  PostgreSQL 16+ (#146, #138, #163, #151).
+- **`postgresql_default_privileges`**: a global entry equal to the built-in
+  defaults no longer fails with "inconsistent result after apply" (#177, #117).
+- **`postgresql_database`**
+  - Changing the owner of a database owned by another role works for a
+    non-superuser provider (#49, #42); the new owner is granted before
+    `REASSIGN OWNED` (#142, #131).
+  - `encoding`, `lc_collate`, `lc_ctype` and `tablespace_name` set to
+    `DEFAULT` no longer replace or update the database on every plan (#173,
+    #128).
+  - Deleting the provider's own database no longer closes the pool the other
+    resources run on (#164, #149).
+- **`postgresql_schema`**: owner change and rename take the needed memberships
+  for a non-superuser provider; `pg_database_owner` is resolved to the
+  database owner (#194, #118, #183).
+- **`postgresql_publication`**: name and owner are quoted; the imported ID
+  keeps the name (#186, #122, #123).
+- **`postgresql_server`**: option values containing `=` are read back intact
+  (#196, #190).
+- **`postgresql_function`**: argument defaults and types containing commas are
+  read from the catalog; IDs are parsed up to the argument list, so argument
+  types can be schema-qualified (#192, #126, #127).
+- **Data sources**: `postgresql_tables` and `postgresql_sequences` read from
+  `pg_class` (#187, #125, #139); pattern filters are bound instead of
+  interpolated (#75, #74).
+- **Connection**: user names with `:`, IPv6 hosts and password redaction in
+  the DSN (#171, #129, #130, #135); the server version is read from
+  `server_version_num`, so versions such as `13.23-rds` parse (#180, #140).
+
+### Documentation
+
+- Performance tuning guide: connection reuse, connection limits, binary
+  parameters, catalog snapshot, configuration layout and benchmark numbers
+  (#153, #162).
+
+### Tests and CI
+
+- Acceptance tests are sharded; pull requests run PostgreSQL 12, 16 and 18,
+  `main`, nightly runs and the `full-matrix` label run 12–18 (#157, #156).
+- Reproducible large-plan benchmark in `tests/bench` (#34, #18, #58).
+- Local acceptance runs with Apple `container` and stock PostgreSQL images
+  (#80, #28); `make lint` pinned to the CI linter version (#30, #29).
+- Test isolation: unique names for cluster-wide objects, no default privileges
+  left in `postgres`, shared database teardown (#106, #86, #110, #109, #155,
+  #154).
+- The remove-waiting-response workflow no longer fails when the label is
+  absent (#161, #159).
+
+## [1.28.0] - 2026-11-13
+
+First release from this fork.
+
+### Changed
+
+- Redundant `Exists` callbacks removed; resources detect objects that are gone
+  in `Read` (#2).
+- Fewer round-trips in the `postgresql_database` and `postgresql_grant_role`
+  Reads (#3).
+- The `objects` filter of table and sequence grants runs in SQL (#4).
+
+### Fixed
+
+- `postgresql_physical_replication_slot`: slots dropped outside Terraform are
+  detected (#2).
+
+### Added
+
+- Terraform Registry manifest (#1), release signing key (#5) and release
+  workflow permissions (#6).
+
+### Upstream changes since v1.27.0
+
+- `postgresql_replication_slot` no longer uses a transaction, so it works on a
+  replica (cyrilgdn/terraform-provider-postgresql#648).
+- Connection retry logic (cyrilgdn/terraform-provider-postgresql#576).
+
+[Unreleased]: https://github.com/FHL-Services-Inc/terraform-provider-postgresql/compare/v1.28.0...HEAD
+[1.28.0]: https://github.com/FHL-Services-Inc/terraform-provider-postgresql/compare/v1.27.0...v1.28.0
