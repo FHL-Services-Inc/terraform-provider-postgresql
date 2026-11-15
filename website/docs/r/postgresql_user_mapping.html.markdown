@@ -61,3 +61,20 @@ Changing this value
   user mapping, even to the owner of the server. In that case the provider
   keeps the options from the Terraform state, so changes made to them outside
   of Terraform are not detected.
+
+## Import
+
+`postgresql_user_mapping` can be imported using the resource ID,
+`<user_name>.<server_name>`. For the PUBLIC mapping, use `public` or `PUBLIC`
+as `<user_name>`, spelled as in your configuration. As role and server names
+may contain `.` themselves, the provider resolves the ID against the existing
+user mappings; the import fails if no split of the ID matches a mapping, or if
+more than one does. When the provider connects as a non-superuser, the options
+of another role's mapping are not visible, so they are not imported.
+
+```hcl
+import {
+  to = postgresql_user_mapping.remote
+  id = "remote.myserver_postgres"
+}
+```
