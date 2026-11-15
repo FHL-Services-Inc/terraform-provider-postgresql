@@ -1111,3 +1111,80 @@ resource "postgresql_database" "quoted" {
 		},
 	})
 }
+
+// TestAccPostgresqlDatabase_DefaultLocale creates a database with encoding,
+// lc_collate, lc_ctype and tablespace_name set to "DEFAULT". Read stores the
+// real values the server picked, so without diff suppression the next plan
+// replaces the database (encoding/lc_* are ForceNew) and tries to update the
+// tablespace. The test framework fails the step if the plan after apply is
+// not empty; the second step re-plans the same config explicitly.
+func TestAccPostgresqlDatabase_DefaultLocale(t *testing.T) {
+	const dbName = "tf_tests_db_default_locale"
+	config := fmt.Sprintf(`
+resource "postgresql_database" "d" {
+  name            = %q
+  template        = "DEFAULT"
+  encoding        = "DEFAULT"
+  lc_collate      = "DEFAULT"
+  lc_ctype        = "default"
+  tablespace_name = "DEFAULT"
+}
+`, dbName)
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:     func() { testAccPreCheck(t) },
+		Providers:    testAccProviders,
+		CheckDestroy: testAccCheckPostgresqlDatabaseDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config: config,
+				Check: resource.ComposeTestCheckFunc(
+					testAccCheckPostgresqlDatabaseExists("postgresql_database.d"),
+					// State keeps what the server actually picked.
+					resource.TestCheckResourceAttrSet("postgresql_database.d", "encoding"),
+					resource.TestCheckResourceAttrSet("postgresql_database.d", "lc_collate"),
+					resource.TestCheckResourceAttrSet("postgresql_database.d", "lc_ctype"),
+					resource.TestCheckResourceAttr("postgresql_database.d", "tablespace_name", "pg_default"),
+				),
+			},
+			{
+				Config:   config,
+				PlanOnly: true,
+			},
+		},
+	})
+}
+
+func TestSuppressDatabaseDefault(t *testing.T) {
+	cases := []struct {
+		old, new string
+		want     bool
+	}{
+		{"UTF8", "DEFAULT", true},
+		{"en_US.utf8", "default", true},
+		{"", "DEFAULT", false}, // create: nothing to compare with yet
+		{"UTF8", "LATIN1", false},
+		{"UTF8", "UTF8", false}, // equal values have no diff to suppress
+	}
+	for _, c := range cases {
+		if got := suppressDatabaseDefault("", c.old, c.new, nil); got != c.want {
+			t.Errorf("suppressDatabaseDefault(%q, %q) = %v, want %v", c.old, c.new, got, c.want)
+		}
+	}
+
+	tsCases := []struct {
+		old, new string
+		want     bool
+	}{
+		{"pg_default", "DEFAULT", true},
+		{"pg_default", "default", true},
+		{"", "DEFAULT", false},
+		{"my_ts", "DEFAULT", false}, // a real move back to pg_default
+		{"pg_default", "my_ts", false},
+	}
+	for _, c := range tsCases {
+		if got := suppressDatabaseDefaultTablespace("", c.old, c.new, nil); got != c.want {
+			t.Errorf("suppressDatabaseDefaultTablespace(%q, %q) = %v, want %v", c.old, c.new, got, c.want)
+		}
+	}
+}

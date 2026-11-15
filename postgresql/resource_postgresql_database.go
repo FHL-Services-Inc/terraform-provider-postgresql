@@ -57,31 +57,35 @@ func resourcePostgreSQLDatabase() *schema.Resource {
 				Description: "The name of the template from which to create the new database",
 			},
 			dbEncodingAttr: {
-				Type:        schema.TypeString,
-				Optional:    true,
-				Computed:    true,
-				ForceNew:    true,
-				Description: "Character set encoding to use in the new database",
+				Type:             schema.TypeString,
+				Optional:         true,
+				Computed:         true,
+				ForceNew:         true,
+				DiffSuppressFunc: suppressDatabaseDefault,
+				Description:      "Character set encoding to use in the new database",
 			},
 			dbCollationAttr: {
-				Type:        schema.TypeString,
-				Optional:    true,
-				Computed:    true,
-				ForceNew:    true,
-				Description: "Collation order (LC_COLLATE) to use in the new database",
+				Type:             schema.TypeString,
+				Optional:         true,
+				Computed:         true,
+				ForceNew:         true,
+				DiffSuppressFunc: suppressDatabaseDefault,
+				Description:      "Collation order (LC_COLLATE) to use in the new database",
 			},
 			dbCTypeAttr: {
-				Type:        schema.TypeString,
-				Optional:    true,
-				Computed:    true,
-				ForceNew:    true,
-				Description: "Character classification (LC_CTYPE) to use in the new database",
+				Type:             schema.TypeString,
+				Optional:         true,
+				Computed:         true,
+				ForceNew:         true,
+				DiffSuppressFunc: suppressDatabaseDefault,
+				Description:      "Character classification (LC_CTYPE) to use in the new database",
 			},
 			dbTablespaceAttr: {
-				Type:        schema.TypeString,
-				Optional:    true,
-				Computed:    true,
-				Description: "The name of the tablespace that will be associated with the new database",
+				Type:             schema.TypeString,
+				Optional:         true,
+				Computed:         true,
+				DiffSuppressFunc: suppressDatabaseDefaultTablespace,
+				Description:      "The name of the tablespace that will be associated with the new database",
 			},
 			dbConnLimitAttr: {
 				Type:         schema.TypeInt,
@@ -627,6 +631,22 @@ func setAlterOwnership(db *DBConnection, d *schema.ResourceData) error {
 	return nil
 }
 
+// suppressDatabaseDefault suppresses the diff between "DEFAULT" in the config
+// and the value the server actually picked for encoding, lc_collate and
+// lc_ctype. CREATE DATABASE resolves DEFAULT from the template and Read stores
+// the real value, so without this the database would be replaced on every
+// plan. An empty old value means the database does not exist yet.
+func suppressDatabaseDefault(_, old, new string, _ *schema.ResourceData) bool {
+	return strings.EqualFold(new, "DEFAULT") && old != ""
+}
+
+// suppressDatabaseDefaultTablespace suppresses the diff between
+// tablespace_name = "DEFAULT" and the pg_default tablespace Read stores for it.
+// Any other tablespace in state is a real change back to the default.
+func suppressDatabaseDefaultTablespace(_, old, new string, _ *schema.ResourceData) bool {
+	return strings.EqualFold(new, "DEFAULT") && old == "pg_default"
+}
+
 func setDBTablespace(db QueryAble, d *schema.ResourceData) error {
 	if !d.HasChange(dbTablespaceAttr) {
 		return nil
@@ -634,12 +654,12 @@ func setDBTablespace(db QueryAble, d *schema.ResourceData) error {
 
 	tbspName := d.Get(dbTablespaceAttr).(string)
 	dbName := d.Get(dbNameAttr).(string)
-	var sql string
-	if tbspName == "" || strings.ToUpper(tbspName) == "DEFAULT" {
-		sql = fmt.Sprintf("ALTER DATABASE %s RESET TABLESPACE", pq.QuoteIdentifier(dbName))
-	} else {
-		sql = fmt.Sprintf("ALTER DATABASE %s SET TABLESPACE %s", pq.QuoteIdentifier(dbName), pq.QuoteIdentifier(tbspName))
+	// ALTER DATABASE has no RESET TABLESPACE (RESET only takes configuration
+	// parameters), so moving back to the default means pg_default.
+	if tbspName == "" || strings.EqualFold(tbspName, "DEFAULT") {
+		tbspName = "pg_default"
 	}
+	sql := fmt.Sprintf("ALTER DATABASE %s SET TABLESPACE %s", pq.QuoteIdentifier(dbName), pq.QuoteIdentifier(tbspName))
 
 	if _, err := db.Exec(sql); err != nil {
 		return fmt.Errorf("error updating database TABLESPACE: %w", err)
