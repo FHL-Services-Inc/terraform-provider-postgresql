@@ -130,3 +130,56 @@ func generateDataSourceTablesConfig(dbName string) string {
 
 	`, dbName)
 }
+
+// Tables owned by a role the provider user has no privileges on, or is not a
+// member of, must be listed too (the rds profile is the relevant one: a real
+// superuser sees everything in information_schema anyway).
+func TestAccPostgresqlDataSourceTables_otherOwner(t *testing.T) {
+	skipIfNotAcc(t)
+
+	dbSuffix, teardown := setupTestDatabase(t, true, true)
+	defer teardown()
+
+	dbName, roleName := getTestDBNames(dbSuffix)
+	config := getTestConfig(t)
+
+	// The other owner creates its object itself; setupTestDatabase only grants USAGE.
+	dbExecute(t, config.connStr(dbName), fmt.Sprintf("GRANT CREATE ON SCHEMA dev_schema TO %s", roleName))
+	createTestTables(t, dbSuffix, []string{"dev_schema.app_mine"}, "")
+	createTestTables(t, dbSuffix, []string{"dev_schema.app_users"}, roleName)
+	dbExecute(t, config.connStr(dbName), "CREATE VIEW dev_schema.app_view AS SELECT 1 AS one")
+	dbExecute(t, config.connStr(dbName), "CREATE MATERIALIZED VIEW dev_schema.app_matview AS SELECT 1 AS one")
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:  func() { testAccPreCheck(t) },
+		Providers: testAccProviders,
+		Steps: []resource.TestStep{
+			{
+				Config: fmt.Sprintf(`
+				data "postgresql_tables" "all" {
+					database = "%[1]s"
+					schemas  = ["dev_schema"]
+				}
+
+				data "postgresql_tables" "views" {
+					database    = "%[1]s"
+					schemas     = ["dev_schema"]
+					table_types = ["VIEW"]
+				}
+				`, dbName),
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr("data.postgresql_tables.all", "tables.#", "3"),
+					resource.TestCheckResourceAttr("data.postgresql_tables.all", "tables.0.object_name", "app_mine"),
+					resource.TestCheckResourceAttr("data.postgresql_tables.all", "tables.0.table_type", "BASE TABLE"),
+					resource.TestCheckResourceAttr("data.postgresql_tables.all", "tables.1.object_name", "app_users"),
+					resource.TestCheckResourceAttr("data.postgresql_tables.all", "tables.1.schema_name", "dev_schema"),
+					resource.TestCheckResourceAttr("data.postgresql_tables.all", "tables.1.table_type", "BASE TABLE"),
+					resource.TestCheckResourceAttr("data.postgresql_tables.all", "tables.2.object_name", "app_view"),
+					resource.TestCheckResourceAttr("data.postgresql_tables.all", "tables.2.table_type", "VIEW"),
+					resource.TestCheckResourceAttr("data.postgresql_tables.views", "tables.#", "1"),
+					resource.TestCheckResourceAttr("data.postgresql_tables.views", "tables.0.object_name", "app_view"),
+				),
+			},
+		},
+	})
+}
