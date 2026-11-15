@@ -222,11 +222,16 @@ func resourcePostgreSQLFunctionReadImpl(db *DBConnection, d *schema.ResourceData
 		return expandErr
 	}
 
-	var funcDefinition string
+	var (
+		funcDefinition string
+		funcSchema     string
+		funcName       string
+		funcArgs       []byte
+	)
 
-	query := `SELECT pg_get_functiondef(p.oid::regproc) funcDefinition ` +
+	query := `SELECT pg_get_functiondef(p.oid), n.nspname, p.proname, ` + functionArgsQuery + ` ` +
 		`FROM pg_proc p ` +
-		`LEFT JOIN pg_namespace n ON p.pronamespace = n.oid ` +
+		`JOIN pg_namespace n ON p.pronamespace = n.oid ` +
 		`WHERE p.oid = to_regprocedure($1)`
 
 	dbc, err := initConnection(db.client, databaseName)
@@ -239,7 +244,7 @@ func resourcePostgreSQLFunctionReadImpl(db *DBConnection, d *schema.ResourceData
 		return err
 	}
 
-	err = dbc.QueryRow(query, functionSignature).Scan(&funcDefinition)
+	err = dbc.QueryRow(query, functionSignature).Scan(&funcDefinition, &funcSchema, &funcName, &funcArgs)
 	switch {
 	case err == sql.ErrNoRows:
 		log.Printf("[WARN] PostgreSQL function: %s", functionId)
@@ -259,12 +264,31 @@ func resourcePostgreSQLFunctionReadImpl(db *DBConnection, d *schema.ResourceData
 	if err != nil {
 		return err
 	}
+	// pg_get_functiondef quotes the schema and the name where needed.
+	pgFunction.Schema = funcSchema
+	pgFunction.Name = funcName
+	pgFunction.Args, err = parseFunctionArgs(funcArgs)
+	if err != nil {
+		return err
+	}
+
+	// Keep the configured spelling of an argument type when it is the type
+	// read back (numeric(10,2) for numeric, pg_catalog.text for text).
+	configuredArgs, _ := d.Get(funcArgAttr).([]any)
 
 	var args []map[string]any
 
-	for _, a := range pgFunction.Args {
+	for i, a := range pgFunction.Args {
+		argType := a.Type
+		if i < len(configuredArgs) {
+			if configured, ok := configuredArgs[i].(map[string]any); ok {
+				if t, ok := configured[funcArgTypeAttr].(string); ok && sameFunctionArgType(t, a.Type) {
+					argType = t
+				}
+			}
+		}
 		args = append(args, map[string]any{
-			funcArgTypeAttr:    a.Type,
+			funcArgTypeAttr:    argType,
 			funcArgNameAttr:    a.Name,
 			funcArgModeAttr:    a.Mode,
 			funcArgDefaultAttr: a.Default,
@@ -467,46 +491,44 @@ func generateFunctionID(db *DBConnection, d *schema.ResourceData) (string, error
 	return b.String(), nil
 }
 
+// parseFunctionID splits a function ID, database.schema.name(arguments) or
+// schema.name(arguments), into its parts. Only the dots before the argument
+// list separate the parts: argument types can be schema-qualified
+// (public.citext). The database and the schema cannot contain a dot, the
+// function name can (database.schema.my.func(integer)).
+func parseFunctionID(functionId string) (database, schemaName, name, args string, err error) {
+	open := strings.Index(functionId, "(")
+	if open < 0 || !strings.HasSuffix(functionId, ")") {
+		return "", "", "", "", fmt.Errorf("function ID %s has not the expected format 'database.schema.function_name(arguments)'", functionId)
+	}
+	args = functionId[open+1 : len(functionId)-1]
+
+	parts := strings.Split(functionId[:open], ".")
+	switch {
+	case len(parts) == 2:
+		schemaName, name = parts[0], parts[1]
+	case len(parts) > 2:
+		database, schemaName, name = parts[0], parts[1], strings.Join(parts[2:], ".")
+	}
+	if schemaName == "" || name == "" || (len(parts) > 2 && database == "") {
+		return "", "", "", "", fmt.Errorf("function ID %s has not the expected format 'database.schema.function_name(arguments)'", functionId)
+	}
+	return database, schemaName, name, args, nil
+}
+
 func expandFunctionID(functionId string, d *schema.ResourceData, db *DBConnection) (databaseName string, functionSignature string, err error) {
+	databaseName, schemaName, name, args, err := parseFunctionID(functionId)
+	if err != nil {
+		return "", "", err
+	}
 
-	partsCount := strings.Count(functionId, ".") + 1
-
-	if partsCount == 2 {
+	if databaseName == "" {
 		clientDatabaseName := "postgres"
 		if db != nil {
 			clientDatabaseName = db.client.databaseName
 		}
-
-		signature, err := quoteSignature(functionId)
-		if err != nil {
-			return "", "", err
-		}
-
-		return getDatabase(d, clientDatabaseName), signature, nil
+		databaseName = getDatabase(d, clientDatabaseName)
 	}
 
-	if partsCount == 3 {
-		functionIdParts := strings.Split(functionId, ".")
-		signature, err := quoteSignature(strings.Join(functionIdParts[1:], "."))
-		if err != nil {
-			return "", "", err
-		}
-		return functionIdParts[0], signature, nil
-	}
-
-	return "", "", fmt.Errorf("function ID %s has not the expected format 'database.schema.function_name(arguments)'", functionId)
-}
-
-func quoteSignature(s string) (signature string, err error) {
-
-	signatureData := findStringSubmatchMap(`(?si)(?P<Schema>[^\.]+)\.(?P<Name>[^(]+)\((?P<Args>.*)\)`, s)
-
-	schemaName, schemaFound := signatureData["Schema"]
-	name, nameFound := signatureData["Name"]
-	args, argsFound := signatureData["Args"]
-	if schemaFound && nameFound && argsFound {
-		return fmt.Sprintf("%s.%s(%s)", pq.QuoteIdentifier(schemaName), pq.QuoteIdentifier(name), args), nil
-	}
-
-	return "", fmt.Errorf("incorrect signature format \"%s\". The expected format is schema.function_name(arguments)", s)
+	return databaseName, fmt.Sprintf("%s.%s(%s)", pq.QuoteIdentifier(schemaName), pq.QuoteIdentifier(name), args), nil
 }

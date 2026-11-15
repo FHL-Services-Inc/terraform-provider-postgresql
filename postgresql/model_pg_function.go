@@ -1,6 +1,9 @@
 package postgresql
 
 import (
+	"encoding/json"
+	"fmt"
+	"regexp"
 	"strings"
 
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
@@ -109,6 +112,9 @@ func (pgFunction *PGFunction) FromResourceData(d *schema.ResourceData) error {
 	return nil
 }
 
+// Parse reads the attributes of a function from its pg_get_functiondef
+// output. The arguments are not parsed from it: argument defaults and types
+// can contain commas, so they are read from the catalog (functionArgsQuery).
 func (pgFunction *PGFunction) Parse(functionDefinition string) error {
 
 	pgFunctionData := findStringSubmatchMap(
@@ -116,28 +122,11 @@ func (pgFunction *PGFunction) Parse(functionDefinition string) error {
 		functionDefinition,
 	)
 
-	argsData := pgFunctionData["Args"]
-
-	args := []PGFunctionArg{}
-
-	if argsData != "" {
-		rawArgs := strings.Split(argsData, ",")
-		for i := 0; i < len(rawArgs); i++ {
-			var arg PGFunctionArg
-			err := arg.Parse(rawArgs[i])
-			if err != nil {
-				continue
-			}
-			args = append(args, arg)
-		}
-	}
-
 	pgFunction.Schema = pgFunctionData["Schema"]
 	pgFunction.Name = pgFunctionData["Name"]
 	pgFunction.Returns = pgFunctionData["Returns"]
 	pgFunction.Language = pgFunctionData["Language"]
 	pgFunction.Body = pgFunctionData["Body"]
-	pgFunction.Args = args
 	pgFunction.SecurityDefiner = len(pgFunctionData["Security"]) > 0
 	pgFunction.Strict = len(pgFunctionData["Strict"]) > 0
 	if len(pgFunctionData["Volatility"]) == 0 {
@@ -154,27 +143,82 @@ func (pgFunction *PGFunction) Parse(functionDefinition string) error {
 	return nil
 }
 
-func (pgFunctionArg *PGFunctionArg) Parse(functionArgDefinition string) error {
-
-	// Check if default exists
-	argDefinitions := findStringSubmatchMap(`(?si)(?P<ArgData>.*)\sDEFAULT\s(?P<ArgDefault>.*)`, functionArgDefinition)
-
-	argData := functionArgDefinition
-	if len(argDefinitions) > 0 {
-		argData = argDefinitions["ArgData"]
-		pgFunctionArg.Default = argDefinitions["ArgDefault"]
-	}
-
-	pgFunctionArgData := findStringSubmatchMap(`(?si)((?P<Mode>IN|OUT|INOUT|VARIADIC)\s)?(?P<Name>[^\s]+)\s(?P<Type>.*)`, argData)
-
-	pgFunctionArg.Name = pgFunctionArgData["Name"]
-	pgFunctionArg.Type = pgFunctionArgData["Type"]
-	pgFunctionArg.Mode = pgFunctionArgData["Mode"]
-	if pgFunctionArg.Mode == "" {
-		pgFunctionArg.Mode = "IN"
-	}
-	return nil
+// catalogFunctionArg is one argument as read from pg_proc by
+// functionArgsQuery.
+type catalogFunctionArg struct {
+	Name    string  `json:"name"`
+	Mode    string  `json:"mode"`
+	Type    string  `json:"type"`
+	Default *string `json:"default"`
 }
+
+// functionArgsQuery lists the arguments of the function p from the catalog as
+// a JSON array, so nothing has to be split out of the function definition.
+// The default of each argument comes from pg_get_function_arg_default, the
+// same function information_schema.parameters uses. Types are formatted like
+// pg_get_functiondef does (format_type), names quoted like it (quote_ident).
+// Arguments of a RETURNS TABLE clause (mode 't') are not arguments.
+const functionArgsQuery = `COALESCE((` +
+	`SELECT json_agg(json_build_object(` +
+	`'name', COALESCE(quote_ident(NULLIF(a.name, '')), ''), ` +
+	`'mode', COALESCE(a.mode, 'i'), ` +
+	`'type', format_type(a.typ, NULL), ` +
+	`'default', pg_get_function_arg_default(p.oid, a.n::int)) ORDER BY a.n) ` +
+	`FROM unnest(COALESCE(p.proallargtypes, p.proargtypes::oid[]), p.proargmodes::text[], p.proargnames) ` +
+	`WITH ORDINALITY AS a(typ, mode, name, n) ` +
+	`WHERE COALESCE(a.mode, 'i') <> 't'` +
+	`), '[]')`
+
+var functionArgModes = map[string]string{
+	"i": "IN",
+	"o": "OUT",
+	"b": "INOUT",
+	"v": "VARIADIC",
+}
+
+// parseFunctionArgs decodes the result of functionArgsQuery.
+func parseFunctionArgs(data []byte) ([]PGFunctionArg, error) {
+	var raw []catalogFunctionArg
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return nil, fmt.Errorf("could not decode function arguments: %w", err)
+	}
+	args := make([]PGFunctionArg, 0, len(raw))
+	for _, a := range raw {
+		mode, ok := functionArgModes[a.Mode]
+		if !ok {
+			return nil, fmt.Errorf("unknown function argument mode %q", a.Mode)
+		}
+		arg := PGFunctionArg{Name: a.Name, Mode: mode, Type: a.Type}
+		if a.Default != nil {
+			arg.Default = *a.Default
+		}
+		args = append(args, arg)
+	}
+	return args, nil
+}
+
+// sameFunctionArgType reports whether the configured argument type is the
+// type PostgreSQL reports back. PostgreSQL drops type modifiers of function
+// arguments (numeric(10,2) is stored as numeric) and prints a type without
+// its schema when the schema is in the search_path (pg_catalog.text is
+// printed as text), so these spellings are kept rather than replaced on every
+// plan.
+func sameFunctionArgType(configured, read string) bool {
+	if strings.EqualFold(configured, read) {
+		return true
+	}
+	t := functionArgTypmod.ReplaceAllString(configured, "")
+	if strings.EqualFold(t, read) {
+		return true
+	}
+	if i := strings.Index(t, "."); i >= 0 && !strings.ContainsAny(t[:i], `"(`) {
+		return strings.EqualFold(t[i+1:], read)
+	}
+	return false
+}
+
+// functionArgTypmod matches a type modifier such as (10,2) in numeric(10,2).
+var functionArgTypmod = regexp.MustCompile(`\s*\([^()]*\)`)
 
 func normalizeFunctionBody(body string) string {
 	newBodyMap := findStringSubmatchMap(`(?si).*\$[a-zA-Z]*\$\s(?P<Body>.*)\s\$[a-zA-Z]*\$.*`, body)
