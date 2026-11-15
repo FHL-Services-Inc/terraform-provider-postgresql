@@ -486,8 +486,14 @@ func resourcePostgreSQLRoleDelete(db *DBConnection, d *schema.ResourceData) erro
 
 // reassignAndDropOwned gives the objects role owns in the database of txn (and
 // the shared objects it owns) to the provider user, then drops the privileges
-// role still holds there. The caller holds pgLockRole on txn.
+// role still holds there. The caller holds pgLockRole on txn. Like a database
+// owner change, it takes the REASSIGN OWNED key of the database exclusively,
+// after the role lock and before the membership locks of withRolesGranted
+// (see grant_locks.go, #181).
 func reassignAndDropOwned(db *DBConnection, txn *sql.Tx, role string) error {
+	if _, err := txn.Exec("SELECT " + reassignOwnedLockKey(false).call()); err != nil {
+		return fmt.Errorf("could not get the REASSIGN OWNED lock: %w", err)
+	}
 	return withRolesGranted(db, txn, []string{role}, func() error {
 		currentUser := db.client.config.getDatabaseUsername()
 		if _, err := txn.Exec(fmt.Sprintf("REASSIGN OWNED BY %s TO %s", pq.QuoteIdentifier(role), pq.QuoteIdentifier(currentUser))); err != nil {

@@ -609,6 +609,15 @@ func setAlterOwnership(db *DBConnection, d *schema.ResourceData) error {
 		defer deferredRollback(reassignTxn)
 	}
 
+	// Grant and default privileges writes in dbName take the REASSIGN OWNED
+	// key shared before they read the owners of their objects: they either
+	// commit before REASSIGN OWNED or see its new owners (#181). It is taken
+	// before the membership locks below, in the global lock order (see
+	// grant_locks.go).
+	if err := lockReassignOwned(conn, reassignTxn); err != nil {
+		return err
+	}
+
 	// See createDatabase (#152).
 	unlock := lockDatabaseMemberships(currentOwner, newOwner)
 	defer unlock()
@@ -666,6 +675,32 @@ func suppressDatabaseDefault(_, old, new string, _ *schema.ResourceData) bool {
 // Any other tablespace in state is a real change back to the default.
 func suppressDatabaseDefaultTablespace(_, old, new string, _ *schema.ResourceData) bool {
 	return strings.EqualFold(new, "DEFAULT") && old == "pg_default"
+}
+
+// lockReassignOwned takes the REASSIGN OWNED key of the database exclusively:
+// in reassignTxn when REASSIGN OWNED runs on a connection to the database, or
+// else on the session of conn, which is connected to it and releases its
+// advisory locks with pg_advisory_unlock_all (lockRoleConn).
+// statement_timeout is disabled while it waits.
+func lockReassignOwned(conn *singleConn, reassignTxn *sql.Tx) error {
+	key := reassignOwnedLockKey(false)
+	if reassignTxn != nil {
+		// beginReassignTxn disabled statement_timeout in reassignTxn.
+		if _, err := reassignTxn.Exec("SELECT " + key.call()); err != nil {
+			return fmt.Errorf("could not get the REASSIGN OWNED lock: %w", err)
+		}
+		return nil
+	}
+	if _, err := conn.Exec("SET statement_timeout = 0"); err != nil {
+		return fmt.Errorf("could not disable statement_timeout: %w", err)
+	}
+	if _, err := conn.Exec(fmt.Sprintf("SELECT pg_advisory_lock(%d, %d)", key.namespace, key.key)); err != nil {
+		return fmt.Errorf("could not get the REASSIGN OWNED lock: %w", err)
+	}
+	if _, err := conn.Exec("RESET statement_timeout"); err != nil {
+		return fmt.Errorf("could not restore statement_timeout: %w", err)
+	}
+	return nil
 }
 
 // beginReassignTxn starts the transaction REASSIGN OWNED runs in.
