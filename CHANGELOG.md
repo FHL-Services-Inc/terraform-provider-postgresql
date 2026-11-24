@@ -20,6 +20,16 @@ Releases up to v1.27.0 were made upstream; see the
   and with the default `connect_timeout` of 180 s. `connect_timeout` limits
   each attempt again, and the retry timeout only decides whether a new attempt
   may start; it plays no part with `max_conn_retries = 0`, the default (#216).
+- **Extension members in grants on all objects of a schema**: with
+  `objects` empty, the tables, sequences and routines that belong to an
+  extension installed in the schema are left out of `postgresql_grant`
+  (#217). With a non-superuser provider such a grant failed since v1.29.0
+  when the members belong to a superuser, as `pg_stat_statements` does on
+  Amazon RDS (`rdsadmin`): "is a superuser and cannot be granted". Their
+  privileges are no longer read, so they do not show as drift, and when the
+  schema holds members the `GRANT` and `REVOKE` list the other objects
+  instead of using `ON ALL ... IN SCHEMA`. List an extension member in
+  `objects` to manage its privileges.
 
 ## [1.29.0] - 2026-11-15
 
