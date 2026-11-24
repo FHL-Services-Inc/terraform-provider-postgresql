@@ -15,7 +15,6 @@ import (
 	"time"
 
 	"github.com/blang/semver"
-	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/retry"
 	"github.com/lib/pq"
 	"gocloud.dev/gcp"
 	"gocloud.dev/gcp/cloudsql"
@@ -488,65 +487,96 @@ func (c *Config) evictDBConnection(database string) bool {
 	return true
 }
 
+// connectRetryInitialBackoff and connectRetryMaxBackoff bound the wait
+// between two connection attempts: it starts at the initial value and doubles
+// after each failed attempt, up to the maximum.
+var (
+	connectRetryInitialBackoff = 500 * time.Millisecond
+	connectRetryMaxBackoff     = 10 * time.Second
+)
+
 // connectWithRetry opens a connection to dsn, retrying transient failures up
-// to c.config.MaxConnRetries times or until c.config.ConnectionRetryTimeoutSeconds
-// elapses, whichever comes first. postgresDriverName is the database/sql
+// to c.config.MaxConnRetries times. postgresDriverName is the database/sql
 // driver used for the "postgres" scheme (overridable by tests).
+//
+// c.config.ConnectionRetryTimeoutSeconds limits the retries only: no new
+// attempt starts once that much time has passed since the first one. An
+// attempt in progress is never cut short; connect_timeout bounds each attempt.
+// With MaxConnRetries = 0 there is a single attempt and the retry timeout
+// plays no part.
 func (c *Client) connectWithRetry(ctx context.Context, postgresDriverName, dsn string) (*sql.DB, error) {
-	var db *sql.DB
 	var err error
-	retryCount := 0
-
-	connectRetryTimeout := time.Duration(c.config.ConnectionRetryTimeoutSeconds) * time.Second
-	retryError := retry.RetryContext(ctx, connectRetryTimeout, func() *retry.RetryError {
-		if budget := c.config.connBudget(); budget != nil {
-			db, err = c.config.openBudgetedPostgresDB(dsn, budget)
-		} else if c.config.AuthTokens != nil {
-			db, err = c.config.openTokenAuthDB(dsn)
-		} else if c.config.Scheme == "postgres" {
-			db, err = sql.Open(postgresDriverName, dsn)
-		} else if c.config.Scheme == "awspostgres" {
-			db, err = c.config.openAWSPostgres(dsn)
-		} else if c.config.Scheme == "gcppostgres" && c.config.GCPIAMImpersonateServiceAccount != "" {
-			db, err = openImpersonatedGCPDBConnection(ctx, dsn, c.config.GCPIAMImpersonateServiceAccount)
-		} else {
-			db, err = postgres.Open(ctx, dsn)
-		}
+	retryDeadline := time.Now().Add(time.Duration(c.config.ConnectionRetryTimeoutSeconds) * time.Second)
+	backoff := connectRetryInitialBackoff
+	for retryCount := 0; ; retryCount++ {
+		var db *sql.DB
+		db, err = c.openAndPing(ctx, postgresDriverName, dsn)
 		if err == nil {
-			err = db.PingContext(ctx)
+			return db, nil
 		}
-
-		if err == nil {
-			return nil
-		}
-
-		if db != nil {
-			_ = db.Close()
-			db = nil
-		}
-
 		if !isRetryableConnectionError(err) || retryCount >= c.config.MaxConnRetries {
-			return retry.NonRetryableError(err)
+			break
 		}
-		retryCount++
-		return retry.RetryableError(err)
-	})
-	if retryError != nil {
-		// Preserve *pq.Error so callers can detect conditions such as a dropped
-		// database (SQLSTATE 3D000); server-side pq errors never contain the
-		// password. Other errors may echo it, so keep redacting those.
-		if _, ok := errors.AsType[*pq.Error](retryError); ok {
-			return nil, fmt.Errorf("error connecting to PostgreSQL server %s (scheme: %s): %w", c.config.Host, c.config.Scheme, retryError)
+		remaining := time.Until(retryDeadline)
+		if remaining <= 0 {
+			break
 		}
-		// The DSN holds the password URL-escaped, and errors such as a URL
-		// parse failure echo the DSN, so redact the escaped forms as well.
-		// On the auth token path Password is empty and the connector has
-		// already redacted the token.
-		redacted := redactTokenError(retryError, c.config.Password)
-		return nil, fmt.Errorf("error connecting to PostgreSQL server %s (scheme: %s): %s", c.config.Host, c.config.Scheme, redacted)
+		wait := min(backoff, remaining)
+		log.Printf("[DEBUG] connection attempt %d to %s failed, retrying in %s: %v", retryCount+1, c.config.Host, wait, redactTokenError(err, c.config.Password))
+		select {
+		case <-ctx.Done():
+			err = errors.Join(err, ctx.Err())
+		case <-time.After(wait):
+		}
+		if ctx.Err() != nil {
+			break
+		}
+		backoff = min(backoff*2, connectRetryMaxBackoff)
 	}
 
-	return db, nil
+	// The loop only ends here on a failure. Preserve *pq.Error so callers can
+	// detect conditions such as a dropped database (SQLSTATE 3D000);
+	// server-side pq errors never contain the password. Other errors may echo
+	// it, so keep redacting those.
+	if _, ok := errors.AsType[*pq.Error](err); ok {
+		return nil, fmt.Errorf("error connecting to PostgreSQL server %s (scheme: %s): %w", c.config.Host, c.config.Scheme, err)
+	}
+	// The DSN holds the password URL-escaped, and errors such as a URL
+	// parse failure echo the DSN, so redact the escaped forms as well.
+	// On the auth token path Password is empty and the connector has
+	// already redacted the token.
+	redacted := redactTokenError(err, c.config.Password)
+	return nil, fmt.Errorf("error connecting to PostgreSQL server %s (scheme: %s): %s", c.config.Host, c.config.Scheme, redacted)
+}
+
+// openAndPing opens a database handle for dsn and checks it with a ping, which
+// establishes the first connection. On failure the handle is closed.
+func (c *Client) openAndPing(ctx context.Context, postgresDriverName, dsn string) (*sql.DB, error) {
+	var db *sql.DB
+	var err error
+	if budget := c.config.connBudget(); budget != nil {
+		db, err = c.config.openBudgetedPostgresDB(dsn, budget)
+	} else if c.config.AuthTokens != nil {
+		db, err = c.config.openTokenAuthDB(dsn)
+	} else if c.config.Scheme == "postgres" {
+		db, err = sql.Open(postgresDriverName, dsn)
+	} else if c.config.Scheme == "awspostgres" {
+		db, err = c.config.openAWSPostgres(dsn)
+	} else if c.config.Scheme == "gcppostgres" && c.config.GCPIAMImpersonateServiceAccount != "" {
+		db, err = openImpersonatedGCPDBConnection(ctx, dsn, c.config.GCPIAMImpersonateServiceAccount)
+	} else {
+		db, err = postgres.Open(ctx, dsn)
+	}
+	if err == nil {
+		err = db.PingContext(ctx)
+	}
+	if err == nil {
+		return db, nil
+	}
+	if db != nil {
+		_ = db.Close()
+	}
+	return nil, err
 }
 
 // isRetryableConnectionError reports whether a connection failure is likely
