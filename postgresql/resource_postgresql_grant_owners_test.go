@@ -24,6 +24,9 @@ FROM pg_proc
 JOIN pg_namespace ON pg_namespace.oid = pg_proc.pronamespace
 JOIN pg_roles ON pg_roles.oid = pg_proc.proowner
 WHERE pg_namespace.nspname = $1 AND pg_proc.prokind = ANY($2)`
+	// Grants on all objects of a type leave extension members out.
+	relNotExtension := " AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_depend dep WHERE dep.classid = 'pg_catalog.pg_class'::regclass AND dep.objid = pg_class.oid AND dep.deptype = 'e')"
+	procNotExtension := " AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_depend dep WHERE dep.classid = 'pg_catalog.pg_proc'::regclass AND dep.objid = pg_proc.oid AND dep.deptype = 'e')"
 	tableKinds := []string{"r", "p", "v", "m", "f"}
 
 	cases := []struct {
@@ -36,7 +39,7 @@ WHERE pg_namespace.nspname = $1 AND pg_proc.prokind = ANY($2)`
 		{
 			name:       "all tables",
 			objectType: "table",
-			wantQuery:  relQuery,
+			wantQuery:  relQuery + relNotExtension,
 			wantArgs:   []any{"test_schema", pq.Array(tableKinds)},
 		},
 		{
@@ -63,7 +66,7 @@ WHERE pg_namespace.nspname = $1 AND pg_proc.prokind = ANY($2)`
 		{
 			name:       "all sequences",
 			objectType: "sequence",
-			wantQuery:  relQuery,
+			wantQuery:  relQuery + relNotExtension,
 			wantArgs:   []any{"test_schema", pq.Array([]string{"S"})},
 		},
 		{
@@ -76,7 +79,7 @@ WHERE pg_namespace.nspname = $1 AND pg_proc.prokind = ANY($2)`
 		{
 			name:       "all procedures",
 			objectType: "procedure",
-			wantQuery:  procQuery,
+			wantQuery:  procQuery + procNotExtension,
 			wantArgs:   []any{"test_schema", pq.Array([]string{"p"})},
 		},
 		{

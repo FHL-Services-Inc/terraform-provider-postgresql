@@ -122,28 +122,34 @@ var (
 // catalogFixture is the canned catalog of database "testdb": roles r (grantee
 // of every resource) and o (owner), schema s with table t, sequence q and the
 // routines f (two overloads) and p, and default ACLs by o. Privileges match
-// the resources in grantReadCases.
+// the resources in grantReadCases. Schema s also holds members of an extension
+// owned by another role (view ext_view, sequence ext_seq, function ext_fn)
+// on which r has no privileges: grants on all objects of the schema leave them
+// out, so they must not show as drift.
 func catalogFixture() [][]driver.Value {
 	acl := func(s string) driver.Value { return s }
 	return [][]driver.Value{
-		{"r", int64(10), int64(0), "r", nil, nil},
-		{"r", int64(11), int64(0), "o", nil, nil},
-		{"n", int64(20), int64(0), "s", nil, acl("{o=UC/o,r=U/o,=U/o}")},
-		{"n", int64(21), int64(0), "empty", nil, nil},
-		{"c", int64(0), int64(20), "t", "r", acl("{o=arwdDxt/o,r=r/o}")},
-		{"c", int64(0), int64(20), "q", "S", acl("{o=rwU/o,r=U/o}")},
-		{"c", int64(0), int64(21), "noacl", "r", nil},
-		{"d", int64(11), int64(20), nil, "r", acl("{r=r/o}")},
-		{"d", int64(11), int64(0), nil, "S", acl("{r=r/o}")},
+		{"r", int64(10), int64(0), "r", nil, nil, false},
+		{"r", int64(11), int64(0), "o", nil, nil, false},
+		{"n", int64(20), int64(0), "s", nil, acl("{o=UC/o,r=U/o,=U/o}"), false},
+		{"n", int64(21), int64(0), "empty", nil, nil, false},
+		{"c", int64(0), int64(20), "t", "r", acl("{o=arwdDxt/o,r=r/o}"), false},
+		{"c", int64(0), int64(20), "q", "S", acl("{o=rwU/o,r=U/o}"), false},
+		{"c", int64(0), int64(20), "ext_view", "v", acl("{x=arwdDxt/x,=r/x}"), true},
+		{"c", int64(0), int64(20), "ext_seq", "S", acl("{x=rwU/x}"), true},
+		{"c", int64(0), int64(21), "noacl", "r", nil, false},
+		{"d", int64(11), int64(20), nil, "r", acl("{r=r/o}"), false},
+		{"d", int64(11), int64(0), nil, "S", acl("{r=r/o}"), false},
 	}
 }
 
 func catalogProcFixture() [][]driver.Value {
 	return [][]driver.Value{
-		{int64(20), "f", "f", "{o=X/o,r=X*/o}"},
-		{int64(20), "f", "f", "{o=X/o,r=X/o}"},
-		{int64(20), "p", "p", "{o=X/o,r=X/o}"},
-		{int64(21), "nogrant", "f", "{o=X/o}"},
+		{int64(20), "f", "f", "{o=X/o,r=X*/o}", false},
+		{int64(20), "f", "f", "{o=X/o,r=X/o}", false},
+		{int64(20), "p", "p", "{o=X/o,r=X/o}", false},
+		{int64(20), "ext_fn", "f", "{x=X/x}", true},
+		{int64(21), "nogrant", "f", "{o=X/o}", false},
 	}
 }
 
@@ -284,6 +290,32 @@ func TestCatalogSnapshotServesReadsFromOneBuild(t *testing.T) {
 	}
 	if got := len(catalogFake.all()); got != 2+direct {
 		t.Errorf("%d statements for %d Reads, want %d (snapshot + pg_proc + %d direct): %q", got, len(grantReadCases()), 2+direct, direct, catalogFake.all())
+	}
+}
+
+// TestCatalogSnapshotSkipsExtensionMembers: a grant on all objects of the
+// schema leaves the extension members of catalogFixture out (r has no
+// privileges on them), while a grant listing one reads it like any object.
+func TestCatalogSnapshotSkipsExtensionMembers(t *testing.T) {
+	client := newCatalogSnapshotConnection(t, catalogFixtureRows(catalogFixture(), catalogProcFixture()), nil)
+	cases := grantReadCases()
+
+	for _, tc := range []struct {
+		name     string
+		override map[string]any
+		want     string
+	}{
+		{"all tables", map[string]any{"object_type": "table", "privileges": []any{"SELECT"}}, "[SELECT]"},
+		{"all sequences", map[string]any{"object_type": "sequence", "privileges": []any{"USAGE"}}, "[USAGE]"},
+		{"all routines", map[string]any{"object_type": "routine", "privileges": []any{"EXECUTE"}}, "[EXECUTE]"},
+		{"listed extension view", map[string]any{"object_type": "table", "objects": []any{"ext_view"}, "privileges": []any{"SELECT"}}, "[]"},
+		{"listed extension sequence", map[string]any{"object_type": "sequence", "objects": []any{"ext_seq"}, "privileges": []any{"USAGE"}}, "[]"},
+		{"listed extension function", map[string]any{"object_type": "function", "objects": []any{"ext_fn"}, "privileges": []any{"EXECUTE"}}, "[]"},
+	} {
+		d := readCase(t, client, cases[0], tc.override)
+		if got := privilegesOfData(d); fmt.Sprint(got) != tc.want {
+			t.Errorf("%s: privileges = %v, want %s", tc.name, got, tc.want)
+		}
 	}
 }
 

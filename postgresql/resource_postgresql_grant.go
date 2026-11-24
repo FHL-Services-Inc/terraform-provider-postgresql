@@ -196,10 +196,10 @@ func resourcePostgreSQLGrantCreateOrUpdate(db *DBConnection, d *schema.ResourceD
 		// Revoke all privileges before granting otherwise reducing privileges will not work.
 		// We just have to revoke them in the same transaction so the role will not lose its
 		// privileges between the revoke and grant statements.
-		if err := revokeRolePrivileges(txn, d, usePrevious); err != nil {
+		if err := revokeRolePrivileges(db, txn, d, usePrevious); err != nil {
 			return err
 		}
-		if err := grantRolePrivileges(txn, d); err != nil {
+		if err := grantRolePrivileges(db, txn, d); err != nil {
 			return err
 		}
 		return nil
@@ -238,7 +238,7 @@ func resourcePostgreSQLGrantDelete(db *DBConnection, d *schema.ResourceData) err
 
 	directGrant := func() (bool, error) { return grantableDirectly(db, txn, d) }
 	if err := withRolesGrantedOrDirect(db, txn, owners, directGrant, func() error {
-		return revokeRolePrivileges(txn, d, false)
+		return revokeRolePrivileges(db, txn, d, false)
 	}); err != nil {
 		return err
 	}
@@ -610,6 +610,8 @@ LEFT JOIN LATERAL (
 		}
 		query += " AND c.relname = ANY($4)"
 		args = append(args, pq.Array(objectNames))
+	} else {
+		query += " AND " + notExtensionMember("pg_class", "c.oid")
 	}
 	query += `
     GROUP BY c.relname
@@ -808,7 +810,7 @@ func buildReadFunctionRolePrivilegesQuery(
 		routines = `
         SELECT p.proname AS name, p.oid, p.proacl, p.proowner
         FROM pg_proc p
-        JOIN n ON n.oid = p.pronamespace` + where(prokindFilter)
+        JOIN n ON n.oid = p.pronamespace` + where(prokindFilter, notExtensionMember("pg_proc", "p.oid"))
 	} else {
 		bare := []string{}
 		var sigEntries, signatures []string
@@ -1157,6 +1159,9 @@ func readRolePrivilegesFromSnapshot(snap *catalogSnapshot, db *DBConnection, d *
 			if objects.Len() > 0 && !objects.Contains(object.name) {
 				continue
 			}
+			if objects.Len() == 0 && object.extensionMember {
+				continue
+			}
 			granted, err := privilegesOf(object.acl, grantee)
 			if err != nil {
 				return err
@@ -1359,7 +1364,7 @@ func createRevokeQuery(getter ResourceSchemeGetter) string {
 	return query
 }
 
-func grantRolePrivileges(txn *sql.Tx, d *schema.ResourceData) error {
+func grantRolePrivileges(db *DBConnection, txn *sql.Tx, d *schema.ResourceData) error {
 	privileges := []string{}
 	for _, priv := range d.Get("privileges").(*schema.Set).List() {
 		privileges = append(privileges, priv.(string))
@@ -1371,12 +1376,26 @@ func grantRolePrivileges(txn *sql.Tx, d *schema.ResourceData) error {
 	}
 
 	query := createGrantQuery(d, privileges)
+	keyword, targets, explicit, err := allObjectsTargets(txn, d.Get, db.featureSupported(featureProcedure))
+	if err != nil {
+		return err
+	}
+	if explicit {
+		if len(targets) == 0 {
+			log.Printf("[DEBUG] schema %s holds only extension members of type %s, nothing to grant", d.Get("schema"), d.Get("object_type"))
+			return nil
+		}
+		query = fmt.Sprintf("GRANT %s ON %s %s TO %s", strings.Join(privileges, ","), keyword, strings.Join(targets, ", "), pq.QuoteIdentifier(d.Get("role").(string)))
+		if d.Get("with_grant_option").(bool) {
+			query += " WITH GRANT OPTION"
+		}
+	}
 
-	_, err := txn.Exec(query)
+	_, err = txn.Exec(query)
 	return err
 }
 
-func revokeRolePrivileges(txn *sql.Tx, d *schema.ResourceData, usePrevious bool) error {
+func revokeRolePrivileges(db *DBConnection, txn *sql.Tx, d *schema.ResourceData, usePrevious bool) error {
 	getter := d.Get
 
 	if usePrevious {
@@ -1414,6 +1433,17 @@ func revokeRolePrivileges(txn *sql.Tx, d *schema.ResourceData, usePrevious bool)
 	}
 
 	query := createRevokeQuery(getter)
+	keyword, targets, explicit, err := allObjectsTargets(txn, getter, db.featureSupported(featureProcedure))
+	if err != nil {
+		return err
+	}
+	if explicit {
+		if len(targets) == 0 {
+			log.Printf("[DEBUG] schema %s holds only extension members of type %s, nothing to revoke", getter("schema"), getter("object_type"))
+			return nil
+		}
+		query = fmt.Sprintf("REVOKE ALL PRIVILEGES ON %s %s FROM %s", keyword, strings.Join(targets, ", "), pq.QuoteIdentifier(getter("role").(string)))
+	}
 	if len(query) == 0 {
 		// Query is empty, don't run anything
 		return nil
@@ -1458,6 +1488,92 @@ WHERE n.nspname = $1 AND c.relkind = ANY($2) AND c.relname = ANY($3)`,
 		return nil, fmt.Errorf("could not read the existing objects of schema %s: %w", schemaName, err)
 	}
 	return existing, nil
+}
+
+// allObjectsTargets handles the GRANT and REVOKE of a grant on all objects of
+// a type in a schema (empty objects) when the schema holds extension members
+// of that type. ON ALL ... IN SCHEMA would include them, and PostgreSQL fails
+// the whole statement on an object the provider holds no privilege on at all
+// (pg_stat_statements_reset, for example, is revoked from PUBLIC). So the
+// statement lists the other objects instead: explicit is true, keyword is the
+// object keyword to use and targets the qualified names (with the argument
+// list for routines), possibly none. explicit is false for listed objects,
+// for other object types and for a schema without extension members, which
+// keep the ON ALL ... IN SCHEMA statement.
+func allObjectsTargets(txn QueryAble, getter ResourceSchemeGetter, hasProkind bool) (keyword string, targets []string, explicit bool, err error) {
+	if getter("objects").(*schema.Set).Len() > 0 {
+		return "", nil, false, nil
+	}
+	query, args, keyword, ok := allObjectsTargetsQueries(getter("schema").(string), getter("object_type").(string), hasProkind)
+	if !ok {
+		return "", nil, false, nil
+	}
+
+	var hasMembers bool
+	if err := txn.QueryRow(query.exists, args...).Scan(&hasMembers); err != nil {
+		return "", nil, false, fmt.Errorf("could not look for extension members in schema %s: %w", getter("schema"), err)
+	}
+	if !hasMembers {
+		return "", nil, false, nil
+	}
+
+	rows, err := txn.Query(query.list, args...)
+	if err != nil {
+		return "", nil, false, fmt.Errorf("could not list the objects of schema %s: %w", getter("schema"), err)
+	}
+	defer closeGrantReadRows(rows)
+	for rows.Next() {
+		var target string
+		if err := rows.Scan(&target); err != nil {
+			return "", nil, false, err
+		}
+		targets = append(targets, target)
+	}
+	if err := rows.Err(); err != nil {
+		return "", nil, false, err
+	}
+	return keyword, targets, true, nil
+}
+
+// allObjectsQueries are the two statements of allObjectsTargets: exists tells
+// whether the schema holds extension members of the object type, list returns
+// the other objects of that type as qualified names.
+type allObjectsQueries struct {
+	exists, list string
+}
+
+func allObjectsTargetsQueries(schemaName, objectType string, hasProkind bool) (q allObjectsQueries, args []any, keyword string, ok bool) {
+	if relkinds, found := ownerRelkinds[objectType]; found && objectType != "column" {
+		from := `
+FROM pg_catalog.pg_class c
+JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+WHERE n.nspname = $1 AND c.relkind = ANY($2)`
+		q.exists = `SELECT EXISTS (SELECT 1` + from + ` AND ` + extensionMember("pg_class", "c.oid") + `)`
+		q.list = `SELECT pg_catalog.quote_ident(n.nspname) || '.' || pg_catalog.quote_ident(c.relname)` + from +
+			` AND ` + notExtensionMember("pg_class", "c.oid") + ` ORDER BY c.relname`
+		return q, []any{schemaName, pq.Array(relkinds)}, strings.ToUpper(objectType), true
+	}
+	prokinds, found := ownerProkinds[objectType]
+	if !found {
+		return q, nil, "", false
+	}
+	from := `
+FROM pg_catalog.pg_proc p
+JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
+WHERE n.nspname = $1`
+	args = []any{schemaName}
+	// ON ROUTINE takes any kind of routine; before PostgreSQL 11 (no
+	// procedures, no prokind) every routine is a function.
+	keyword = "FUNCTION"
+	if hasProkind {
+		from += ` AND p.prokind = ANY($2)`
+		args = append(args, pq.Array(prokinds))
+		keyword = "ROUTINE"
+	}
+	q.exists = `SELECT EXISTS (SELECT 1` + from + ` AND ` + extensionMember("pg_proc", "p.oid") + `)`
+	q.list = `SELECT pg_catalog.quote_ident(n.nspname) || '.' || pg_catalog.quote_ident(p.proname) || '(' || pg_catalog.pg_get_function_identity_arguments(p.oid) || ')'` + from +
+		` AND ` + notExtensionMember("pg_proc", "p.oid") + ` ORDER BY p.proname, p.oid`
+	return q, args, keyword, true
 }
 
 func generateGrantID(d *schema.ResourceData) string {

@@ -360,6 +360,8 @@ func readImportedGrantOption(db *DBConnection, g grantImportID) (bool, error) {
 			}
 			query += ` AND p.proname = ANY($3)`
 			args = append(args, pq.Array(names))
+		} else {
+			query += ` AND ` + notExtensionMember("pg_proc", "p.oid")
 		}
 	default: // table, sequence
 		query = `FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace, aclexplode(c.relacl) a WHERE n.nspname = $2 AND c.relkind = ANY($3)`
@@ -367,6 +369,8 @@ func readImportedGrantOption(db *DBConnection, g grantImportID) (bool, error) {
 		if len(g.objects) > 0 {
 			query += ` AND c.relname = ANY($4)`
 			args = append(args, pq.Array(g.objects))
+		} else {
+			query += ` AND ` + notExtensionMember("pg_class", "c.oid")
 		}
 	}
 

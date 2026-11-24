@@ -146,8 +146,11 @@ func TestBuildReadFunctionRolePrivilegesQuery(t *testing.T) {
 		if !strings.Contains(query, "WHERE p.prokind <> 'p'") {
 			t.Fatalf("whole schema read must apply the prokind filter:\n%s", query)
 		}
-		if strings.Count(query, "pg_proc") != 1 {
+		if strings.Count(query, "FROM pg_proc") != 1 {
 			t.Fatalf("whole schema read must scan pg_proc once:\n%s", query)
+		}
+		if !strings.Contains(query, notExtensionMember("pg_proc", "p.oid")) {
+			t.Fatalf("whole schema read must leave extension members out:\n%s", query)
 		}
 	})
 
