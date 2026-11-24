@@ -47,7 +47,7 @@ resource "postgresql_grant" "read_insert_column" {
 * `schema` - The database schema to grant privileges on for this role (Required except if object_type is "database")
 * `object_type` - (Required) The PostgreSQL object type to grant the privileges on (one of: database, schema, table, sequence, function, procedure, routine, foreign_data_wrapper, foreign_server, column).
 * `privileges` - (Required) The list of privileges to grant. There are different kinds of privileges: SELECT, INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER, CREATE, CONNECT, TEMPORARY, EXECUTE, and USAGE. An empty list could be provided to revoke all privileges for this role. When the objects covered by the grant drift apart, a refresh records a privilege held by only some of them as `"<PRIVILEGE> (on some objects only)"`, so the plan shows it until the next apply aligns every object. On refresh, an object whose privileges were never granted or revoked explicitly is read with its default privileges (`acldefault`): everything for its owner, `EXECUTE` for `public` on functions, `CONNECT` and `TEMPORARY` for `public` on databases.
-* `objects` - (Optional) The objects upon which to grant the privileges. An empty list (the default) means to grant permissions on *all* objects of the specified type. You cannot specify this option if the `object_type` is `database` or `schema`. When `object_type` is `column`, only one value is allowed. For `function`, `procedure` and `routine`, an entry can carry an argument type list to select one overload (e.g. `"my_func(integer, text)"`); a bare name refers to the routine of that name (PostgreSQL requires it to be unique when granting). On refresh, each overload covered by the grant is checked: a signature entry checks that overload (any spelling PostgreSQL accepts for the types, e.g. `int4` or `integer`), a bare name every overload of that name, and an empty list every routine of the schema. `function` covers plain, aggregate and window functions, `procedure` only procedures, `routine` both. A listed routine that does not exist is not checked. Argument modes and names are accepted as in `GRANT` (e.g. `"my_func(IN x integer, OUT y text)"`, where `OUT` arguments are not part of the signature).
+* `objects` - (Optional) The objects upon which to grant the privileges. An empty list (the default) means to grant permissions on *all* objects of the specified type, except the members of extensions (see the notes below). You cannot specify this option if the `object_type` is `database` or `schema`. When `object_type` is `column`, only one value is allowed. For `function`, `procedure` and `routine`, an entry can carry an argument type list to select one overload (e.g. `"my_func(integer, text)"`); a bare name refers to the routine of that name (PostgreSQL requires it to be unique when granting). On refresh, each overload covered by the grant is checked: a signature entry checks that overload (any spelling PostgreSQL accepts for the types, e.g. `int4` or `integer`), a bare name every overload of that name, and an empty list every routine of the schema. `function` covers plain, aggregate and window functions, `procedure` only procedures, `routine` both. A listed routine that does not exist is not checked. Argument modes and names are accepted as in `GRANT` (e.g. `"my_func(IN x integer, OUT y text)"`, where `OUT` arguments are not part of the signature).
 * `columns` - (Optional) The columns upon which to grant the privileges. Required when `object_type` is `column`. You cannot specify this option if the `object_type` is not `column`.
 * `with_grant_option` - (Optional) Whether the recipient of these privileges can grant the same privileges to others. Defaults to false.
 
@@ -83,6 +83,22 @@ resource "postgresql_grant" "read_insert_column" {
   objects); without it the apply fails with an error saying so. Earlier
   versions ran the statement anyway, and PostgreSQL ignored it with only a
   warning: the apply succeeded without granting anything.
+* **Extension members are left out of grants on all objects of a schema:**
+  with `objects` empty, the tables, sequences and routines that belong to an
+  extension installed in the schema (`pg_stat_statements`, `spatial_ref_sys`
+  of PostGIS, ...) are not part of the grant. Their privileges are neither
+  granted, revoked nor read, so they never show as drift, and the apply does
+  not need to act as their owner, often a superuser (on Amazon RDS,
+  `pg_stat_statements` belongs to `rdsadmin`). When the schema holds such
+  members, the `GRANT`/`REVOKE` lists the other objects instead of using
+  `ON ALL ... IN SCHEMA`. To manage the privileges of an extension member,
+  list it in `objects`: it is then handled like any other object (and, with a
+  non-superuser provider, its owner rules above apply). Seeing the query texts
+  of other roles in `pg_stat_statements` is a matter of membership in
+  `pg_read_all_stats` (see `postgresql_grant_role`), not of a grant on the
+  view, which `PUBLIC` can read by default. Earlier versions included
+  extension members: with a non-superuser provider a grant on all objects of
+  a schema holding superuser-owned members failed.
 * Privileges are read with a single statement per resource, outside of a
   transaction.
 

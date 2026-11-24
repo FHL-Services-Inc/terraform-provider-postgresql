@@ -30,6 +30,10 @@ var catalogSnapshotMaxBytes = 64 << 20
 //	   tables, views, materialized views, foreign tables and sequences)
 //	d: default ACLs     (defaclrole, defaclnamespace, NULL, defaclobjtype, defaclacl)
 //
+// The last column tells whether a relation is an extension member, which a
+// grant on all objects of the schema leaves out (see notExtensionMember); it
+// is false for the other rows.
+//
 // pg_database is not in it: database grants are read on the maintenance
 // database (grantConnDatabase), not on the database the snapshot is taken on.
 //
@@ -42,10 +46,10 @@ var catalogSnapshotMaxBytes = 64 << 20
 // ACLs come back in their text form (aclitem[]::text) and are parsed in Go
 // when a Read needs them: exploding them on the server costs several times the
 // raw read on large catalogs.
-const catalogSnapshotQuery = `SELECT 'r', oid::bigint, 0::bigint, rolname::text, NULL::text, NULL::text FROM pg_catalog.pg_roles
-UNION ALL SELECT 'n', oid::bigint, 0::bigint, nspname::text, NULL, COALESCE(nspacl, pg_catalog.acldefault('n', nspowner))::text FROM pg_catalog.pg_namespace
-UNION ALL SELECT 'c', 0::bigint, relnamespace::bigint, relname::text, relkind::text, COALESCE(relacl, pg_catalog.acldefault(CASE WHEN relkind = 'S' THEN 's' ELSE 'r' END::"char", relowner))::text FROM pg_catalog.pg_class WHERE relkind IN ('r', 'p', 'v', 'm', 'f', 'S')
-UNION ALL SELECT 'd', defaclrole::bigint, defaclnamespace::bigint, NULL, defaclobjtype::text, defaclacl::text FROM pg_catalog.pg_default_acl
+const catalogSnapshotQuery = `SELECT 'r', oid::bigint, 0::bigint, rolname::text, NULL::text, NULL::text, false FROM pg_catalog.pg_roles
+UNION ALL SELECT 'n', oid::bigint, 0::bigint, nspname::text, NULL, COALESCE(nspacl, pg_catalog.acldefault('n', nspowner))::text, false FROM pg_catalog.pg_namespace
+UNION ALL SELECT 'c', 0::bigint, relnamespace::bigint, relname::text, relkind::text, COALESCE(relacl, pg_catalog.acldefault(CASE WHEN relkind = 'S' THEN 's' ELSE 'r' END::"char", relowner))::text, EXISTS (SELECT 1 FROM pg_catalog.pg_depend dep WHERE dep.classid = 'pg_catalog.pg_class'::regclass AND dep.objid = pg_class.oid AND dep.deptype = 'e') FROM pg_catalog.pg_class WHERE relkind IN ('r', 'p', 'v', 'm', 'f', 'S')
+UNION ALL SELECT 'd', defaclrole::bigint, defaclnamespace::bigint, NULL, defaclobjtype::text, defaclacl::text, false FROM pg_catalog.pg_default_acl
 `
 
 // catalogSnapshotProcQuery loads pg_proc on demand: only Reads of function,
@@ -54,17 +58,23 @@ UNION ALL SELECT 'd', defaclrole::bigint, defaclnamespace::bigint, NULL, defaclo
 // acldefault('f', owner), as in the direct Read. Servers without
 // pg_proc.prokind (before PostgreSQL 11, no procedures) use
 // catalogSnapshotProcQueryNoProkind, where every routine is a function.
-const catalogSnapshotProcQuery = `SELECT pronamespace::bigint, proname::text, prokind::text, COALESCE(proacl, pg_catalog.acldefault('f', proowner))::text FROM pg_catalog.pg_proc
+const catalogSnapshotProcQuery = `SELECT pronamespace::bigint, proname::text, prokind::text, COALESCE(proacl, pg_catalog.acldefault('f', proowner))::text, ` + catalogSnapshotProcExtensionMember + ` FROM pg_catalog.pg_proc
 `
 
-const catalogSnapshotProcQueryNoProkind = `SELECT pronamespace::bigint, proname::text, 'f'::text, COALESCE(proacl, pg_catalog.acldefault('f', proowner))::text FROM pg_catalog.pg_proc
+const catalogSnapshotProcQueryNoProkind = `SELECT pronamespace::bigint, proname::text, 'f'::text, COALESCE(proacl, pg_catalog.acldefault('f', proowner))::text, ` + catalogSnapshotProcExtensionMember + ` FROM pg_catalog.pg_proc
 `
+
+// catalogSnapshotProcExtensionMember tells whether a routine is an extension
+// member (see notExtensionMember).
+const catalogSnapshotProcExtensionMember = `EXISTS (SELECT 1 FROM pg_catalog.pg_depend dep WHERE dep.classid = 'pg_catalog.pg_proc'::regclass AND dep.objid = pg_proc.oid AND dep.deptype = 'e')`
 
 type catalogObject struct {
 	name string
 	// kind is relkind for relations, prokind for routines.
 	kind string
 	acl  sql.NullString
+	// extensionMember is true for an object that belongs to an extension.
+	extensionMember bool
 }
 
 type catalogNamespace struct {
@@ -250,7 +260,8 @@ func buildCatalogSnapshot(db *DBConnection, gen uint64) (*catalogSnapshot, error
 		var kind string
 		var id, namespace int64
 		var name, sub, acl sql.NullString
-		if err := rows.Scan(&kind, &id, &namespace, &name, &sub, &acl); err != nil {
+		var extensionMember bool
+		if err := rows.Scan(&kind, &id, &namespace, &name, &sub, &acl, &extensionMember); err != nil {
 			return nil, err
 		}
 		if size += len(name.String) + len(acl.String); size > catalogSnapshotMaxBytes {
@@ -264,7 +275,7 @@ func buildCatalogSnapshot(db *DBConnection, gen uint64) (*catalogSnapshot, error
 		case "n":
 			snap.namespaces[name.String] = catalogNamespace{oid: uint32(id), acl: acl}
 		case "c":
-			snap.relations[uint32(namespace)] = append(snap.relations[uint32(namespace)], catalogObject{name: name.String, kind: sub.String, acl: acl})
+			snap.relations[uint32(namespace)] = append(snap.relations[uint32(namespace)], catalogObject{name: name.String, kind: sub.String, acl: acl, extensionMember: extensionMember})
 		case "d":
 			snap.defaultACL[defaultACLKey{owner: uint32(id), namespace: uint32(namespace), objType: sub.String}] = acl.String
 		default:
@@ -317,13 +328,14 @@ func loadCatalogRoutines(db *DBConnection) (map[uint32][]catalogObject, error) {
 		var namespace int64
 		var name, kind string
 		var acl sql.NullString
-		if err := rows.Scan(&namespace, &name, &kind, &acl); err != nil {
+		var extensionMember bool
+		if err := rows.Scan(&namespace, &name, &kind, &acl, &extensionMember); err != nil {
 			return nil, err
 		}
 		if size += len(name) + len(acl.String); size > catalogSnapshotMaxBytes {
 			return nil, errCatalogSnapshotTooLarge
 		}
-		routines[uint32(namespace)] = append(routines[uint32(namespace)], catalogObject{name: name, kind: kind, acl: acl})
+		routines[uint32(namespace)] = append(routines[uint32(namespace)], catalogObject{name: name, kind: kind, acl: acl, extensionMember: extensionMember})
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err

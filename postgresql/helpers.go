@@ -658,18 +658,41 @@ var ownerProkinds = map[string][]string{
 	"routine":   {"f", "a", "w", "p"},
 }
 
+// notExtensionMember returns an SQL condition that is true when the object
+// with OID oidExpr in the given system catalog (pg_class or pg_proc) is not a
+// member of an extension (a pg_depend row with deptype 'e').
+//
+// A grant on all objects of a type in a schema (empty objects) leaves
+// extension members out: they belong to the extension, not to the schema's
+// application, and are often owned by a superuser the provider cannot act as
+// (pg_stat_statements created on Amazon RDS belongs to rdsadmin). The owners
+// lookup, the grant option check and the Reads skip them, and the GRANT and
+// REVOKE list the other objects when there are members (allObjectsTargets),
+// so such a grant neither fails on them nor reports drift for them. Listing an
+// extension member in objects manages it like any other object.
+func notExtensionMember(catalog, oidExpr string) string {
+	return "NOT " + extensionMember(catalog, oidExpr)
+}
+
+// extensionMember is the negation of notExtensionMember.
+func extensionMember(catalog, oidExpr string) string {
+	return "EXISTS (SELECT 1 FROM pg_catalog.pg_depend dep WHERE dep.classid = 'pg_catalog." + catalog +
+		"'::regclass AND dep.objid = " + oidExpr + " AND dep.deptype = 'e')"
+}
+
 // buildObjectsOwnersQuery returns the query listing the distinct owners of the
 // objects of objectType in schemaName. When objects is not empty only those
 // objects are considered; function-like objects may carry an argument
-// signature, which is stripped since owners are matched by name.
+// signature, which is stripped since owners are matched by name. When it is
+// empty, extension members are left out (see notExtensionMember).
 func buildObjectsOwnersQuery(schemaName, objectType string, objects []string) (string, []any) {
 	var query string
-	var nameColumn string
+	var nameColumn, catalog string
 	var kinds []string
 
 	if relkinds, ok := ownerRelkinds[objectType]; ok {
 		kinds = relkinds
-		nameColumn = "pg_class.relname"
+		nameColumn, catalog = "pg_class.relname", "pg_class"
 		query = `
 SELECT DISTINCT pg_roles.rolname
 FROM pg_class
@@ -678,7 +701,7 @@ JOIN pg_roles ON pg_roles.oid = pg_class.relowner
 WHERE pg_namespace.nspname = $1 AND pg_class.relkind = ANY($2)`
 	} else {
 		kinds = ownerProkinds[objectType]
-		nameColumn = "pg_proc.proname"
+		nameColumn, catalog = "pg_proc.proname", "pg_proc"
 		query = `
 SELECT DISTINCT pg_roles.rolname
 FROM pg_proc
@@ -698,6 +721,8 @@ WHERE pg_namespace.nspname = $1 AND pg_proc.prokind = ANY($2)`
 		}
 		query += " AND " + nameColumn + " = ANY($3)"
 		args = append(args, pq.Array(names))
+	} else {
+		query += " AND " + notExtensionMember(catalog, catalog+".oid")
 	}
 
 	return query, args

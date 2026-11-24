@@ -72,6 +72,8 @@ func grantableDirectlyQuery(db *DBConnection, d *schema.ResourceData) (query str
 		}
 		filters = fmt.Sprintf(" AND o.%s = ANY($4)", nameColumn)
 		args = append(args, pq.Array(names))
+	} else {
+		filters = " AND " + notExtensionMember(catalog, "o.oid")
 	}
 	if objectType == "column" {
 		var columns []string

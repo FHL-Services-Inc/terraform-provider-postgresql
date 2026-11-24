@@ -37,6 +37,9 @@ func TestBuildReadTableRolePrivilegesQuery(t *testing.T) {
 	if len(emptyArgs) != 3 {
 		t.Fatalf("empty objects must bind 3 args, got %d: %#v", len(emptyArgs), emptyArgs)
 	}
+	if !strings.Contains(emptyQuery, notExtensionMember("pg_class", "c.oid")) {
+		t.Fatalf("empty objects must leave extension members out, got: %q", emptyQuery)
+	}
 
 	objects := schema.NewSet(schema.HashString, []interface{}{"test_table", "test_table2"})
 	query, args := buildReadTableRolePrivilegesQuery("test_role", "test_schema", ownerRelkinds["table"], objects)
@@ -45,6 +48,9 @@ func TestBuildReadTableRolePrivilegesQuery(t *testing.T) {
 	}
 	if len(args) != 4 {
 		t.Fatalf("explicit objects must bind 4 args, got %d: %#v", len(args), args)
+	}
+	if strings.Contains(query, "pg_depend") {
+		t.Fatalf("explicit objects are read even when they belong to an extension, got: %q", query)
 	}
 
 	for _, q := range []string{emptyQuery, query} {
@@ -61,7 +67,7 @@ func TestBuildReadTableRolePrivilegesQuery(t *testing.T) {
 				t.Fatalf("query missing %q:\n%s", want, q)
 			}
 		}
-		if strings.Count(q, "pg_class") != 1 {
+		if strings.Count(q, "FROM pg_class") != 1 {
 			t.Fatalf("query must scan pg_class once: %q", q)
 		}
 	}
@@ -2276,5 +2282,56 @@ func testCheckForeignServerPrivileges(t *testing.T, role, srv, table string, usa
 		}
 
 		return nil
+	}
+}
+
+func TestAllObjectsTargetsQueries(t *testing.T) {
+	for _, tc := range []struct {
+		objectType string
+		hasProkind bool
+		ok         bool
+		keyword    string
+		nargs      int
+		catalog    string
+	}{
+		{"table", true, true, "TABLE", 2, "pg_class"},
+		{"sequence", true, true, "SEQUENCE", 2, "pg_class"},
+		{"function", true, true, "ROUTINE", 2, "pg_proc"},
+		{"procedure", true, true, "ROUTINE", 2, "pg_proc"},
+		{"routine", true, true, "ROUTINE", 2, "pg_proc"},
+		// Before PostgreSQL 11 there is no prokind and every routine is a function.
+		{"function", false, true, "FUNCTION", 1, "pg_proc"},
+		{"column", true, false, "", 0, ""},
+		{"schema", true, false, "", 0, ""},
+		{"database", true, false, "", 0, ""},
+	} {
+		t.Run(fmt.Sprintf("%s/prokind=%v", tc.objectType, tc.hasProkind), func(t *testing.T) {
+			q, args, keyword, ok := allObjectsTargetsQueries("s", tc.objectType, tc.hasProkind)
+			if ok != tc.ok {
+				t.Fatalf("ok = %v, want %v", ok, tc.ok)
+			}
+			if !ok {
+				return
+			}
+			if keyword != tc.keyword {
+				t.Errorf("keyword = %q, want %q", keyword, tc.keyword)
+			}
+			if len(args) != tc.nargs {
+				t.Errorf("%d args, want %d: %#v", len(args), tc.nargs, args)
+			}
+			oid := "c.oid"
+			if tc.catalog == "pg_proc" {
+				oid = "p.oid"
+			}
+			if !strings.Contains(q.exists, " AND "+extensionMember(tc.catalog, oid)) {
+				t.Errorf("exists query must look for extension members:\n%s", q.exists)
+			}
+			if !strings.Contains(q.list, " AND "+notExtensionMember(tc.catalog, oid)) {
+				t.Errorf("list query must leave extension members out:\n%s", q.list)
+			}
+			if strings.Contains(q.list, "prokind") != (tc.catalog == "pg_proc" && tc.hasProkind) {
+				t.Errorf("list query prokind filter mismatch:\n%s", q.list)
+			}
+		})
 	}
 }
