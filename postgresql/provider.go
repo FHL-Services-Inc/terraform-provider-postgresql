@@ -199,7 +199,7 @@ func Provider() *schema.Provider {
 				Type:         schema.TypeInt,
 				Optional:     true,
 				Default:      defaultProviderConnectionRetryTimeoutSeconds,
-				Description:  "Maximum total wait, in seconds, across all connection retries.",
+				Description:  "Time limit, in seconds, for connection retries: no retry starts after it. An attempt in progress is not interrupted; connect_timeout limits each attempt.",
 				ValidateFunc: validation.IntAtLeast(0),
 			},
 			"max_connections": {

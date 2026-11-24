@@ -11,6 +11,16 @@ Releases up to v1.27.0 were made upstream; see the
 
 ## [Unreleased]
 
+### Fixed
+
+- **Connection**: an attempt to connect is no longer abandoned 30 s after
+  `connection_retry_timeout_seconds` (5 s by default). Since v1.28.0 a server
+  that took longer than about 35 s to accept a connection failed with
+  "timeout while waiting for state to become 'success'", even without retries
+  and with the default `connect_timeout` of 180 s. `connect_timeout` limits
+  each attempt again, and the retry timeout only decides whether a new attempt
+  may start; it plays no part with `max_conn_retries = 0`, the default (#216).
+
 ## [1.29.0] - 2026-11-15
 
 ### Upgrade notes

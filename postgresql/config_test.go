@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/blang/semver"
 )
@@ -103,6 +104,9 @@ func TestConfigConnStrIsStable(t *testing.T) {
 type flakyPingDriver struct {
 	failuresBeforeSuccess int32
 	attempts              atomic.Int32
+	// pingDelay makes every Ping take this long, like a slow network or a
+	// server that is slow to accept connections.
+	pingDelay time.Duration
 }
 
 func (d *flakyPingDriver) Open(name string) (driver.Conn, error) {
@@ -119,6 +123,13 @@ func (c *flakyPingConn) Begin() (driver.Tx, error)                 { return nil,
 
 func (c *flakyPingConn) Ping(ctx context.Context) error {
 	attempt := c.driver.attempts.Add(1)
+	if c.driver.pingDelay > 0 {
+		select {
+		case <-time.After(c.driver.pingDelay):
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
 	if attempt <= c.driver.failuresBeforeSuccess {
 		return errors.New("connection refused")
 	}
@@ -162,6 +173,63 @@ func TestConnectWithRetryGivesUpAfterMaxConnRetries(t *testing.T) {
 
 	if got := drv.attempts.Load(); got != 4 {
 		t.Errorf("expected exactly 4 connection attempts (1 initial + MaxConnRetries), got %d", got)
+	}
+}
+
+// A single attempt that takes longer than connection_retry_timeout_seconds is
+// not cut short: the retry timeout limits the retries, connect_timeout limits
+// an attempt. With the SDK retry helper used before, an attempt was abandoned
+// with "timeout while waiting for state to become 'success'" once the retry
+// timeout plus the helper's 30 s grace period had passed.
+func TestConnectWithRetryDoesNotCutSlowAttempt(t *testing.T) {
+	drv := &flakyPingDriver{pingDelay: 1500 * time.Millisecond}
+	c := newFlakyClient("flaky-retry-slow-attempt", drv, 0, 1)
+
+	db, err := c.connectWithRetry(context.Background(), "flaky-retry-slow-attempt", "dsn")
+	if err != nil {
+		t.Fatalf("connectWithRetry() returned unexpected error: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	if got := drv.attempts.Load(); got != 1 {
+		t.Errorf("expected 1 connection attempt, got %d", got)
+	}
+}
+
+// No retry starts once connection_retry_timeout_seconds have passed since the
+// first attempt, even when max_conn_retries allows more.
+func TestConnectWithRetryStopsRetryingAtRetryTimeout(t *testing.T) {
+	drv := &flakyPingDriver{failuresBeforeSuccess: 1000}
+	c := newFlakyClient("flaky-retry-deadline", drv, 100, 1)
+
+	start := time.Now()
+	_, err := c.connectWithRetry(context.Background(), "flaky-retry-deadline", "dsn")
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatal("connectWithRetry() expected an error, got nil")
+	}
+
+	// Attempts at about 0 s, 0.5 s and 1 s (the second wait is cut to the
+	// time left), then the retry timeout has passed.
+	if got := drv.attempts.Load(); got < 2 || got > 4 {
+		t.Errorf("expected 2 to 4 connection attempts within the 1 s retry timeout, got %d", got)
+	}
+	if elapsed > 3*time.Second {
+		t.Errorf("connectWithRetry() kept retrying for %s after a 1 s retry timeout", elapsed)
+	}
+}
+
+// A failed attempt that itself outlasts the retry timeout is not retried.
+func TestConnectWithRetryNoRetryAfterSlowFailedAttempt(t *testing.T) {
+	drv := &flakyPingDriver{failuresBeforeSuccess: 1000, pingDelay: 1200 * time.Millisecond}
+	c := newFlakyClient("flaky-retry-slow-failure", drv, 5, 1)
+
+	_, err := c.connectWithRetry(context.Background(), "flaky-retry-slow-failure", "dsn")
+	if err == nil {
+		t.Fatal("connectWithRetry() expected an error, got nil")
+	}
+	if got := drv.attempts.Load(); got != 1 {
+		t.Errorf("expected 1 connection attempt, got %d", got)
 	}
 }
 

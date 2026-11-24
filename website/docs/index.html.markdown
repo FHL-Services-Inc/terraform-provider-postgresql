@@ -182,8 +182,11 @@ The following arguments are supported:
 * `max_conn_retries` - (Optional) Maximum number of retries when opening a
   connection fails. Authentication errors and unknown databases are not
   retried. Zero means no retries. The default is `0`.
-* `connection_retry_timeout_seconds` - (Optional) Maximum total wait, in
-  seconds, across all connection retries. The default is `5`.
+* `connection_retry_timeout_seconds` - (Optional) Time limit, in seconds, for
+  the connection retries: no new attempt starts once this much time has passed
+  since the first one. It does not interrupt an attempt in progress:
+  `connect_timeout` limits each attempt. It has no effect with
+  `max_conn_retries = 0`. The default is `5`.
 * `max_connections` - (Optional) Maximum number of open connections in each
   connection pool. The default is `20`. Zero means unlimited.
 
