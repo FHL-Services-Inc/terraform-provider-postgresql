@@ -11,6 +11,8 @@ Releases up to v1.27.0 were made upstream; see the
 
 ## [Unreleased]
 
+## [1.29.1] - 2026-11-24
+
 ### Fixed
 
 - **Connection**: an attempt to connect is no longer abandoned 30 s after
@@ -300,6 +302,7 @@ First release from this fork.
   replica (cyrilgdn/terraform-provider-postgresql#648).
 - Connection retry logic (cyrilgdn/terraform-provider-postgresql#576).
 
-[Unreleased]: https://github.com/FHL-Services-Inc/terraform-provider-postgresql/compare/v1.29.0...HEAD
+[Unreleased]: https://github.com/FHL-Services-Inc/terraform-provider-postgresql/compare/v1.29.1...HEAD
+[1.29.1]: https://github.com/FHL-Services-Inc/terraform-provider-postgresql/compare/v1.29.0...v1.29.1
 [1.29.0]: https://github.com/FHL-Services-Inc/terraform-provider-postgresql/compare/v1.28.0...v1.29.0
 [1.28.0]: https://github.com/FHL-Services-Inc/terraform-provider-postgresql/compare/v1.27.0...v1.28.0
