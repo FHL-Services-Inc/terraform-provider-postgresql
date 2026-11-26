@@ -14,7 +14,9 @@ Releases up to v1.27.0 were made upstream; see the
 ### Changed
 
 - **Docs**: the README links to this fork's page on the Terraform Registry
-  instead of the upstream provider's (#215).
+  instead of the upstream provider's, and its build instructions clone this
+  repository. The examples and the `tests/bench` scripts use the
+  `FHL-Services-Inc/postgresql` source address (#215).
 
 ## [1.29.1] - 2026-11-24
 
