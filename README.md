@@ -3,31 +3,56 @@ Terraform Provider for PostgreSQL
 
 This provider allows to manage with Terraform [Postgresql](https://www.postgresql.org/) objects like databases, extensions, roles, etc.
 
-It's published on the [Terraform registry](https://registry.terraform.io/providers/FHL-Services-Inc/postgresql/latest).
-It replaces https://github.com/hashicorp/terraform-provider-postgresql since Hashicorp stopped hosting community providers in favor of the Terraform registry.
+It's published on the [Terraform registry](https://registry.terraform.io/providers/FHL-Services-Inc/postgresql/latest)
+as `FHL-Services-Inc/postgresql`.
+
+This is a maintained fork of [cyrilgdn/terraform-provider-postgresql](https://github.com/cyrilgdn/terraform-provider-postgresql),
+which no longer gets regular releases. It continues the upstream version line:
+upstream's last release is v1.27.0, this fork starts at v1.28.0 and follows
+semantic versioning independently of upstream. Issues and pull requests are welcome here.
 
 - Documentation: https://registry.terraform.io/providers/FHL-Services-Inc/postgresql/latest
+
+Migrating from cyrilgdn/postgresql
+----------------------------------
+
+1. Change the source address:
+
+   ```hcl
+   terraform {
+     required_providers {
+       postgresql = {
+         source  = "FHL-Services-Inc/postgresql"
+         version = "~> 1.29"
+       }
+     }
+   }
+   ```
+
+2. Point the existing state at the new address and reinstall:
+
+   ```sh
+   terraform state replace-provider cyrilgdn/postgresql FHL-Services-Inc/postgresql
+   terraform init -upgrade
+   ```
+
+3. Run `terraform plan` and read the upgrade notes in the [changelog](CHANGELOG.md)
+   for 1.28.0 and 1.29.0 before applying.
 
 Requirements
 ------------
 
--	[Terraform](https://www.terraform.io/downloads.html) 0.12.x
--	[Go](https://golang.org/doc/install) 1.16 (to build the provider plugin)
+-	[Terraform](https://developer.hashicorp.com/terraform/install) 0.13 or later (provider source addresses)
+-	[Go](https://go.dev/doc/install) as pinned in [`.go-version`](.go-version) (to build the provider plugin)
 
 Building The Provider
 ---------------------
 
-Clone repository to: `$GOPATH/src/github.com/FHL-Services-Inc/terraform-provider-postgresql`
+Clone the repository and build the provider:
 
 ```sh
-$ mkdir -p $GOPATH/src/github.com/FHL-Services-Inc; cd $GOPATH/src/github.com/FHL-Services-Inc
 $ git clone git@github.com:FHL-Services-Inc/terraform-provider-postgresql
-```
-
-Enter the provider directory and build the provider
-
-```sh
-$ cd $GOPATH/src/github.com/FHL-Services-Inc/terraform-provider-postgresql
+$ cd terraform-provider-postgresql
 $ make build
 ```
 
@@ -39,14 +64,14 @@ Usage examples can be found in the Terraform [provider documentation](https://re
 Developing the Provider
 ---------------------------
 
-If you wish to work on the provider, you'll first need [Go](http://www.golang.org) installed on your machine (version 1.11+ is *required*). You'll also need to correctly setup a [GOPATH](http://golang.org/doc/code.html#GOPATH), as well as adding `$GOPATH/bin` to your `$PATH`.
+If you wish to work on the provider, you'll first need [Go](https://go.dev) installed on your machine (the version in [`.go-version`](.go-version)).
 
-To compile the provider, run `make build`. This will build the provider and put the provider binary in the `$GOPATH/bin` directory.
+To compile the provider, run `make build`. This runs `go install`, which puts the provider binary in `$(go env GOPATH)/bin` (or `$GOBIN` if set).
 
 ```sh
 $ make build
 ...
-$ $GOPATH/bin/terraform-provider-postgresql
+$ $(go env GOPATH)/bin/terraform-provider-postgresql
 ...
 ```
 
