@@ -11,6 +11,12 @@ Releases up to v1.27.0 were made upstream; see the
 
 ## [Unreleased]
 
+### Documentation
+
+- New guide: migrating from `cyrilgdn/postgresql`
+  (`terraform state replace-provider`). The usage example on the index page
+  now shows the `required_providers` block (#224).
+
 ## [1.29.1] - 2026-11-24
 
 ### Fixed
