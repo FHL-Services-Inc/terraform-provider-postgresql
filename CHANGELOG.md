@@ -11,6 +11,11 @@ Releases up to v1.27.0 were made upstream; see the
 
 ## [Unreleased]
 
+### Documentation
+
+- The issue template and support page are rewritten for this provider;
+  `CONTRIBUTING.md` and `SECURITY.md` are added (#222).
+
 ## [1.29.1] - 2026-11-24
 
 ### Fixed
