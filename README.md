@@ -16,7 +16,7 @@ semantic versioning independently of upstream. Issues and pull requests are welc
 Migrating from cyrilgdn/postgresql
 ----------------------------------
 
-1. Change the source address:
+1. Change the source address in the root module and in every child module:
 
    ```hcl
    terraform {
@@ -34,10 +34,14 @@ Migrating from cyrilgdn/postgresql
    ```sh
    terraform state replace-provider cyrilgdn/postgresql FHL-Services-Inc/postgresql
    terraform init -upgrade
+   terraform providers   # cyrilgdn/postgresql must no longer be listed
    ```
 
-3. Run `terraform plan` and read the upgrade notes in the [changelog](CHANGELOG.md)
-   for 1.28.0 and 1.29.0 before applying.
+   If a module still requires `cyrilgdn/postgresql`, Terraform installs both providers
+   and the next apply moves that module's resources back to the old address.
+
+3. Run `terraform plan` and read the [changelog](CHANGELOG.md) entries from 1.28.0 on,
+   including the 1.29.0 upgrade notes, before applying.
 
 Requirements
 ------------
