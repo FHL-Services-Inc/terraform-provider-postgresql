@@ -11,6 +11,16 @@ Releases up to v1.27.0 were made upstream; see the
 
 ## [Unreleased]
 
+### Changed
+
+- **Docs**: the README links to this fork's page on the Terraform Registry
+  instead of the upstream provider's, and its build instructions clone this
+  repository. The examples and the `tests/bench` scripts use the
+  `FHL-Services-Inc/postgresql` source address (#219).
+- **Docs**: the README says this is a maintained fork of cyrilgdn/postgresql,
+  states the versioning policy, explains how to migrate existing state with
+  `terraform state replace-provider`, and has current build requirements (#219).
+
 ## [1.29.1] - 2026-11-24
 
 ### Fixed

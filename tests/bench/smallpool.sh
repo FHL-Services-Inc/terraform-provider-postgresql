@@ -98,7 +98,7 @@ for spec in "${providers[@]}"; do
 	cat >"$workdir/cli-$label.tfrc" <<EOF
 provider_installation {
   dev_overrides {
-    "cyrilgdn/postgresql" = "$dir"
+    "FHL-Services-Inc/postgresql" = "$dir"
   }
   direct {}
 }
@@ -141,7 +141,7 @@ write_config() { # write_config <dir> <label> <max_connections>
 terraform {
   required_providers {
     postgresql = {
-      source = "cyrilgdn/postgresql"
+      source = "FHL-Services-Inc/postgresql"
     }
   }
 }
