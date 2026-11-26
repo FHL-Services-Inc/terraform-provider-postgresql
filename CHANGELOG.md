@@ -11,6 +11,10 @@ Releases up to v1.27.0 were made upstream; see the
 
 ## [Unreleased]
 
+### Removed
+
+- Unused scripts (`scripts/changelog-links.sh`, `scripts/gogetcookie.sh`, `postgresql/GNUmakefile`) and linker flags for variables that don't exist (#220).
+
 ## [1.29.1] - 2026-11-24
 
 ### Fixed
