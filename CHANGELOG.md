@@ -40,6 +40,8 @@ Releases up to v1.27.0 were made upstream; see the
   `.go-version`; GoReleaser is pinned to v2. Dependabot proposes updates for Go
   modules and actions. The unused `remove-waiting-response` workflow is removed
   (#223).
+- `go.sum` is tidy and `.goreleaser.yml` uses `archives.formats` instead of
+  the deprecated `archives.format`; `goreleaser check` passes (#235).
 
 ## [1.29.1] - 2026-11-24
 
