@@ -28,6 +28,13 @@ Releases up to v1.27.0 were made upstream; see the
   (`terraform state replace-provider`). The usage example on the index page
   now shows the `required_providers` block (#224).
 
+### Tests and CI
+
+- Workflows pin actions by commit SHA and read the Go version from
+  `.go-version`; GoReleaser is pinned to v2. Dependabot proposes updates for Go
+  modules and actions. The unused `remove-waiting-response` workflow is removed
+  (#223).
+
 ## [1.29.1] - 2026-11-24
 
 ### Fixed
