@@ -1,8 +1,8 @@
 package main
 
 import (
+	"github.com/FHL-Services-Inc/terraform-provider-postgresql/postgresql"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/plugin"
-	"github.com/terraform-providers/terraform-provider-postgresql/postgresql"
 )
 
 func main() {

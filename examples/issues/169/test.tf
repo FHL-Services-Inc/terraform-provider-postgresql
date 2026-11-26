@@ -16,8 +16,8 @@ terraform {
 
   required_providers {
     postgresql = {
-      source  = "cyrilgdn/postgresql"
-      version = ">=1.14"
+      source  = "FHL-Services-Inc/postgresql"
+      version = ">= 1.28"
     }
   }
 }
