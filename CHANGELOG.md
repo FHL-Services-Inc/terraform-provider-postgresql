@@ -22,6 +22,10 @@ Releases up to v1.27.0 were made upstream; see the
   `terraform state replace-provider`, and has current build requirements (#219).
 - The Go module path is now `github.com/FHL-Services-Inc/terraform-provider-postgresql`. This does not affect Terraform users (#221).
 
+### Removed
+
+- Unused scripts (`scripts/changelog-links.sh`, `scripts/gogetcookie.sh`, `postgresql/GNUmakefile`) and linker flags for variables that don't exist (#220).
+
 ### Documentation
 
 - New guide: migrating from `cyrilgdn/postgresql`
