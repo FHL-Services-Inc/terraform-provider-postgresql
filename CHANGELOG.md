@@ -27,6 +27,8 @@ Releases up to v1.27.0 were made upstream; see the
 - New guide: migrating from `cyrilgdn/postgresql`
   (`terraform state replace-provider`). The usage example on the index page
   now shows the `required_providers` block (#224).
+- The issue template and support page are rewritten for this provider;
+  `CONTRIBUTING.md` and `SECURITY.md` are added (#222).
 
 ### Tests and CI
 
