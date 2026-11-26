@@ -162,7 +162,7 @@ func (p params) terraform(w writer) int {
 	w.print(`terraform {
   required_providers {
     postgresql = {
-      source = "cyrilgdn/postgresql"
+      source = "FHL-Services-Inc/postgresql"
     }
   }
 }
