@@ -20,6 +20,7 @@ Releases up to v1.27.0 were made upstream; see the
 - **Docs**: the README says this is a maintained fork of cyrilgdn/postgresql,
   states the versioning policy, explains how to migrate existing state with
   `terraform state replace-provider`, and has current build requirements (#219).
+- The Go module path is now `github.com/FHL-Services-Inc/terraform-provider-postgresql`. This does not affect Terraform users (#221).
 
 ### Documentation
 
