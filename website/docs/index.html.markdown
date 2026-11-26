@@ -21,7 +21,20 @@ turn them off, and further settings such as `catalog_snapshot`.
 
 ## Usage
 
+Without the `required_providers` entry, Terraform looks for
+`hashicorp/postgresql`. If your configuration uses `cyrilgdn/postgresql`, see
+[Migrating from cyrilgdn/postgresql](guides/migrating-from-cyrilgdn.html).
+
 ```hcl
+terraform {
+  required_providers {
+    postgresql = {
+      source  = "FHL-Services-Inc/postgresql"
+      version = "~> 1.29"
+    }
+  }
+}
+
 provider "postgresql" {
   host            = "postgres_server_ip"
   port            = 5432
