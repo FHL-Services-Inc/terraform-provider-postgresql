@@ -34,7 +34,7 @@ $ make build
 Using the provider
 ----------------------
 
-Usage examples can be found in the Terraform [provider documentation](https://www.terraform.io/docs/providers/postgresql/index.html)
+Usage examples can be found in the Terraform [provider documentation](https://registry.terraform.io/providers/FHL-Services-Inc/postgresql/latest/docs)
 
 Developing the Provider
 ---------------------------
