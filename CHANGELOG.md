@@ -11,6 +11,11 @@ Releases up to v1.27.0 were made upstream; see the
 
 ## [Unreleased]
 
+### Changed
+
+- **Docs**: the README links to this fork's page on the Terraform Registry
+  instead of the upstream provider's (#215).
+
 ## [1.29.1] - 2026-11-24
 
 ### Fixed
