@@ -116,7 +116,7 @@ for spec in "${providers[@]}"; do
 	cat >"$workdir/cli-$label.tfrc" <<EOF
 provider_installation {
   dev_overrides {
-    "cyrilgdn/postgresql" = "$dir"
+    "FHL-Services-Inc/postgresql" = "$dir"
   }
   direct {}
 }

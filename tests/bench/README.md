@@ -91,6 +91,8 @@ You need Go, Terraform 1.x, `psql` and `perl`. `perl` is used for sub-second tim
    Within each latency, runs are interleaved across providers, so slow periods on the
    machine affect all of them. Run `run.sh -h` for the other options: `-P` sets the
    parallelism, `-w` sets the work dir, and `-S` reuses an existing fixture and state.
+   A work dir created before the provider address changed to `FHL-Services-Inc/postgresql`
+   can't be reused with `-S` (its `main.tf` still has the old source); run without `-S` once.
 
 3. `run.sh` prints a markdown table and writes it to `<workdir>/summary.md`.
    `<workdir>/results.csv` holds the per-run numbers, and `<workdir>/logs/` holds the
