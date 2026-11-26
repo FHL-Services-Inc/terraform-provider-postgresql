@@ -11,6 +11,10 @@ Releases up to v1.27.0 were made upstream; see the
 
 ## [Unreleased]
 
+### Changed
+
+- The Go module path is now `github.com/FHL-Services-Inc/terraform-provider-postgresql`. This does not affect Terraform users (#221).
+
 ## [1.29.1] - 2026-11-24
 
 ### Fixed
